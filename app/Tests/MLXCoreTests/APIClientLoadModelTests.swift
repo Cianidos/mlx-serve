@@ -103,10 +103,29 @@ final class APIClientLoadModelTests: XCTestCase {
         ])
         XCTAssertEqual(both.specDecodeBadge, "+MTP")
 
+        // A DFlash-family drafter outranks MTP (server dispatch), named by its config.
+        for (config, badge) in [(["selector_rank": 256], "+DF2"), (["markov_rank": 8], "+DS"), ([:], "+DF")] as [([String: Any], String)] {
+            let dir = NSTemporaryDirectory() + "drafter-\(UUID().uuidString)"
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(atPath: dir) }
+            var root: [String: Any] = ["block_size": 8, "mask_token_id": 1, "target_layer_ids": [1]]
+            root.merge(config) { $1 }
+            try? JSONSerialization.data(withJSONObject: root).write(to: URL(fileURLWithPath: dir + "/config.json"))
+            let m = APIClient.parseModelInfo(["id": "q", "meta": ["mtp_loaded": true, "drafter_loaded": true, "drafter_path": dir]])
+            XCTAssertEqual(m.specDecodeBadge, badge)
+        }
+
         // Neither head, and a pre-feature server (key absent) → no badge, no crash.
         let none = APIClient.parseModelInfo(["id": "y", "meta": ["architecture": "llama"]])
         XCTAssertFalse(none.mtpLoaded)
         XCTAssertNil(none.specDecodeBadge)
+    }
+
+    func testTrayShowsAQuantizedKvCache() {
+        XCTAssertEqual(APIClient.parseModelInfo(["id": "a", "meta": ["kv_quant": "8"]]).kvBadge, "KV8")
+        XCTAssertEqual(APIClient.parseModelInfo(["id": "a", "meta": ["kv_quant": "4"]]).kvBadge, "KV4")
+        XCTAssertNil(APIClient.parseModelInfo(["id": "a", "meta": ["kv_quant": "off"]]).kvBadge)
+        XCTAssertNil(APIClient.parseModelInfo(["id": "a", "meta": [:]]).kvBadge)
     }
 
     func testParseModelInfoReadsAudioCapability() {

@@ -292,9 +292,46 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 // renderJson — open JSON feed (drives the index-page live metrics panel)
 // ---------------------------------------------------------------------------
 
+pub const MAX_SESSIONS = 32;
+
+/// One live request's context occupancy, published by the inference thread.
+/// `context_length` is the model's effective limit, filled at render time by the server.
+pub const Session = struct {
+    pub const Phase = enum { prefill, decode, cached };
+
+    model_buf: [256]u8 = undefined,
+    model_len: u16 = 0,
+    phase: Phase,
+    context_tokens: u32,
+    cached_tokens: u32,
+    generated_tokens: u32,
+    state_bytes: u64,
+    context_length: u32 = 0,
+    /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
+    entry_id: u64 = 0,
+
+    pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
+        var s: Session = .{
+            .phase = phase,
+            .context_tokens = context_tokens,
+            .cached_tokens = cached_tokens,
+            .generated_tokens = generated_tokens,
+            .state_bytes = state_bytes,
+        };
+        const n = @min(model_id.len, s.model_buf.len);
+        @memcpy(s.model_buf[0..n], model_id[0..n]);
+        s.model_len = @intCast(n);
+        return s;
+    }
+
+    pub fn model(self: *const Session) []const u8 {
+        return self.model_buf[0..self.model_len];
+    }
+};
+
 /// Write all metrics as a JSON object to `w`.
 /// Called only on the scrape connection thread.
-pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
+pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer) !void {
     const ns_to_s = 1.0 / 1_000_000_000.0;
 
     try w.print(
@@ -368,7 +405,16 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
     try w.print(",", .{});
     try writeHistogramJson(w, "output_tokens", &m.output_tokens_hist, 1.0);
 
-    try w.print("}}}}", .{});
+    try w.print("}},\"sessions\":[", .{});
+    for (sessions, 0..) |*s, i| {
+        if (i > 0) try w.print(",", .{});
+        try w.print("{{\"model\":", .{});
+        try std.json.Stringify.encodeJsonString(s.model(), .{}, w);
+        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}}}", .{
+            @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes,
+        });
+    }
+    try w.print("]}}", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +650,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // The index panel polls /metrics.json and divides by `prefill_tokens_total`.
     var jbuf: [8192]u8 = undefined;
     var jw = std.Io.Writer.fixed(&jbuf);
-    try renderJson(&m, &jw);
+    try renderJson(&m, &.{}, &jw);
     const j = jw.buffered();
     try testing.expect(std.mem.indexOf(u8, j, "\"prefill_tokens_total\":500") != null);
     try testing.expect(std.mem.indexOf(u8, j, "\"prefix_cache_tokens_total\":910") != null);
@@ -631,7 +677,7 @@ test "prefill progress is exposed live, not only at request completion" {
 
     var jbuf: [8192]u8 = undefined;
     var jw = std.Io.Writer.fixed(&jbuf);
-    try renderJson(&m, &jw);
+    try renderJson(&m, &.{}, &jw);
     try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"prefill_tokens_live\":16384") != null);
     try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"prefill_tokens_expected\":48000") != null);
 
@@ -653,7 +699,7 @@ test "prefill progress is exposed live, not only at request completion" {
 
     var j2: [8192]u8 = undefined;
     var jw2 = std.Io.Writer.fixed(&j2);
-    try renderJson(&m, &jw2);
+    try renderJson(&m, &.{}, &jw2);
     try testing.expect(std.mem.indexOf(u8, jw2.buffered(), "\"requests_prefilling\":1") != null);
 }
 
@@ -785,7 +831,7 @@ test "renderJson emits valid JSON with correct structure" {
 
     var buf: [64 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try renderJson(&m, &w);
+    try renderJson(&m, &.{}, &w);
     const out = buf[0..w.end];
 
     // Must be valid-ish JSON (starts { ends })
@@ -808,7 +854,7 @@ test "renderJson output parses as valid JSON via stdlib parser" {
     var m0 = Metrics.init();
     var buf0: [64 * 1024]u8 = undefined;
     var w0: std.Io.Writer = .fixed(&buf0);
-    try renderJson(&m0, &w0);
+    try renderJson(&m0, &.{}, &w0);
     const out0 = buf0[0..w0.end];
 
     const parsed0 = try std.json.parseFromSlice(std.json.Value, testing.allocator, out0, .{});
@@ -827,7 +873,7 @@ test "renderJson output parses as valid JSON via stdlib parser" {
 
     var buf1: [64 * 1024]u8 = undefined;
     var w1: std.Io.Writer = .fixed(&buf1);
-    try renderJson(&m1, &w1);
+    try renderJson(&m1, &.{}, &w1);
     const out1 = buf1[0..w1.end];
 
     const parsed1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, out1, .{});
@@ -844,7 +890,7 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
     var m = Metrics.init();
     var jbuf: [64 * 1024]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&jbuf);
-    try renderJson(&m, &jw);
+    try renderJson(&m, &.{}, &jw);
     try testing.expect(std.mem.indexOf(u8, jbuf[0..jw.end], "\"ngram_warm_bytes\":0") != null);
 
     m.ngram_warm_bytes.set(17_179_869_184);
@@ -870,10 +916,31 @@ test "decode_serial_total carries one labelled series per serial reason, never o
 
     var jbuf: [64 * 1024]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&jbuf);
-    try renderJson(&m, &jw);
+    try renderJson(&m, &.{}, &jw);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
     defer parsed.deinit();
     const serial = parsed.value.object.get("decode_serial").?.object;
     try testing.expectEqual(@as(i64, 3), serial.get("spec_active").?.integer);
     try testing.expect(serial.get("ok") == null);
+}
+
+test "renderJson lists each live session's context against its model's limit" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var s = Session.init("org/pack \"q\"", .decode, 1700, 1200, 200, 4096);
+    s.context_length = 8192;
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{s}, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const row = parsed.value.object.get("sessions").?.array.items[0].object;
+    try testing.expectEqualStrings("org/pack \"q\"", row.get("model").?.string);
+    try testing.expectEqualStrings("decode", row.get("phase").?.string);
+    try testing.expectEqual(@as(i64, 1700), row.get("context_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 8192), row.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
 }

@@ -118,23 +118,33 @@ if (typeof document !== 'undefined') (function () {
 :root[data-theme=light] #m-status{background:#ececf0;color:#5b616b}
 :root[data-theme=light] #m-status.live{background:#e3f5ee;color:#0f7b5f}
 :root[data-theme=light] #m-status.err{background:#fdeceb;color:#b3261e}
+.msess{margin-top:12px}
+.msess table{width:100%;border-collapse:collapse;font-size:0.75rem}
+.msess th{text-align:left;font-weight:600;font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;padding:0 8px 6px 0}
+.msess td{padding:6px 8px 6px 0;border-top:1px solid #1f242c;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee;white-space:nowrap}
+.msess td.mmodel{font-family:inherit;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.msess td.mctx{width:34%}
+.msess .mbar{margin-top:4px}
+.msess .mempty{color:#5b6470;font-size:0.75rem}
+:root[data-theme=light] .msess td{color:#1e1f22;border-color:#e1e2e6}
 </style>
 <div class=mhead><h2 style="margin:0" data-i18n="Live metrics">Live metrics</h2><span id=m-status data-i18n="connecting…">connecting…</span></div>
 <div class=card style="padding:16px">
 <div class=mgrid>
 <div class=mtile><div class=mlbl data-i18n="Decode">Decode</div><div class=mval><span id=m-decode-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-decode-ms data-i18n="— ms avg">— ms avg</div></div>
-<div class=mtile><div class=mlbl data-i18n="Prefill">Prefill</div><div class=mval><span id=m-prefill-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-prefill-ms data-i18n="— ms avg">— ms avg</div></div>
+<div class=mtile><div class=mlbl data-i18n="Prefill">Prefill</div><div class=mval><span id=m-prefill-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-prefill-ms data-i18n="— ms avg">— ms avg</div><div class=mbar><div class=mfill id=m-prefillbar></div></div></div>
 <div class=mtile><div class=mlbl data-i18n="Requests">Requests</div><div class=mval><span id=m-running>0</span><span class=munit data-i18n="running">running</span></div><div class=msub id=m-waiting data-i18n="0 waiting · — req/s">0 waiting · — req/s</div></div>
 <div class=mtile><div class=mlbl data-i18n="Avg TTFT">Avg TTFT</div><div class=mval><span id=m-ttft>—</span><span class=munit>ms</span></div><div class=msub id=m-e2e data-i18n="— ms e2e">— ms e2e</div></div>
 <div class=mtile><div class=mlbl data-i18n="Cache hit rate">Cache hit rate</div><div class=mval><span id=m-cache>—</span><span class=munit>%</span></div><div class=msub id=m-cachedetail data-i18n="— / — queries">— / — queries</div></div>
 <div class=mtile><div class=mlbl>GPU</div><div class=mval><span id=m-gpu>0</span><span class=munit>%</span></div><div class=mbar><div class=mfill id=m-gpubar></div></div></div>
-<div class=mtile><div class=mlbl data-i18n="Memory">Memory</div><div class=mval><span id=m-mem>0</span><span class=munit>MB</span></div><div class=msub data-i18n="physical footprint">physical footprint</div></div>
+<div class=mtile><div class=mlbl data-i18n="Memory">Memory</div><div class=mval><span id=m-mem>0</span><span class=munit>MB</span></div><div class=msub id=m-memdetail data-i18n="physical footprint">physical footprint</div></div>
 <div class=mtile><div class=mlbl data-i18n="Generated">Generated</div><div class=mval><span id=m-gen>0</span><span class=munit>tok</span></div><div class=msub id=m-success data-i18n="0 requests">0 requests</div></div>
 </div>
 <div class=mspark>
 <div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Decode tok/s · last 60s">Decode tok/s · last 60s</span><span class=msparkval id=m-spark-decode-val>—</span></div><svg id=m-spark-decode viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
 <div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Prefill tok/s · last 60s">Prefill tok/s · last 60s</span><span class=msparkval id=m-spark-prefill-val>—</span></div><svg id=m-spark-prefill viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
 </div>
+<div class="msparkbox msess"><div class=mlbl data-i18n="Sessions">Sessions</div><div id=m-sessions></div></div>
 </div>`;
 
   // The panel brings its own markup, so the language boot cannot know about it:
@@ -234,6 +244,53 @@ if (typeof document !== 'undefined') (function () {
     });
   }
 
+  function fmtBytes(b) {
+    if (!b) return '0';
+    return b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' GB' : (b / 1048576).toFixed(0) + ' MB';
+  }
+
+  // Built with DOM nodes, never innerHTML: the model id is a folder name.
+  function renderSessions(list) {
+    const box = $('m-sessions');
+    if (!box) return;
+    box.textContent = '';
+    if (!list || list.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'mempty';
+      e.textContent = t('No sessions');
+      box.appendChild(e);
+      return;
+    }
+    const table = document.createElement('table');
+    const head = table.insertRow();
+    for (const h of ['Model', 'Phase', 'Context', 'Cached', 'Generated', 'KV + state']) {
+      const th = document.createElement('th');
+      th.textContent = t(h);
+      head.appendChild(th);
+    }
+    const idle = (s) => (s.phase === 'cached' ? 1 : 0);
+    const rows = list.slice().sort((a, b) => a.model.localeCompare(b.model) || idle(a) - idle(b));
+    for (const s of rows) {
+      const tr = table.insertRow();
+      const cell = (txt, cls) => { const td = tr.insertCell(); td.textContent = txt; if (cls) td.className = cls; return td; };
+      cell(s.model, 'mmodel').title = s.model;
+      cell(t({ prefill: 'prefilling', decode: 'decoding', cached: 'in cache' }[s.phase] || s.phase));
+      const pct = s.context_length > 0 ? Math.min(100, (s.context_tokens / s.context_length) * 100) : null;
+      const ctx = cell(fmt(s.context_tokens, 0) + (s.context_length > 0 ? ' / ' + fmt(s.context_length, 0) + ' · ' + pct.toFixed(0) + '%' : ''), 'mctx');
+      if (pct !== null) {
+        const bar = document.createElement('div'); bar.className = 'mbar';
+        const fill = document.createElement('div');
+        fill.className = 'mfill' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
+        fill.style.width = pct + '%';
+        bar.appendChild(fill); ctx.appendChild(bar);
+      }
+      cell(fmt(s.cached_tokens, 0));
+      cell(s.phase === 'cached' ? '—' : fmt(s.generated_tokens, 0));
+      cell(fmtBytes(s.state_bytes));
+    }
+    box.appendChild(table);
+  }
+
   const histSum = (hist) => (hist && typeof hist.sum === 'number') ? hist.sum : 0;
 
   async function tick() {
@@ -291,8 +348,12 @@ if (typeof document !== 'undefined') (function () {
       : (avgPrefillTps !== null
           ? t('%@ tok/s avg · %@ ms', [fmt(avgPrefillTps, 0), prefillMs !== null ? fmt(prefillMs, 0) : '—'])
           : t('%@ ms avg', ['—'])));
+    const pexp = g.prefill_tokens_expected || 0;
+    $('m-prefillbar').style.width = (prefilling && pexp > 0 ? Math.min(100, (r.livePre / pexp) * 100) : 0) + '%';
     $('m-running').textContent = g.requests_running;
-    setVal('m-waiting', t('%@ waiting · %@ req/s', [g.requests_waiting, reqRate !== null ? fmt(reqRate, 2) : '—']));
+    setVal('m-waiting', t('%@ waiting · %@ req/s', [g.requests_waiting, reqRate !== null ? fmt(reqRate, 2) : '—'])
+      + (g.batched_group_size > 1 ? ' · ' + t('batch of %@', [g.batched_group_size]) : '')
+      + (c.requests_cancelled_total > 0 ? ' · ' + t('%@ cancelled', [c.requests_cancelled_total]) : ''));
     $('m-ttft').textContent = ttft !== null ? fmt(ttft, 0) : '—';
     setVal('m-e2e', t('%@ ms e2e', [e2e !== null ? fmt(e2e, 0) : '—']));
     $('m-cache').textContent = cachePct !== null ? cachePct : '—';
@@ -306,12 +367,14 @@ if (typeof document !== 'undefined') (function () {
     bar.className = 'mfill' + (gp >= 90 ? ' crit' : gp >= 70 ? ' warn' : '');
 
     $('m-mem').textContent = g.memory_mb;
+    setVal('m-memdetail', t('MLX %@ active · %@ pool', [fmtBytes(g.mlx_active_bytes), fmtBytes(g.mlx_cache_bytes)]));
     // Live count (completed + in-flight) so it moves during a running request.
     $('m-gen').textContent = fmt(liveTok, 0);
     setVal('m-success', t('%@ requests', [fmt(c.requests_success_total, 0)]));
 
     spark('m-spark-decode', decodeHist, '#22c55e', 'm-spark-decode-val', 'decode', 1);
     spark('m-spark-prefill', prefillHist, '#3b82f6', 'm-spark-prefill-val', 'prefill', 0);
+    renderSessions(d.sessions);
   }
 
   attachSparkHover('m-spark-decode', 'decode', function () { return decodeHist; }, '#22c55e', 'm-spark-decode-val', 1);

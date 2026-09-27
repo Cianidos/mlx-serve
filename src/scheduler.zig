@@ -453,6 +453,8 @@ pub const Slot = struct {
     /// Media items in `full_prompt` (owned): the prefix-cache key of their rows.
     media: []prefix_cache_mod.MediaSpan,
     cache_key: u64 = 0,
+    /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
+    restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
@@ -1394,6 +1396,12 @@ pub const Scheduler = struct {
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the decoding slots own, published once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Per-slot context snapshot for `/metrics.json`, published with the above under `queue_mu`.
+    live_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
+    live_session_count: usize = 0,
+    /// Every ready model's hot-cache entries for `/metrics.json`, under `digest_mu`.
+    cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
+    cached_session_count: usize = 0,
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -4114,6 +4122,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
     params.config.dflash_bound = xfm_ptr.config.dflash_bound;
+    if (params.config.dflash_bound and std.meta.activeTag(params.config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default) != .exact)
+        log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
     errdefer if (drafter_ptr) |d| {
         d.deinit();
         sch.allocator.destroy(d);
@@ -4446,7 +4456,6 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 fn reviseHotCacheBudgets(sch: *Scheduler) void {
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
-    defer sch.registry.mutex.unlock(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
     // current model goes last.
     for ([_]bool{ false, true }) |current_pass| {
@@ -4460,9 +4469,10 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             var idle: u64 = 0;
             hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
             hc.ssd_idle_mem = idle;
-            if (current_pass) publishHotCacheResidency(sch);
         }
     }
+    sch.registry.mutex.unlock(sch.io);
+    publishHotCacheResidency(sch);
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
@@ -4471,6 +4481,34 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishHotCacheDigests(sch);
+    if (sch.metrics != null) publishCachedSessions(sch);
+}
+
+/// Caller must not hold `registry.mutex`.
+fn publishCachedSessions(sch: *Scheduler) void {
+    var rows: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined;
+    var n: usize = 0;
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        outer: while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            const hc = if (entry.prefix_cache) |*h| h else continue;
+            for (hc.entries.items) |*e| {
+                if (n == rows.len) break :outer;
+                const len: u32 = @intCast(@min(e.tokens.len, std.math.maxInt(u32)));
+                rows[n] = .init(entry.id, .cached, len, len, 0, e.kv_bytes);
+                rows[n].entry_id = e.id;
+                n += 1;
+            }
+        }
+    }
+    sch.digest_mu.lockUncancelable(sch.io);
+    defer sch.digest_mu.unlock(sch.io);
+    @memcpy(sch.cached_sessions[0..n], rows[0..n]);
+    sch.cached_session_count = n;
 }
 
 /// Swap in a fresh digest snapshot and free the one it supersedes (inference thread only).
@@ -4867,9 +4905,28 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
 /// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
 fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
-    var bytes: u64 = if (prefilling) |p| slotStateBytes(p) else 0;
-    for (sch.decoding.items) |s| bytes += slotStateBytes(s);
+    const observe = sch.metrics != null;
+    sch.live_session_count = 0;
+    var bytes: u64 = 0;
+    if (prefilling) |p| {
+        const b = slotStateBytes(p);
+        bytes += b;
+        if (observe) recordLiveSession(sch, p, .prefill, b);
+    }
+    for (sch.decoding.items) |s| {
+        const b = slotStateBytes(s);
+        bytes += b;
+        if (observe) recordLiveSession(sch, s, .decode, b);
+    }
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
+}
+
+fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
+    if (sch.live_session_count == sch.live_sessions.len) return;
+    const prompt: u32 = if (phase == .prefill) @intCast(s.full_prompt.len) else s.prompt_tokens;
+    sch.live_sessions[sch.live_session_count] = .init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, s.completion_tokens, state_bytes);
+    sch.live_sessions[sch.live_session_count].entry_id = s.restored_entry;
+    sch.live_session_count += 1;
 }
 
 fn slotStateBytes(s: *const Slot) u64 {
@@ -6328,7 +6385,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // prefill path executes NO extra instruction at all (the chunk loop's hook
     // is null too — see the `prefill_progress` option below).
     const observe = sch.metrics != null;
-    if (observe) _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+    if (observe) {
+        _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        publishLiveKvResidency(sch, slot);
+    }
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
@@ -6482,6 +6544,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
                 hot_checked_out = lookup.checked_out;
+                slot.restored_entry = lookup.entry_id;
             }
             if (dfl_target) |*dc| {
                 // Adopt only a context that lines up EXACTLY with the trunk
@@ -6679,7 +6742,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
-            .mtp_acceptance = slot.model.config.?.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
+            .mtp_acceptance = slot.model.config.?.mtpAcceptance(generate_mod.mtp_acceptance_default),
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,

@@ -27,6 +27,8 @@ struct DrafterGem: Equatable, Hashable, Identifiable {
     }
 
     var needsDownload: Bool { kind != .mtp }
+    /// Loads through the server's DFlash engine (a pack's `drafter/` does too).
+    var isDflash: Bool { kind != .mtp && kind != .gemmaAssistant }
 }
 
 enum DrafterGems {
@@ -94,6 +96,17 @@ enum GemStone: String {
         case .ruby: "Gemma assistant drafter"
         }
     }
+
+    /// The short tag the tray and My Models both print beside the stone.
+    var badge: String {
+        switch self {
+        case .emerald: "+MTP"
+        case .amethyst: "+DS"
+        case .sapphire: "+DF"
+        case .topaz: "+DF2"
+        case .ruby: "+Drafter"
+        }
+    }
 }
 
 /// `skull`: MTP accepts drafts lossily (Typical / TokenV3).
@@ -150,6 +163,16 @@ enum DrafterSocket: Equatable {
     case gem(DrafterGem)
     /// A drafter path no known gem accounts for.
     case custom(String)
+
+    /// The server binds a DFlash drafter for this socket: `automatic` loads the
+    /// pack's own `drafter/` when it is on disk.
+    func bindsDflash(localDrafter: Bool) -> Bool {
+        switch self {
+        case .automatic: localDrafter
+        case .gem(let g): g.isDflash
+        case .empty, .custom: false
+        }
+    }
 
     /// `pathOf`: where a separate-repo gem lives on disk, nil when absent.
     static func read(_ o: ModelOverride, gems: [DrafterGem], pathOf: (DrafterGem) -> String?) -> DrafterSocket {

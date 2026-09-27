@@ -19,10 +19,10 @@ enum ModelSettingsApply {
     }
 
     /// MTP rows only where a head exists (unknown = older server, show);
-    /// acceptance only while MTP is not Off.
-    static func mtpRows(available: Bool?, mtp: Bool?) -> (mtp: Bool, acceptance: Bool) {
+    /// acceptance only while MTP is not Off and no DFlash drafter forces it exact.
+    static func mtpRows(available: Bool?, mtp: Bool?, dflash: Bool = false) -> (mtp: Bool, acceptance: Bool) {
         let show = available ?? true
-        return (show, show && mtp != false)
+        return (show, show && mtp != false && !dflash)
     }
 }
 
@@ -66,7 +66,12 @@ struct ModelSettingsSheet: View {
 
     private var rows: (mtp: Bool, acceptance: Bool) {
         if isGguf { return (false, false) }
-        return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp)
+        return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp, dflash: bindsDflash)
+    }
+
+    private var bindsDflash: Bool {
+        socket.bindsDflash(localDrafter: FileManager.default.fileExists(
+            atPath: (request.path as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json")))
     }
 
     private var repoId: String {
@@ -268,6 +273,7 @@ struct ModelSettingsSheet: View {
             let gemPath: String? = if case .gem(let g) = socket { downloads.gemPath(g, modelDir: request.path) } else { nil }
             socket.write(into: &override, gemPath: gemPath)
         }
+        if bindsDflash { override.mtpAcceptance = nil }
         var file = ModelSettingsFile.load()
         file.set(override, for: request.path)
         do {

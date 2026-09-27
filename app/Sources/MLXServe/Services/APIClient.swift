@@ -199,6 +199,7 @@ class APIClient {
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
+            drafterStone: (meta["drafter_path"] as? String).flatMap { DrafterGems.readConfig($0) }.flatMap { DrafterGems.stone(drafterConfig: $0) },
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
             mtpAvailable: meta["mtp_available"] as? Bool,
             specExact: meta["spec_exact"] as? Bool,

@@ -30,6 +30,17 @@ final class ModelSettingsMtpRowsTests: XCTestCase {
         let r = ModelSettingsApply.mtpRows(available: nil, mtp: nil)
         XCTAssertTrue(r.mtp); XCTAssertTrue(r.acceptance)
     }
+    /// The server forces exact MTP acceptance while a DFlash drafter is bound.
+    func testADflashSocketHidesAcceptance() {
+        XCTAssertFalse(ModelSettingsApply.mtpRows(available: true, mtp: nil, dflash: true).acceptance)
+        let dflash2 = DrafterGem(kind: .dflash2, repo: "z-lab/x", subfolder: nil, sizeGB: 1)
+        let mtp = DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0)
+        XCTAssertTrue(DrafterSocket.gem(dflash2).bindsDflash(localDrafter: false))
+        XCTAssertFalse(DrafterSocket.gem(mtp).bindsDflash(localDrafter: true))
+        XCTAssertTrue(DrafterSocket.automatic.bindsDflash(localDrafter: true), "auto loads the pack's drafter/")
+        XCTAssertFalse(DrafterSocket.automatic.bindsDflash(localDrafter: false))
+        XCTAssertFalse(DrafterSocket.empty.bindsDflash(localDrafter: true))
+    }
 }
 
 /// Mirrors the server's `mtp.dirAdvertisesMtp`: sidecar file, index marker, or qwen4's own head.

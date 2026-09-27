@@ -166,6 +166,8 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// `Entry.id` of the RAM entry restored from; 0 = none.
+    entry_id: u64 = 0,
 };
 
 const Entry = struct {
@@ -181,6 +183,8 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
+    /// Stable identity for observers; `last_used` moves on every touch.
+    id: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -1394,6 +1398,7 @@ pub const HotPrefixCache = struct {
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, matched, s),
             .mtp_base = restoreMtp(e, mtp_target, matched, s),
+            .entry_id = e.id,
         };
         if (!full_reuse) {
             res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
@@ -1986,6 +1991,7 @@ pub const HotPrefixCache = struct {
             .media = media_owned,
             .cache_key = cache_key,
             .snapshot = new_snap,
+            .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
@@ -8815,4 +8821,29 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "a restore names its entry, and a commit that extends it in place keeps the id" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [64]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var longer: [80]u32 = undefined;
+    for (&longer, 0..) |*t, i| t.* = @intCast(i + 7);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 64);
+    const id = hc.entries.items[0].id;
+    try testing.expect(id != 0);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &longer, false, &.{}, null, null, 0);
+    try testing.expectEqual(id, res.entry_id);
+
+    try testFillCache(&slot, s, 1, longer.len);
+    _ = try hc.commit(&slot, &longer, false);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(id, hc.entries.items[0].id);
 }

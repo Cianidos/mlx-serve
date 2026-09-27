@@ -5294,3 +5294,17 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `gdn_decode.recurSeq: a T-row window equals T one-row calls`, the rowqmv/simd_qmm/
   row_attn width-invariance tests, `keyed_sample` pinned to TensorFold's reference tokens,
   seeded cold==warm in `tests/test_hybrid_reuse_equivalence.sh`.
+
+## A draft tree failed the second request under --kv-quant 8 (2026-09-27)
+
+- Defect: with a DFlash2 drafter and `--kv-quant 8` (the app's default profile), the first
+  request answered and the next one 500'd: `decode tick failed: SpecTreeUnsupported`.
+- Cause: `KVCache.compactRows`, which moves a tree's accepted path into place, returned the
+  error for any quantized scheme. Only a round whose accepted path is not the first branch
+  compacts, so short or lucky requests passed. The tree gate was decided at load with no
+  look at the KV scheme, so the refusal surfaced mid-decode.
+- Fix: the affine scales and biases move with their rows (groups run along head_dim, so a
+  row is self-contained); the stored rows equal what serial appends would write.
+- Guard: `KVCache.compactRows: a tree's accepted path lands as serial appends would, dense
+  and quantized`; smoke matrix `drafter` / `drafter_kv8` cells (red on the old binary);
+  same-load serial vs drafter byte check under `--kv-quant 8`.

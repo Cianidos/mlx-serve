@@ -152,6 +152,17 @@
     "metrics disabled": "指标未启用",
     "error: %@": "错误：%@",
     "● live": "● 实时",
+    "Sessions": "会话",
+    "No sessions": "没有会话",
+    "in cache": "已缓存",
+    "Phase": "阶段",
+    "Context": "上下文",
+    "Cached": "已缓存",
+    "KV + state": "KV + 状态",
+    "decoding": "正在解码",
+    "batch of %@": "批量 %@",
+    "%@ cancelled": "%@ 已取消",
+    "MLX %@ active · %@ pool": "MLX %@ 使用中 · %@ 缓存池",
 
     // ── API reference ───────────────────────────────────────────────────────
     "Streaming and non-streaming · tool calling · JSON mode · vision (when supported)": "流式与非流式 · 工具调用 · JSON 模式 · 视觉（模型支持时）",

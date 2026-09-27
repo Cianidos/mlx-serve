@@ -468,6 +468,8 @@ struct ModelInfo {
     /// Absolute path passed to `--drafter` at startup. nil when the server
     /// has no drafter loaded.
     var drafterPath: String? = nil
+    /// The loaded drafter's kind, read from its `config.json` (nil: none, or not on this Mac).
+    var drafterStone: GemStone? = nil
     /// True when the model dir shipped an `mtp/weights.safetensors` sidecar and
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
@@ -565,14 +567,19 @@ struct ModelInfo {
     }
 
     /// Short "speedup active" badge for the tray under the model name, or nil
-    /// when no speculative-decoding head is loaded. MTP takes priority over the
-    /// drafter (mirrors server dispatch: MTP > drafter > PLD), so at most one
-    /// shows. PLD is intentionally NOT badged — it's content-adaptive (gated off
-    /// on novel prompts) rather than a loaded asset.
+    /// when no speculative-decoding head is loaded. Mirrors server dispatch:
+    /// DFlash-family drafter > MTP > Gemma assistant, so at most one shows.
+    /// PLD is not badged: it is content-adaptive, not a loaded asset.
     var specDecodeBadge: String? {
+        if let stone = drafterStone, stone != .ruby { return stone.badge }
         if mtpLoaded { return "+MTP" }
         if drafterLoaded { return "+Drafter" }
         return nil
+    }
+
+    /// "KV4" / "KV8" while this model stores a quantized KV cache.
+    var kvBadge: String? {
+        kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil
     }
 
     /// Whether this entry can answer a chat request at all. A generator

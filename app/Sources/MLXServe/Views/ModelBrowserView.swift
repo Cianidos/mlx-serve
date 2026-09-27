@@ -1950,10 +1950,16 @@ private struct LocalModelRow: View {
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
                     if let stone = badge.stone {
-                        GemIcon(name: "gem-\(stone.rawValue).png").help(stone.label)
-                    }
-                    if badge.skull {
-                        GemIcon(name: "gem-skull.png").help("Lossy MTP acceptance (Typical / TokenV3)")
+                        HStack(spacing: 3) {
+                            GemIcon(name: "gem-\(stone.rawValue).png")
+                            Text(stone.badge)
+                                .font(.app(.caption2).weight(.semibold))
+                                .foregroundStyle(.green)
+                            if badge.skull { GemIcon(name: "gem-skull.png") }
+                        }
+                        .padding(.leading, 2).padding(.trailing, 5).padding(.vertical, 1)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                        .help(badge.skull ? "\(stone.label), lossy acceptance (Typical / TokenV3)" : stone.label)
                     }
                 }
                 // The id itself, under the readable name.

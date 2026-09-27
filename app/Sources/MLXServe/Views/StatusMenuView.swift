@@ -707,7 +707,16 @@ struct StatusMenuView: View {
                     .background(.quaternary)
                     .clipShape(Capsule())
             }
-            // Speculative-decoding speedup badge (MTP / drafter).
+            if let kv = info.kvBadge {
+                Text(kv)
+                    .font(.app(.caption2).weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
+                    .help("KV cache stored at \(info.kvQuant)-bit")
+            }
+            // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
             if let badge = info.specDecodeBadge {
                 Text(L10n.text(badge))
                     .font(.app(.caption2).weight(.semibold))
@@ -716,9 +725,9 @@ struct StatusMenuView: View {
                     .padding(.vertical, 1)
                     .background(Color.green.opacity(0.15))
                     .clipShape(Capsule())
-                    .help(info.mtpLoaded
+                    .help(badge == "+MTP"
                           ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                          : "Assistant drafter loaded — faster decode via speculative decoding")
+                          : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
             }
             Spacer()
             if info.bytesResident > 0 {

@@ -8377,7 +8377,6 @@ pub const KVCache = struct {
     /// move to base + 1, base + 2, ... in order; the caller truncates after.
     pub fn compactRows(self: *KVCache, base: usize, rows: []const u32, s: mlx.mlx_stream) !void {
         if (rows.len == 0) return;
-        if (self.config.scheme != .off) return error.SpecTreeUnsupported;
         var idx_buf: [64]i32 = undefined;
         if (rows.len > idx_buf.len) return error.SpecTreeUnsupported;
         for (rows, 0..) |r, i| idx_buf[i] = @intCast(base + r);
@@ -8385,7 +8384,9 @@ pub const KVCache = struct {
         defer _ = mlx.mlx_array_free(idx);
         for (self.entries) |*entry| {
             if (!entry.initialized) continue;
-            for ([_]*mlx.mlx_array{ &entry.keys, &entry.values }) |buf| {
+            // A quantized row's scales and biases move with it (groups run along head_dim).
+            const bufs = [_]*mlx.mlx_array{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
+            for (bufs[0..if (self.config.scheme == .off) 2 else bufs.len]) |buf| {
                 const sh = mlx.getShape(buf.*);
                 var picked = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(picked);
@@ -43846,6 +43847,52 @@ test "KVCache: an append after a short restore sizes its copy from the prefix, n
         try testing.expectEqual(@as(usize, 101), cache.entries[0].offset);
         try testing.expect(KVCache.bufferCapacity(cache.entries[0].keys) <= 512);
         try testing.expect(KVCache.bufferCapacity(snap.entries[0].keys) >= 8192);
+    }
+}
+
+test "KVCache.compactRows: a tree's accepted path lands as serial appends would, dense and quantized" {
+    const s = mlx.gpuStream();
+    const base: usize = 6;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 42));
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_random_normal(&xf, &[_]c_int{ 1, 2, base + 8, 64 }, 4, .float32, 0.0, 1.0, key, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    const rows = [_]u32{ 2, 5 };
+    for ([_]kv_quant.KVQuantConfig{ kv_quant.KVQuantConfig.dense, kv_quant.KVQuantConfig.affine(8) }) |cfg| {
+        var tree = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        defer tree.deinit();
+        _ = try tree.update(0, x, x, s, 0);
+        try tree.compactRows(base, &rows, s);
+        try tree.truncate(base + 1 + rows.len, s);
+
+        var serial = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        defer serial.deinit();
+        const idx_host = [_]i32{ 0, 1, 2, 3, 4, 5, 6, @intCast(base + rows[0]), @intCast(base + rows[1]) };
+        const idx = mlx.mlx_array_new_data(&idx_host, &[_]c_int{idx_host.len}, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, x, idx, 2, s));
+        _ = try serial.update(0, picked, picked, s, 0);
+
+        var a = try tree.denseView(0, s);
+        defer a.deinit();
+        var b = try serial.denseView(0, s);
+        defer b.deinit();
+        try testing.expectEqualSlices(c_int, mlx.getShape(b.k), mlx.getShape(a.k));
+        for ([_][2]mlx.mlx_array{ .{ a.k, b.k }, .{ a.v, b.v } }) |pair| {
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, pair[0], pair[1], false, s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try testing.expect(same);
+        }
     }
 }
 

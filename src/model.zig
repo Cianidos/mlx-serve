@@ -909,6 +909,13 @@ pub const ModelConfig = struct {
         return self.row_exact_covered and self.dflash_bound and self.rowExactArch();
     }
 
+    /// MTP acceptance for this load: exact while a DFlash drafter is bound, so
+    /// the MTP rounds it yields to stay byte-exact too.
+    pub fn mtpAcceptance(self: *const ModelConfig, default: mtp_acceptance_mod.Mode) mtp_acceptance_mod.Mode {
+        if (self.dflash_bound) return .exact;
+        return self.mtp_acceptance_override orelse default;
+    }
+
     pub fn rowExactArch(self: *const ModelConfig) bool {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return true;
         return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
@@ -7506,4 +7513,14 @@ test "rowExactDecode: a covered trunk decodes exact only while a DFlash drafter 
     try std.testing.expect(cfg.rowExactDecode());
     cfg.row_exact_covered = false;
     try std.testing.expect(!cfg.rowExactDecode());
+}
+
+test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setting, else the launch default" {
+    var cfg = ModelConfig{};
+    const typical: mtp_acceptance_mod.Mode = .{ .typical = .{ .delta = 0.2 } };
+    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .typical);
+    cfg.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
+    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
+    cfg.dflash_bound = true;
+    try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
 }
