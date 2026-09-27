@@ -895,6 +895,27 @@ pub const ModelConfig = struct {
         return null;
     }
 
+    /// Decode-width 4-bit projections go through `rowqmv`, whose rows get the
+    /// same bits at any window width: a verify row reproduces serial decoding.
+    pub fn rowExactDecode(self: *const ModelConfig) bool {
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return true;
+        return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
+    }
+
+    /// The MTP head's hidden input is the trunk's final-normed hidden, not the
+    /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
+    pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "nemotron_h");
+    }
+
+    /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer
+    /// puts 99.64% of committed tokens below id 98304, so a draft reads 40% of
+    /// the head. A token past it is never drafted: speed only, never output.
+    pub fn draftVocab(self: *const ModelConfig) c_int {
+        if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
+        return 0;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }

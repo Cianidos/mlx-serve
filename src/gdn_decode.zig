@@ -170,7 +170,7 @@ const K1S_HEAD =
     \\      uint ch = cb + lane * 4 + i;
     \\      float acc = 0.0f;
     \\      for (int tap = 0; tap < 4; ++tap) {
-    \\        int w = t + tap;
+    \\        const int w = TAP_W(t, tap);
     \\        const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
     \\        acc += float(xv) * float(conv_w[ch * 4 + tap]);
     \\      }
@@ -213,6 +213,7 @@ const K1S_HEAD =
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\for (int t = 0; t < TL; ++t) {
+    \\  RELOAD(t)
     \\  float kk[4], qq[4];
     \\  for (int i = 0; i < 4; ++i) { kk[i] = ks[t][lane * 4 + i]; qq[i] = qs[t][lane * 4 + i]; }
     \\  const float g = gb[t][0], beta = gb[t][1];
@@ -227,7 +228,9 @@ const K1S_HEAD =
     \\    out = simd_sum(out);
 ;
 const K1S_TAIL =
-    \\    if (t + 1 < TL) {
+    \\    // The next token reads the state serial decoding stored (StT), not the f32.
+    \\    for (int i = 0; i < 4; ++i) st[j][i] = float(static_cast<StT>(st[j][i]));
+    \\    if (STATE_ALL || t + 1 < TL) {
     \\      uint sbase = t * (HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
     \\      for (int i = 0; i < 4; ++i) state_seq[sbase + i] = static_cast<StT>(st[j][i]);
     \\    }
@@ -238,7 +241,23 @@ const K1S_TAIL =
     \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
     \\}
 ;
-const K1S_SOURCE = K1S_HEAD ++ "\n" ++
+const CHAIN_MACROS = "#define TAP_W(t, tap) ((t) + (tap))\n#define RELOAD(t)\n#define STATE_ALL 0\n";
+// A draft tree (TREE = 1): row t's conv window and recurrence follow its
+// ancestors. `parents` holds [TL] parent rows (-1 for the root), then [TL][4]
+// conv sources (< 3 a conv-state row, else 3 + a window row). A node whose
+// parent is not the row before restarts from the parent's stored state, the
+// state serial decoding reads at that position.
+const TREE_MACROS =
+    \\#define TAP_W(t, tap) (TREE ? int(parents[TL + (t) * 4 + (tap)]) : (t) + (tap))
+    \\#define RELOAD(t) if (TREE && t > 0 && parents[t] != t - 1) { \
+    \\  for (int j = 0; j < R; ++j) { \
+    \\    uint sb = parents[t] * (HV * DV * DK) + (hv * DV + row0 + j) * DK + lane * 4; \
+    \\    for (int i = 0; i < 4; ++i) st[j][i] = float(state_seq[sb + i]); } }
+    \\#define STATE_ALL TREE
+    \\
+;
+const TREE_HEADER = HEADER;
+const K1S_SOURCE = CHAIN_MACROS ++ K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
 ++ "\n" ++ K1S_TAIL;
 
@@ -247,7 +266,7 @@ const K1S_SOURCE = K1S_HEAD ++ "\n" ++
 // folded in. A head's 128 y values stay in threadgroup memory, rounded to T as
 // the stored y was, and simdgroup t runs the norm-gate kernel's exact reduction
 // for token t. The conv-input rows rollback slices are copied out as well.
-const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
+const K1S_FOLD_SOURCE = TREE_MACROS ++ "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
 ++ "\n" ++ K1S_TAIL ++ "\n" ++
     \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
@@ -459,7 +478,7 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
 /// ([T,1,Hv,Dv,Dk], row T-1 unwritten). Null outside the kernel's geometry.
 pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?RecurSeq {
     if (!mlx.streamIsGpu(s)) return null;
-    if (t_len < 2 or t_len > MAX_SEQ) return null;
+    if (t_len < 1 or t_len > MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;
@@ -494,6 +513,42 @@ pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recu
     return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3] };
 }
 
+/// The fold's tree table for rows with `parents` (-1 = the root): the parents,
+/// then each row's four conv-input sources oldest first (< 3 a conv-state row,
+/// else 3 + a window row), resolved on the host once instead of per channel.
+pub fn treeTable(parents: []const i32, out: []i32) void {
+    const n = parents.len;
+    std.debug.assert(out.len == 5 * n);
+    @memcpy(out[0..n], parents);
+    for (0..n) |t| {
+        var depth: i32 = 0;
+        var r: i32 = @intCast(t);
+        while (parents[@intCast(r)] >= 0) : (r = parents[@intCast(r)]) depth += 1;
+        for (0..4) |tap| {
+            const up: i32 = 3 - @as(i32, @intCast(tap));
+            const dd = depth - up;
+            if (dd < 0) {
+                out[n + t * 4 + tap] = dd + 3;
+                continue;
+            }
+            var a: i32 = @intCast(t);
+            var k = up;
+            while (k > 0) : (k -= 1) a = parents[@intCast(a)];
+            out[n + t * 4 + tap] = 3 + a;
+        }
+    }
+}
+
+test "treeTable: a chain reads t + tap, a branch reads its own ancestors" {
+    var out: [5 * 4]i32 = undefined;
+    treeTable(&.{ -1, 0, 1, 2 }, &out);
+    for (0..4) |t| for (0..4) |tap| try std.testing.expectEqual(@as(i32, @intCast(t + tap)), out[4 + t * 4 + tap]);
+    var tree: [5 * 3]i32 = undefined;
+    treeTable(&.{ -1, 0, 0 }, &tree);
+    // row 2 (depth 1, parent 0): conv rows 1, 2, then window rows 0 and 2.
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 5 }, tree[3 + 8 .. 3 + 12]);
+}
+
 pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
 
 const FOLD_NT: c_int = 1024; // one threadgroup per head, 4 dv rows per simdgroup
@@ -502,7 +557,7 @@ fn foldNt() c_int {
     return fold_nt_override orelse FOLD_NT;
 }
 var k1f_cache: ?mlx.mlx_fast_metal_kernel = null;
-var fold_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var fold_cfgs: [2][MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
 // Whether this GPU's pipeline runs each width's 1024-thread fold; null = not dispatched yet.
 var fold_ok: [MAX_SEQ + 1]?bool = @splat(null);
 const FoldKey = struct { k: CfgKey, swish: bool, nt: c_int };
@@ -514,7 +569,7 @@ pub fn foldDeclined(t_len: c_int) bool {
 }
 var fold_cfg_key: ?FoldKey = null;
 
-fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool) !mlx.mlx_fast_metal_kernel_config {
+fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool, tree: bool) !mlx.mlx_fast_metal_kernel_config {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -530,6 +585,7 @@ fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TREE", @intFromBool(tree)));
     return cfg;
 }
 
@@ -538,9 +594,12 @@ fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dty
 /// state, the final state, state_seq (row T-1 unwritten) and conv_input
 /// [1,3+T,C]. Bit-identical to recurSeq -> gdnNormGateFused -> concat. Null
 /// outside the kernel's geometry or dtypes (caller keeps the unfolded path).
-pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
+/// `parents` (`treeTable`: `[t_len]` parent rows then `[t_len][4]` conv
+/// sources) runs the rows as a draft tree: every row's state lands in
+/// state_seq; null = a chain.
+pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, parents: ?mlx.mlx_array, s: mlx.mlx_stream) !?RecurSeqFold {
     if (!mlx.streamIsGpu(s)) return null;
-    if (t_len < 2 or t_len > MAX_SEQ) return null;
+    if (t_len < 1 or t_len > MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;
@@ -550,10 +609,11 @@ pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.m
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
     if (!inputsFit(g, t_len, in, true)) return null;
-    if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, HEADER);
+    if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps", "parents" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, TREE_HEADER);
+    const tree = parents != null;
     const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish, .nt = foldNt() };
     if (fold_cfg_key == null or !std.meta.eql(fold_cfg_key.?, key)) {
-        for (&fold_cfgs) |*slot| if (slot.*) |c| {
+        for (&fold_cfgs) |*row| for (row) |*slot| if (slot.*) |c| {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
             slot.* = null;
         };
@@ -562,14 +622,18 @@ pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.m
     }
     const idx: usize = @intCast(t_len);
     if (fold_ok[idx] == false) return null;
-    if (fold_cfgs[idx] == null) fold_cfgs[idx] = try buildFoldConfig(g, t_len, dt, st, swish);
+    const ti: usize = @intFromBool(tree);
+    if (fold_cfgs[ti][idx] == null) fold_cfgs[ti][idx] = try buildFoldConfig(g, t_len, dt, st, swish, tree);
 
-    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps };
+    const no_tree: i32 = -1;
+    const dummy = mlx.mlx_array_new_data(&no_tree, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps, parents orelse dummy };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
     defer _ = mlx.mlx_vector_array_free(v1);
     var o1 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1f_cache.?, v1, fold_cfgs[idx].?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1f_cache.?, v1, fold_cfgs[ti][idx].?, s));
     var out: [5]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
     errdefer for (out) |a| {
         _ = mlx.mlx_array_free(a);

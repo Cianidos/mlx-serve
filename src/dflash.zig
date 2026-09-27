@@ -854,6 +854,8 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
+        } else if (target.config.draftVocab() > 0) {
+            out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -1543,6 +1545,7 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
+
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -1560,27 +1563,34 @@ pub const SelectedPath = struct {
     }
 };
 
-/// Reference `CandidateSelector.select`: top-k candidates per position by
-/// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
-/// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
-/// edge scores are precomputed in ONE batched GPU dispatch ([m-1, k, k] +
-/// the anchor row) and the 16-wide trace runs on host — same math as the
-/// reference's sequential loop, chosen path identical, no per-step sync.
-///
-/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
-/// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
-/// already has the anchor row dropped (`[1, m, V]`).
-pub fn selectPath(
+/// The selector's candidate lattice on the host: `cands`/`unary` `[m, k]`
+/// (candidate ids and their draft logits per position), `e0` `[k]` the anchor's
+/// edges to position 0, `e` `[m-1, k, k]` edges between adjacent positions.
+pub const Lattice = struct {
+    m: usize,
+    k: usize,
+    cands: []i32,
+    unary: []f32,
+    e0: []f32,
+    e: []f32,
+
+    pub fn deinit(self: *Lattice, allocator: std.mem.Allocator) void {
+        allocator.free(self.cands);
+        if (self.unary.len > 0) allocator.free(self.unary);
+        if (self.e0.len > 0) allocator.free(self.e0);
+        if (self.e.len > 0) allocator.free(self.e);
+    }
+};
+
+pub fn lattice(
     allocator: std.mem.Allocator,
     sel: *const Selector,
     top_k: u32,
     blk_hidden: mlx.mlx_array,
     draft_logits: mlx.mlx_array,
     anchor_id: u32,
-    temperature: f32,
-    rand: std.Random,
     s: mlx.mlx_stream,
-) !SelectedPath {
+) !Lattice {
     const dl_shape = mlx.getShape(draft_logits);
     const m: usize = @intCast(dl_shape[1]);
     const vocab: c_int = dl_shape[2];
@@ -1754,10 +1764,182 @@ pub fn selectPath(
     const cand_data = mlx.mlx_array_data_int32(cands_i32) orelse return error.MlxArrayDataNull;
     const unary_data = mlx.mlx_array_data_float32(unary_f32) orelse return error.MlxArrayDataNull;
     const e0_data = mlx.mlx_array_data_float32(e0_f32) orelse return error.MlxArrayDataNull;
-    const e_data: ?[*]const f32 = if (e_f32.ctx != null)
-        (mlx.mlx_array_data_float32(e_f32) orelse return error.MlxArrayDataNull)
-    else
-        null;
+    var lat = Lattice{ .m = m, .k = k, .cands = try allocator.dupe(i32, cand_data[0 .. m * k]), .unary = &.{}, .e0 = &.{}, .e = &.{} };
+    errdefer lat.deinit(allocator);
+    lat.unary = try allocator.dupe(f32, unary_data[0 .. m * k]);
+    lat.e0 = try allocator.dupe(f32, e0_data[0..k]);
+    if (e_f32.ctx != null) {
+        const e_data = mlx.mlx_array_data_float32(e_f32) orelse return error.MlxArrayDataNull;
+        lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
+    }
+    return lat;
+
+}
+
+/// A best-first draft tree over the lattice: node values are path sums of
+/// log-softmax((unary + edge_w * pairwise) / temperature / tau) over siblings,
+/// the `children` best candidates of each expanded node queued, the best queued
+/// node taken next. Parameters follow TensorFold's fit (MIT): the head's raw
+/// scores are overconfident and its pairwise term too strong.
+pub const TreeParams = struct {
+    max_nodes: usize,
+    children: usize = 4,
+    tau: f32 = 1.5,
+    edge_w: f32 = 0.6,
+    temperature: f32 = 1.0,
+    /// `[m, k]` Gumbel noise the verify rows draw at the candidates, weighted
+    /// into the scores (null for a greedy target).
+    noise: ?[]const f32 = null,
+    noise_w: f32 = 0.7,
+};
+
+/// Nodes in the order taken (a parent always before its children): `tokens`,
+/// `parents` (node index, -1 = under the anchor) and `depth` (0 = position 0).
+pub const DraftTree = struct {
+    tokens: []u32,
+    parents: []i32,
+    depth: []u32,
+
+    pub fn deinit(self: *DraftTree, allocator: std.mem.Allocator) void {
+        allocator.free(self.tokens);
+        allocator.free(self.parents);
+        allocator.free(self.depth);
+    }
+};
+
+pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
+    const k = lat.k;
+    const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
+    var queue: std.ArrayList(Item) = .empty;
+    defer queue.deinit(allocator);
+    var tree = DraftTree{ .tokens = try allocator.alloc(u32, p.max_nodes), .parents = try allocator.alloc(i32, p.max_nodes), .depth = try allocator.alloc(u32, p.max_nodes) };
+    errdefer tree.deinit(allocator);
+    var scores: [64]f32 = undefined;
+    std.debug.assert(k <= scores.len);
+
+    // Children of a node (or the anchor, cand == null) at `depth`, pushed as log-softmax + parent value.
+    const Push = struct {
+        fn run(alloc: std.mem.Allocator, q: *std.ArrayList(Item), l: *const Lattice, sc: []f32, pp: TreeParams, parent: i32, parent_cand: ?u32, depth: u32, base: f32) !void {
+            const kk = l.k;
+            const t = @max(pp.temperature, 1e-6);
+            var mx: f32 = -std.math.inf(f32);
+            for (sc, 0..) |*v, j| {
+                const edge = if (parent_cand) |a| l.e[(@as(usize, depth) - 1) * kk * kk + a * kk + j] else l.e0[j];
+                var raw = (l.unary[@as(usize, depth) * kk + j] + pp.edge_w * edge) / t;
+                if (pp.noise) |nz| raw += pp.noise_w * nz[@as(usize, depth) * kk + j];
+                v.* = raw / pp.tau;
+                mx = @max(mx, v.*);
+            }
+            var total: f32 = 0;
+            for (sc) |v| total += @exp(v - mx);
+            const lse = mx + @log(total);
+            var taken: [64]bool = @splat(false);
+            for (0..@min(pp.children, kk)) |_| {
+                var best: usize = 0;
+                var best_v: f32 = -std.math.inf(f32);
+                for (sc, 0..) |v, j| if (!taken[j] and v > best_v) {
+                    best_v = v;
+                    best = j;
+                };
+                taken[best] = true;
+                try q.append(alloc, .{ .value = base + best_v - lse, .parent = parent, .depth = depth, .cand = @intCast(best) });
+            }
+        }
+    };
+    try Push.run(allocator, &queue, lat, scores[0..k], p, -1, null, 0, 0);
+    var n: usize = 0;
+    while (n < p.max_nodes and queue.items.len > 0) {
+        var bi: usize = 0;
+        for (queue.items, 0..) |it, i| if (it.value > queue.items[bi].value) {
+            bi = i;
+        };
+        const it = queue.swapRemove(bi);
+        tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
+        tree.parents[n] = it.parent;
+        tree.depth[n] = it.depth;
+        if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
+        n += 1;
+    }
+    if (n < p.max_nodes) {
+        tree.tokens = try allocator.realloc(tree.tokens, n);
+        tree.parents = try allocator.realloc(tree.parents, n);
+        tree.depth = try allocator.realloc(tree.depth, n);
+    }
+    try preorder(allocator, &tree);
+    return tree;
+}
+
+/// Renumber the nodes depth-first, each node's children in the order they
+/// were taken (best first): the likeliest path lands on consecutive rows, so
+/// a round that keeps it moves no KV rows.
+fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
+    const n = t.tokens.len;
+    if (n == 0) return;
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    const new_index = try allocator.alloc(i32, n);
+    defer allocator.free(new_index);
+    var stack: std.ArrayList(i32) = .empty;
+    defer stack.deinit(allocator);
+    var out: usize = 0;
+    // Roots (parent -1) in taken order, visited depth-first.
+    var root_i: usize = n;
+    while (root_i > 0) {
+        root_i -= 1;
+        if (t.parents[root_i] < 0) try stack.append(allocator, @intCast(root_i));
+    }
+    while (stack.pop()) |node| {
+        order[out] = @intCast(node);
+        new_index[@intCast(node)] = @intCast(out);
+        out += 1;
+        var c: usize = n;
+        while (c > 0) {
+            c -= 1;
+            if (t.parents[c] == node) try stack.append(allocator, @intCast(c));
+        }
+    }
+    const tokens = try allocator.dupe(u32, t.tokens);
+    defer allocator.free(tokens);
+    const parents = try allocator.dupe(i32, t.parents);
+    defer allocator.free(parents);
+    const depth = try allocator.dupe(u32, t.depth);
+    defer allocator.free(depth);
+    for (order, 0..) |old, i| {
+        t.tokens[i] = tokens[old];
+        t.depth[i] = depth[old];
+        t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
+    }
+}
+
+/// Reference `CandidateSelector.select`: top-k candidates per position by
+/// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
+/// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
+/// edge scores are precomputed in ONE batched GPU dispatch ([m-1, k, k] +
+/// the anchor row) and the 16-wide trace runs on host — same math as the
+/// reference's sequential loop, chosen path identical, no per-step sync.
+///
+/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
+/// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
+/// already has the anchor row dropped (`[1, m, V]`).
+pub fn selectPath(
+    allocator: std.mem.Allocator,
+    sel: *const Selector,
+    top_k: u32,
+    blk_hidden: mlx.mlx_array,
+    draft_logits: mlx.mlx_array,
+    anchor_id: u32,
+    temperature: f32,
+    rand: std.Random,
+    s: mlx.mlx_stream,
+) !SelectedPath {
+    var lat = try lattice(allocator, sel, top_k, blk_hidden, draft_logits, anchor_id, s);
+    defer lat.deinit(allocator);
+    const m = lat.m;
+    const k = lat.k;
+    const cand_data = lat.cands;
+    const unary_data = lat.unary;
+    const e0_data = lat.e0;
+    const e_data: ?[]const f32 = if (lat.e.len > 0) lat.e else null;
 
     const stochastic = temperature > 0;
     var out = SelectedPath{
@@ -3707,4 +3889,36 @@ test "dflash: every server-side drafter-loaded gate also consults lm.dflash (per
     }
     // Zero means the gates were renamed and this guard went vacuous.
     try testing.expect(checked >= 10);
+}
+
+test "bestFirstTree: the confident chain comes first, then its likeliest sibling" {
+    const allocator = std.testing.allocator;
+    // m = 3 positions, k = 3 candidates; candidate 0 dominates, candidate 1 is
+    // a close second at position 0 only; no pairwise preference.
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22, 30, 31, 32 };
+    var unary = [_]f32{ 5, 4.5, 0, 8, 0, 0, 8, 0, 0 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [18]f32 = @splat(0);
+    const lat = Lattice{ .m = 3, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var t = try bestFirstTree(allocator, &lat, .{ .max_nodes = 4, .tau = 1.0, .edge_w = 1.0 });
+    defer t.deinit(allocator);
+    // Depth-first rows: the taken chain 10-20-30 first, then the sibling 11.
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 11 }, t.tokens);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1, -1 }, t.parents);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 0 }, t.depth);
+}
+
+test "bestFirstTree: rows are depth-first, the best child's subtree before its siblings" {
+    const allocator = std.testing.allocator;
+    // Two near-equal candidates at position 0, one clear candidate after each.
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22 };
+    var unary = [_]f32{ 3, 2.9, -9, 9, -9, -9 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [9]f32 = @splat(0);
+    const lat = Lattice{ .m = 2, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var t = try bestFirstTree(allocator, &lat, .{ .max_nodes = 4, .tau = 1.0, .edge_w = 1.0, .children = 2 });
+    defer t.deinit(allocator);
+    // Taken: 10, 11, 20 under 10, 20 under 11 -> depth-first: 10, 20, 11, 20.
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 11, 20 }, t.tokens);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, -1, 2 }, t.parents);
 }

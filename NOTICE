@@ -358,6 +358,26 @@ head requantization uses our existing per-weight quantization path, and the
 crossrow kernel is emitted by comptime codegen with our own host dispatch
 (paired input groups instead of their idle-odd-threadgroup reuse).
 
+--------------------------------------------------------------------------------
+TensorFold
+https://github.com/ashhart/TensorFold
+Copyright (c) 2026 TensorFold contributors
+Licensed under the MIT License.
+
+Ported into mlx-serve:
+  - `src/rowqmv.zig`: the row-exact 4-bit matvec, routed-expert and router
+    kernels of `rows.py` (one simdgroup per input row, MLX's qmv_fast loop).
+  - `src/simd_qmm.zig`: the `simd_qmm` fixed-order matmul kernels.
+  - `src/row_attn.zig`: the fixed-split row attention of `row_attention`.
+  - `src/keyed_sample.zig`: the keyed Gumbel-max GPU sampler of
+    `gpu_sampling.py` (Metal source reproduced unchanged).
+  - `src/dflash.zig`: the best-first draft-tree parameters and the
+    lattice/tree construction scheme.
+
+Modifications by mlx-serve: reimplemented in Zig against mlx-c with our own
+host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify
+through our GDN fold kernel and path attention.
+
 
 ================================================================================
 Other licenses

@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -33,6 +34,7 @@ const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
+const gdn_decode = @import("gdn_decode.zig");
 const KVCache = transformer_mod.KVCache;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
@@ -795,6 +797,13 @@ pub const SamplingParams = struct {
     /// sampling policy. Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
+    /// Seeded draws go through `keyed_sample`: a token's noise is a hash of
+    /// (seed, position, id), so a draft shares the draw its verify row makes
+    /// (row-exact archs, `ModelConfig.rowExactDecode`).
+    keyed: bool = false,
+    /// Absolute position of generated token 0 (the prompt length): a keyed
+    /// draw's position is `position_base + draw`.
+    position_base: u64 = 0,
 };
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
@@ -1468,6 +1477,14 @@ pub const Generator = struct {
     mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
     mtp_accept_param: f32 = 0,
+    /// A row-exact trunk verifies sampled rounds with the serial sampler itself:
+    /// row i draws with the key serial decoding uses at that position and a
+    /// draft stays only when it is that draw, so the stream is serial's.
+    mtp_serial_accept: bool = false,
+    /// This request's kept / tried first drafts (`mtpExactDepth`).
+    mtp_kept: u32 = 0,
+    mtp_tried: u32 = 0,
+    mtp_cycle_watch: ?io_util.Stopwatch = null,
     /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
     model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
@@ -2319,6 +2336,14 @@ pub const Generator = struct {
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
+        sampling.keyed = xfm.config.rowExactDecode();
+        sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
+        // Spec drafts and verify rows share the serial sampler's keys, so an
+        // unseeded sampled request gets its own random seed.
+        if (sampling.keyed and sampling.seed == null and sampling.temperature > 0.01) {
+            var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
+            sampling.seed = prng.random().int(u64);
+        }
         // DeepSeek-V4 hard-off, at the ONE chokepoint every init site
         // funnels through: dsv4's per-request state lives on the module
         // (rings + compressed caches) and a spec VERIFY forward appends
@@ -3223,6 +3248,7 @@ pub const Generator = struct {
                 .mtp_accept_graph = accept_route.graph,
                 .mtp_accept_prefix = accept_route.prefix,
                 .mtp_accept_param = accept_route.param,
+                .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
                 .mtp_depth = resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile),
@@ -5052,7 +5078,10 @@ pub const Generator = struct {
         // track p and keeps acceptance flat across temperature. Greedy
         // requests keep the argmax path untouched, so the byte-equality
         // guard is unaffected.
-        const stochastic = self.sampling.temperature > 0.01;
+        // A row-exact trunk samples with the serial sampler's keys: drafts
+        // drawn with the verify row's key, rows kept only while they match.
+        const serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
+        const stochastic = self.sampling.temperature > 0.01 and !serial;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
         // block sampling. Greedy requests keep the byte-equality bar (a
@@ -5069,6 +5098,9 @@ pub const Generator = struct {
         // an uncorrected distribution the sidecar was never trained to emit.
         const use_markov = model.markov != null and dflashMarkovEnabled();
         const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
+        if (use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported()) {
+            return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial);
+        }
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
@@ -5147,6 +5179,8 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(host_arr);
             try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
         } else if (use_selector) {
+            // A serial-sampled request drafts the greedy path: over 20 seeds it
+            // kept more drafts than paths scored with the verify rows' noise.
             const sel_temp: f32 = if (stochastic) self.sampling.temperature else 0.0;
             sel_path = try dflash_mod.selectPath(
                 allocator,
@@ -5265,7 +5299,10 @@ pub const Generator = struct {
         var verify_argmax: CommittedArgmax = .{};
         defer verify_argmax.deinit();
         if (!stochastic) {
-            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
+            verify_argmax = if (serial)
+                try self.verifySerialSamples(verify_logits, 1 + m)
+            else
+                try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -5331,6 +5368,7 @@ pub const Generator = struct {
             self.completion_tokens,
             self.max_tokens,
         );
+        if (serial) self.sampling.draw = self.generated_ids.items.len + accepted + 2;
 
         const next_pending: u32 = blk: {
             if (stochastic) {
@@ -5464,6 +5502,209 @@ pub const Generator = struct {
         };
     }
 
+    var dflash_tree_logged = false;
+    /// A verify forward goes to the GPU every this many layers while the rest
+    /// of its graph is built (27B tree rounds: 52.8 -> 50.3 ms).
+    const VERIFY_PIPELINE_LAYERS: u32 = 4;
+
+    /// `[m, k]` Gumbel noise each lattice position's candidates get from the
+    /// keyed draw of its verify row (generated index G + 1 + position).
+    fn treeNoise(self: *const Generator, allocator: std.mem.Allocator, lat: *const dflash_mod.Lattice) ![]f32 {
+        const out = try allocator.alloc(f32, lat.m * lat.k);
+        const base = self.sampling.position_base + self.generated_ids.items.len + 1;
+        for (0..lat.m) |d| for (0..lat.k) |j| {
+            out[d * lat.k + j] = keyed_sample.gumbel(self.sampling.seed.?, base + d, @intCast(lat.cands[d * lat.k + j]));
+        };
+        return out;
+    }
+
+    /// One DFlash2 round over a best-first draft TREE instead of the selector's
+    /// single path: every node is verified in one forward (each row the serial
+    /// step along its ancestors), the target's token walked down the tree from
+    /// the root, and the accepted path committed into the KV cache, the GDN
+    /// state and the assistant context.
+    fn dflashTreeRound(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        model: *DflashModel,
+        dctx: *dflash_mod.DflashCtx,
+        blk_hidden: mlx.mlx_array,
+        draft_logits: mlx.mlx_array,
+        t1: u32,
+        m: u32,
+        anchor_pos: usize,
+        kv_step_snap: usize,
+        serial: bool,
+    ) !DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const MAX_W = 16;
+        var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden, draft_logits, t1, s);
+        defer lat.deinit(allocator);
+        // A sampled target's scores carry its own noise at each position's candidates.
+        const noise: ?[]f32 = if (serial) try self.treeNoise(allocator, &lat) else null;
+        defer if (noise) |nz| allocator.free(nz);
+        var tree = try dflash_mod.bestFirstTree(allocator, &lat, .{
+            .max_nodes = @min(m, MAX_W - 1),
+            .temperature = if (serial) self.sampling.temperature else 1.0,
+            .noise = noise,
+        });
+        defer tree.deinit(allocator);
+        if (!dflash_tree_logged) {
+            dflash_tree_logged = true;
+            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{@min(m, MAX_W - 1)});
+        }
+
+        // Rows: 0 = t1 (the root), 1 + i = tree node i.
+        const w: usize = 1 + tree.tokens.len;
+        var parents: [MAX_W]i32 = undefined;
+        var depth: [MAX_W]i32 = undefined;
+        var toks: [MAX_W]i32 = undefined;
+        parents[0] = -1;
+        depth[0] = 0;
+        toks[0] = @intCast(t1);
+        var max_depth: i32 = 0;
+        for (tree.tokens, tree.parents, tree.depth, 1..) |tok, par, d, row| {
+            parents[row] = if (par < 0) 0 else par + 1;
+            depth[row] = @intCast(d + 1);
+            toks[row] = @intCast(tok);
+            max_depth = @max(max_depth, depth[row]);
+        }
+        const maxd: usize = @intCast(max_depth + 1);
+        var path: [MAX_W * MAX_W]i32 = @splat(0);
+        for (0..w) |r| {
+            var cur: i32 = @intCast(r);
+            var d = depth[r];
+            while (cur >= 0) : (d -= 1) {
+                path[r * maxd + @as(usize, @intCast(d))] = cur;
+                cur = parents[@intCast(cur)];
+            }
+        }
+        const wc: c_int = @intCast(w);
+        var table: [5 * MAX_W]i32 = undefined;
+        gdn_decode.treeTable(parents[0..w], table[0 .. 5 * w]);
+        const par_arr = mlx.mlx_array_new_data(&table, &[_]c_int{5 * wc}, 1, .int32);
+        defer _ = mlx.mlx_array_free(par_arr);
+        const dep_arr = mlx.mlx_array_new_data(&depth, &[_]c_int{wc}, 1, .int32);
+        defer _ = mlx.mlx_array_free(dep_arr);
+        const path_arr = mlx.mlx_array_new_data(&path, &[_]c_int{ wc, @intCast(maxd) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(path_arr);
+        const spec_tree = transformer_mod.SpecTree{ .parents = par_arr, .attn = .{ .depth = dep_arr, .path = path_arr, .max_depth = max_depth } };
+        const verify_input = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, wc }, 2, .int32);
+        defer _ = mlx.mlx_array_free(verify_input);
+
+        const cap_out = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (cap_out) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(cap_out);
+        }
+        for (cap_out) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        self.ctx.capture_layers = &cl;
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        self.ctx.tree = &spec_tree;
+        self.ctx.pipeline_build = VERIFY_PIPELINE_LAYERS;
+        const verify_logits = xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_layers = null;
+        self.ctx.capture_ssm_seq = false;
+        self.ctx.tree = null;
+        self.ctx.pipeline_build = 0;
+        const logits = try verify_logits;
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
+        self.dflash_attempted += 1;
+
+        var targets = blk: {
+            defer _ = mlx.mlx_array_free(logits);
+            break :blk if (serial)
+                try self.verifySerialSamplesAt(logits, w, depth[0..w])
+            else
+                try verifyArgmax(logits, self.sampling.suppress_mask, s);
+        };
+        defer targets.deinit();
+        try mlx.check(mlx.mlx_array_eval(targets.lazy()));
+        const ids = try targets.ids(w);
+
+        // Walk the target's tokens down the tree.
+        var path_rows: [MAX_W]u32 = undefined;
+        path_rows[0] = 0;
+        var accepted: u32 = 0;
+        walk: while (true) {
+            const cur = path_rows[accepted];
+            const want: i32 = ids[cur];
+            for (1..w) |c| {
+                if (parents[c] == @as(i32, @intCast(cur)) and toks[c] == want) {
+                    accepted += 1;
+                    path_rows[accepted] = @intCast(c);
+                    continue :walk;
+                }
+            }
+            break;
+        }
+        accepted = capAcceptedForTokenBudget(accepted, self.completion_tokens, self.max_tokens);
+        const next_pending: u32 = @intCast(ids[path_rows[accepted]]);
+        if (serial) self.sampling.draw = self.generated_ids.items.len + accepted + 2;
+
+        // Commit: the accepted path's KV rows move to consecutive positions,
+        // the GDN state is the last kept node's, the conv window its path's.
+        const n_commit: usize = 1 + @as(usize, accepted);
+        var moved = false;
+        for (1..n_commit) |j| {
+            if (path_rows[j] != j) moved = true;
+        }
+        if (moved) try self.ctx.cache.compactRows(anchor_pos, path_rows[1..n_commit], s);
+        try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+        self.ctx.cache.step = kv_step_snap;
+        if (self.ctx.ssm_entries) |entries| {
+            var conv_rows: [3]i32 = undefined;
+            for (0..3) |i| {
+                const dd: i32 = @as(i32, @intCast(accepted)) - 2 + @as(i32, @intCast(i));
+                conv_rows[i] = if (dd < 0) dd + 3 else 3 + @as(i32, @intCast(path_rows[@intCast(dd)]));
+            }
+            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, path_rows[accepted], conv_rows, s);
+        }
+        self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+        if (accepted + 1 < w) self.partial_rounds += 1;
+
+        // The assistant context grows by the kept rows' captures.
+        {
+            var idx_buf: [MAX_W]i32 = undefined;
+            for (0..n_commit) |j| idx_buf[j] = @intCast(path_rows[j]);
+            const idx = mlx.mlx_array_new_data(&idx_buf, &[_]c_int{@intCast(n_commit)}, 1, .int32);
+            defer _ = mlx.mlx_array_free(idx);
+            const kept = try allocator.alloc(mlx.mlx_array, cap_out.len);
+            var kept_n: usize = 0;
+            defer {
+                for (kept[0..kept_n]) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(kept);
+            }
+            for (cap_out, kept) |full, *out| {
+                out.* = mlx.mlx_array_new();
+                kept_n += 1;
+                try mlx.check(mlx.mlx_take_axis(out, full, idx, 1, s));
+            }
+            try dflash_mod.appendContext(model, dctx, kept, anchor_pos);
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            dctx.appendEvalArrays(eval_vec);
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+        }
+
+        const tokens = try allocator.alloc(u32, n_commit);
+        for (0..n_commit) |j| tokens[j] = @intCast(toks[path_rows[j]]);
+        for (tokens) |t| try self.generated_ids.append(allocator, t);
+        self.dflash_accepted_tokens += accepted;
+        self.next_token_id = next_pending;
+        self.advanceStep(@intCast(n_commit));
+        self.checkDflashRuntimeGate();
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
+    }
+
     /// Sticky like every DFlash serial switch: plain rounds do not extend the assistant context.
     pub fn dflashYieldToCompany(self: *Generator) void {
         if (self.dflash == null or self.spec_disabled_runtime) return;
@@ -5591,6 +5832,47 @@ pub const Generator = struct {
         };
     }
 
+    /// The serial sampler's draw for every verify row: row i is the token at
+    /// generated index G + 1 + i (t1 sits at G), keyed by that index.
+    fn verifySerialSamples(self: *const Generator, logits: mlx.mlx_array, rows: usize) !CommittedArgmax {
+        return self.verifySerialSamplesAt(logits, rows, null);
+    }
+
+    /// `verifySerialSamples` for a tree's rows: row i is the token at generated
+    /// index G + 1 + depth[i].
+    fn verifySerialSamplesAt(self: *const Generator, logits: mlx.mlx_array, rows: usize, depth: ?[]const i32) !CommittedArgmax {
+        const s = self.xfm.s;
+        const vocab = mlx.getShape(logits)[2];
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        const base = self.generated_ids.items.len + 1;
+        for (0..rows) |i| {
+            const ri: c_int = @intCast(i);
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, logits, &[_]c_int{ 0, ri, 0 }, 3, &[_]c_int{ 1, ri + 1, vocab }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            var sp = self.sampling;
+            sp.draw = base + (if (depth) |d| @as(usize, @intCast(d[i])) else i);
+            const tok = sampleTokenLazy(row, sp, s);
+            defer _ = mlx.mlx_array_free(tok);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, tok, &[_]c_int{1}, 1, s));
+            _ = mlx.mlx_vector_array_append_value(vec, flat);
+        }
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, cat, &[_]c_int{ 1, @intCast(rows) }, 2, s));
+        return .{ .arr = out };
+    }
+
+    /// Serial-accept rounds of a sampled request draft coupled to the serial draws.
+    fn mtpCoupledDrafts(self: *const Generator) bool {
+        return self.mtp_serial_accept and self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
+    }
+
     /// Allocate one request-local categorical draw index while the lazy MTP
     /// graph is built. The same counter covers draft and correction samples,
     /// including cross-round pre-drafts, so no two keyed draws reuse a key.
@@ -5618,6 +5900,8 @@ pub const Generator = struct {
         /// Lazy `[1]` int32 draft ids. len = plan.m_hi; [0..n_drafted) valid.
         draft_arrs: []mlx.mlx_array,
         n_drafted: u32,
+        /// Generated index the first draft proposes (a coupled draft's key).
+        pos0: usize = 0,
         head_input_rows: u32 = 1,
         /// Chunk-A log-confidence graphs (two-chunk plans only). len m_lo.
         conf_arrs: ?[]mlx.mlx_array,
@@ -5674,6 +5958,7 @@ pub const Generator = struct {
             .head_input_rows = @intCast(1 + if (self.mtp_hist_stash) |stash| stash.n else @as(usize, 0)),
             .t1 = t1,
             .t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32),
+            .pos0 = self.generated_ids.items.len + 1,
             .drafts = drafts,
             .draft_arrs = draft_arrs,
             .n_drafted = 0,
@@ -6093,7 +6378,7 @@ pub const Generator = struct {
         const mc = &self.mtp_cache.?;
         const draft_sampling = self.mtpDraftSampling();
         const mtp_mrope_ctx = self.mtpMropeContext();
-        const rerank_drafts = head.canRerankDrafts();
+        const rerank_drafts = self.mtpRerankDrafts();
         std.debug.assert(chain.n_drafted == from);
         var i: u32 = from;
         while (i < to) : (i += 1) {
@@ -6191,6 +6476,11 @@ pub const Generator = struct {
                 slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
                 chain.n_qp = i + 1;
                 chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], self.mtpSamplingDraw(draft_sampling), s);
+            } else if (self.mtpCoupledDrafts()) {
+                // The verify row's own keyed draw over the head's logits.
+                var sp = self.sampling;
+                sp.draw = chain.pos0 + i;
+                chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, sp, s);
             } else {
                 chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
             }
@@ -6287,9 +6577,16 @@ pub const Generator = struct {
     /// `.mixed_last_row` head forward, only the tail over the 32 candidates
     /// differs — so a mixed sampled/greedy workload does not split the step into
     /// two head forwards.
+    /// Row-exact rounds draft from the head's full logits: the coarse
+    /// shortlist costs more than it saves there, and a sampled draft needs the
+    /// verify row's keyed draw over the full row.
+    fn mtpRerankDrafts(self: *const Generator) bool {
+        return !self.mtp_serial_accept and self.mtp.?.canRerankDrafts();
+    }
+
     fn mtpRowRerankMode(g: *Generator, c: *const MtpPreDraft, step: u32) bool {
         const conf_needed = c.conf_arrs != null and step < c.plan.m_lo;
-        return mtpDraftStepPath(g.mtp.?.canRerankDrafts(), c.q_probs != null, conf_needed) != .full_logits;
+        return mtpDraftStepPath(g.mtpRerankDrafts(), c.q_probs != null, conf_needed) != .full_logits;
     }
 
     pub fn mtpChainBuildBatched(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
@@ -7746,6 +8043,8 @@ pub const Generator = struct {
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
         self.ctx.ple_defer = true;
+        self.ctx.pipeline_build = if (self.mtp_serial_accept) VERIFY_PIPELINE_LAYERS else 0;
+        defer self.ctx.pipeline_build = 0;
         const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -7885,7 +8184,7 @@ pub const Generator = struct {
         var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
         var k: usize = 0;
         for (gens, states, 0..) |gen, st, i| {
-            if (gen.sampling.temperature <= 0.01) continue;
+            if (gen.sampling.temperature <= 0.01 or gen.mtp_serial_accept) continue;
             if (st.chain.m == 0 or st.verify_len != 1 + st.chain.m) return;
             rows[k] = i;
             params[k] = gen.sampling;
@@ -8046,7 +8345,7 @@ pub const Generator = struct {
         // realizes the whole round. The old per-draft probAt()/sampleResidual()
         // calls cost one GPU round-trip sync EACH — 3-5 syncs per round that
         // stalled the pipeline for milliseconds while the GPU sat idle.
-        const stochastic = self.sampling.temperature > 0.01;
+        const stochastic = self.sampling.temperature > 0.01 and !self.mtp_serial_accept;
         const vl_shape = mlx.getShape(verify_logits);
 
         var per_pos_probs: ?[]mlx.mlx_array = null;
@@ -8234,7 +8533,10 @@ pub const Generator = struct {
         st.verify_argmax = .{};
         defer verify_argmax.deinit();
         if (!group_argmax and !stochastic) {
-            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
+            verify_argmax = if (self.mtp_serial_accept and self.sampling.temperature > 0.01)
+                try self.verifySerialSamples(verify_logits, st.verify_len)
+            else
+                try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -8343,6 +8645,9 @@ pub const Generator = struct {
         }
 
         const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned) self.eos_token_ids else &.{});
+        // t1 sits at generated index G, the kept drafts after it, the pending
+        // token next: the serial sampler's next draw is the one after that.
+        if (self.mtp_serial_accept) self.sampling.draw = self.generated_ids.items.len + stop_prefix.accepted + 2;
         if (stop_prefix.stop) |token| log.debug("[mtp-stop] accepted EOS token={d} accepted={d}->{d}\n", .{ token, accepted, stop_prefix.accepted });
         accepted = stop_prefix.accepted;
         const next_pending: u32 = blk: {
@@ -8711,7 +9016,7 @@ pub const Generator = struct {
     pub fn mtpDraftSampling(self: *const Generator) SamplingParams {
         return mtpDraftSamplingFor(
             self.sampling,
-            mtpDraftGreedyFor(self.sampling, mtpDraftProposalEnv()),
+            self.mtp_serial_accept or mtpDraftGreedyFor(self.sampling, mtpDraftProposalEnv()),
             mtpDraftTempFor(&self.xfm.config),
         );
     }
@@ -9086,7 +9391,52 @@ pub const Generator = struct {
     /// the kv term, the regime gate and the round-cost table all read ONE
     /// inter-round wall clock (tok/s is measured between round ends, so
     /// per-round work outside the round stopwatch belongs to the width).
+    /// The depth (1 or 2) with the most expected tokens per ms: this request's
+    /// acceptance against the model's measured round ms per depth. A depth
+    /// never measured on this model runs first; every MTP_EXACT_PROBE rounds
+    /// on the model the other depth runs, so both costs stay current.
+    fn mtpExactDepth(self: *Generator, cap: u32) u32 {
+        const ms = &self.xfm.mtp_depth_ms;
+        var d: u32 = 1;
+        while (d <= cap) : (d += 1) if (ms[d] == 0) return d;
+        if (cap < 2) return 1;
+        const a = self.mtpExactAcceptance();
+        const tok1 = 1 + a;
+        const tok2 = tok1 + a * a;
+        const best: u32 = if (tok2 / ms[2] > tok1 / ms[1]) 2 else 1;
+        self.xfm.mtp_depth_rounds +%= 1;
+        return if (self.xfm.mtp_depth_rounds % MTP_EXACT_PROBE == 0) 3 - best else best;
+    }
+    const MTP_EXACT_PROBE = 64;
+
+    /// This request's first-draft acceptance: its own counts over a prior of
+    /// MTP_EXACT_PRIOR_ROUNDS rounds at the model's rate. A second draft is
+    /// kept about as often as a first on the same text, so it stands for both.
+    fn mtpExactAcceptance(self: *const Generator) f32 {
+        const kept: f32 = @floatFromInt(self.mtp_kept);
+        const tried: f32 = @floatFromInt(self.mtp_tried);
+        return (kept + MTP_EXACT_PRIOR_ROUNDS * self.xfm.mtp_depth_acc) / (tried + MTP_EXACT_PRIOR_ROUNDS);
+    }
+    const MTP_EXACT_PRIOR_ROUNDS = 8;
+
+    /// `m` drafts, `accepted` kept. A round's cost is the wall time since the
+    /// previous round ended: everything a round adds to the request, streaming included.
+    fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
+        if (m == 0 or m >= self.xfm.mtp_depth_ms.len) return;
+        if (self.mtp_cycle_watch) |*w| {
+            const cycle_ms = @as(f32, @floatFromInt(w.read())) / std.time.ns_per_ms;
+            const ms = &self.xfm.mtp_depth_ms[m];
+            // A stall (streaming, another request) is not this depth's cost.
+            if (ms.* == 0) ms.* = cycle_ms else if (cycle_ms < 2 * ms.*) ms.* += 0.2 * (cycle_ms - ms.*);
+            w.reset();
+        } else self.mtp_cycle_watch = io_util.Stopwatch.init(self.timer.io);
+        self.mtp_tried += 1;
+        self.mtp_kept += @intFromBool(accepted >= 1);
+        self.xfm.mtp_depth_acc += 0.02 * (@as(f32, @floatFromInt(@intFromBool(accepted >= 1))) - self.xfm.mtp_depth_acc);
+    }
+
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
+        if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
         if (group_planner.enabled() and self.mtp_planner_width != null) return;
         // An interval spanning a speculative round is neither arm's number.
         self.mtp_serial_clock = null;
@@ -10699,9 +11049,9 @@ pub const Generator = struct {
 
     /// One debug line per planned round with every input the planner read.
     pub fn mtpPlannerMode(self: *const Generator) u8 {
-        const head = self.mtp orelse return 0;
+        if (self.mtp == null) return 0;
         const sharp = self.mtpDraftSampling().temperature > 0.01;
-        return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, self.sampling.temperature > 0.01);
+        return group_cost.GroupShape.samplingMode(self.mtpRerankDrafts(), false, sharp, self.sampling.temperature > 0.01);
     }
 
     fn mtpPlannerObserve(self: *Generator, observed: u32, accepted: u32) void {
@@ -10782,6 +11132,11 @@ pub const Generator = struct {
 
     fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
         if (mtpForcedDepth()) |d| {
+            self.mtp_ev_m_lo_prev = d;
+            return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
+        }
+        if (self.mtp_serial_accept) {
+            const d = self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2));
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
@@ -12261,6 +12616,13 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         return result;
     }
 
+    if (sampling.keyed and sampling.seed != null) {
+        defer _ = mlx.mlx_array_free(current);
+        const p: keyed_sample.Params = .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k };
+        const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
+        return keyed_sample.sample(current, p, &pos, s) catch mlx.mlx_array_new();
+    }
+
     // Scale by 1/temperature
     if (sampling.temperature != 1.0) {
         const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
@@ -12477,6 +12839,7 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
 /// request replays byte-for-byte and consecutive draws never share a key.
 /// Null-ctx (MLX global RNG) when the request set no seed.
+/// `logits + Gumbel(key)` over the vocab row `[1, V]`, in f32.
 fn seedKey(sampling: SamplingParams) mlx.mlx_array {
     const seed = sampling.seed orelse return mlx.mlx_array_new();
     var key = mlx.mlx_array_new();
@@ -13602,6 +13965,16 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         if (logprobs_n > 0) {
             logprob_result = try computeLogprobs(allocator, last_logits, token_id, logprobs_n, s);
         }
+        return .{ .token_id = token_id, .logprob_result = logprob_result };
+    }
+
+    if (sampling.keyed and sampling.seed != null) {
+        const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
+        const tok = try keyed_sample.sample(current, .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k }, &pos, s);
+        defer _ = mlx.mlx_array_free(tok);
+        try mlx.check(mlx.mlx_array_eval(tok));
+        const token_id = (mlx.mlx_array_data_uint32(tok) orelse return error.MlxArrayDataNull)[0];
+        const logprob_result: ?LogprobResult = if (logprobs_n > 0) try computeLogprobs(allocator, last_logits, token_id, logprobs_n, s) else null;
         return .{ .token_id = token_id, .logprob_result = logprob_result };
     }
 
@@ -18392,7 +18765,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
 // exactly the serial greedy stream at whatever accepted counts the rounds
 // produce, through the hybrid path's pre-norm hidden capture, the fused-window
 // per-row SSM capture and the capture-based rollback.
-test "mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream" {
+test "mtp: nextMtp on a Nemotron-H trunk emits the serial stream, greedy and seeded" {
     if (mlx.noGpuBackend()) return;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -18565,53 +18938,57 @@ test "mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream" {
     const greedy = SamplingParams{ .temperature = 0.0 };
     const want: usize = 16;
 
-    var serial: [want]u32 = undefined;
-    {
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
-            .skip_lazy_preforward = true,
-        });
-        defer gen.deinit(allocator);
-        var n: usize = 0;
-        while (n < want) {
-            const t = (try gen.next(allocator)) orelse break;
-            serial[n] = t;
-            n += 1;
+    // Greedy, and a seeded sampler: a draft is kept only when the serial
+    // sampler draws it at that position, so both streams are the serial one.
+    for ([_]SamplingParams{ greedy, .{ .temperature = 1.0, .seed = 7 } }) |sp| {
+        var serial: [want]u32 = undefined;
+        {
+            var xfm = try Transformer.init(io, allocator, config, &weights);
+            defer xfm.deinit();
+            var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), sp, &.{}, .{
+                .skip_lazy_preforward = true,
+            });
+            defer gen.deinit(allocator);
+            var n: usize = 0;
+            while (n < want) {
+                const t = (try gen.next(allocator)) orelse break;
+                serial[n] = t;
+                n += 1;
+            }
+            try testing.expectEqual(want, n);
         }
-        try testing.expectEqual(want, n);
-    }
 
-    {
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var head = try mtp_mod.loadMtp(io, allocator, s, dir_path);
-        defer head.deinit();
-        try testing.expectEqual(mtp_mod.Layout.nemotron, head.layout);
-        try head.bind(&xfm);
+        {
+            var xfm = try Transformer.init(io, allocator, config, &weights);
+            defer xfm.deinit();
+            var head = try mtp_mod.loadMtp(io, allocator, s, dir_path);
+            defer head.deinit();
+            try testing.expectEqual(mtp_mod.Layout.nemotron, head.layout);
+            try head.bind(&xfm);
 
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
-            .mtp_enabled = true,
-            .mtp = .{ .qwen = &head },
-            .model_has_mtp = true,
-            .mtp_depth = 2,
-        });
-        defer gen.deinit(allocator);
+            var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), sp, &.{}, .{
+                .mtp_enabled = true,
+                .mtp = .{ .qwen = &head },
+                .model_has_mtp = true,
+                .mtp_depth = 2,
+            });
+            defer gen.deinit(allocator);
 
-        var got = std.ArrayList(u32).empty;
-        defer got.deinit(allocator);
-        while (true) {
-            const rounds_before = gen.mtp_attempted + gen.mtp_lookup_rounds;
-            const res = (try gen.nextMtp(allocator)) orelse break;
-            defer allocator.free(res.tokens);
-            try got.appendSlice(allocator, res.tokens);
-            // Every emitted token passes through a real spec round, head or lookup (no silent fallback).
-            try testing.expect(gen.mtp_attempted + gen.mtp_lookup_rounds != rounds_before);
+            var got = std.ArrayList(u32).empty;
+            defer got.deinit(allocator);
+            while (true) {
+                const rounds_before = gen.mtp_attempted + gen.mtp_lookup_rounds;
+                const res = (try gen.nextMtp(allocator)) orelse break;
+                defer allocator.free(res.tokens);
+                try got.appendSlice(allocator, res.tokens);
+                // Every emitted token passes through a real spec round, head or lookup (no silent fallback).
+                try testing.expect(gen.mtp_attempted + gen.mtp_lookup_rounds != rounds_before);
+            }
+            try testing.expect(gen.mtp_attempted > 0);
+            try testing.expect(!gen.spec_disabled_runtime);
+            try testing.expectEqual(want, got.items.len);
+            for (serial, got.items) |a, b| try testing.expectEqual(a, b);
         }
-        try testing.expect(gen.mtp_attempted > 0);
-        try testing.expect(!gen.spec_disabled_runtime);
-        try testing.expectEqual(want, got.items.len);
-        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
 
     // Bar: the head's attention is NoPE like the trunk's, so a history row's
@@ -21015,4 +21392,24 @@ test "constrained generation returns one logprob entry per token, paired with th
         }
     }
     try testing.expect(paired > 0);
+}
+
+test "keyed sampling draws the softmax distribution" {
+    const s = mlx.gpuStream();
+    const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var logv: [4]f32 = undefined;
+    for (probs, &logv) |p, *l| l.* = @log(p);
+    const logits = mlx.mlx_array_new_data(&logv, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var counts: [4]u32 = @splat(0);
+    const n: u32 = 4000;
+    for (0..n) |d| {
+        const tok = sampleTokenLazy(logits, .{ .temperature = 1.0, .seed = 11, .draw = d, .keyed = true }, s);
+        defer _ = mlx.mlx_array_free(tok);
+        try mlx.check(mlx.mlx_array_eval(tok));
+        var v: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&v, tok));
+        counts[@intCast(v)] += 1;
+    }
+    for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
 }

@@ -6,7 +6,8 @@
 # per-position SSM/conv state checkpoints". This test pins three invariants
 # against future regressions:
 #
-#  1. Warm output is byte-identical to cold (temperature=0, same prompt).
+#  1. Warm output is byte-identical to cold (temperature=0, same prompt; and
+#     seeded temperature=1, whose draws key on absolute positions).
 #  2. `cached_n` on the second identical request is > 0 (proof the cache
 #     actually engaged — the bug we're guarding against silently disabled
 #     itself if anything goes wrong in lookupAndRestore).
@@ -63,7 +64,7 @@ PY
 req_one() {
     curl -sf --max-time 60 -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg p "$PROMPT" '{messages:[{role:"user",content:$p}],max_tokens:40,temperature:0,stream:false}')"
+        -d "$(jq -nc --arg p "$PROMPT" --argjson t "${1:-0}" '{messages:[{role:"user",content:$p}],max_tokens:40,temperature:$t,top_k:20,seed:7,stream:false}')"
 }
 
 echo "--- cold ---"
@@ -90,6 +91,18 @@ if [ "$COLD_TEXT" != "$WARM_TEXT" ]; then
     EC=1
 else
     echo "✅ byte-identical output"
+fi
+
+echo "--- seeded temperature=1, cold then warm ---"
+PROMPT="Seeded. $PROMPT"
+SEED_COLD=$(req_one 1 | jq -r '.choices[0].message.content')
+SEED_WARM=$(req_one 1 | jq -r '.choices[0].message.content')
+if [ -z "$SEED_COLD" ] || [ "$SEED_COLD" != "$SEED_WARM" ]; then
+    echo "❌ FAIL: seeded warm output diverged from cold"
+    diff <(printf "%s" "$SEED_COLD") <(printf "%s" "$SEED_WARM") | head -20
+    EC=1
+else
+    echo "✅ seeded byte-identical output"
 fi
 
 if ! python3 -c "import sys; sys.exit(0 if $WARM_CACHED > 0 else 1)"; then

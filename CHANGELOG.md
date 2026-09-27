@@ -19,6 +19,9 @@
 - **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
 
 ### Changes
+- MTP and DFlash on Nemotron-H and dense Qwen3.5/3.8 emit exactly what serial decoding would, sampled requests included; seeded output on these models differs from earlier versions.
+- A seeded request gives the same text whether or not its prompt hit the prefix cache.
+- Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).

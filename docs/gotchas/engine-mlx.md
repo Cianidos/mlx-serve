@@ -5277,3 +5277,20 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   handles (a copy would stay resident beside the joined buffer) and reports
   `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
 
+## Drafted output differed from serial, and seeded output from itself on a cache hit (2026-09-27)
+
+- Defect: speculative rounds on Nemotron-H / Qwen3.5 produced text that differed from serial
+  decoding at T=1 even with the same seed, and a seeded request changed its text on a
+  prefix-cache hit.
+- Cause: a verify row's bits differed from the one-row step (MLX kernels reduce in a
+  width-dependent order; the GDN window kept an f32 state where serial stores bf16 per
+  token; the MoE combine summed differently at T>1), rows sampled with a different key than
+  serial, and the sampler position counted from the uncached prompt suffix.
+- Fix: row-exact kernels ported from TensorFold (`rowqmv`, `simd_qmm`, `row_attn`), per-token
+  state rounding in `gdn_decode`, `keyed_sample` (hash of seed, absolute position, id) for
+  verify rows and drafts alike, `position_base` = full prompt length.
+- Trap: `--no-mtp` still runs PLD, whose sampled acceptance is not serial; compare against
+  `--no-mtp --no-pld --no-drafter`.
+- Guard: `gdn_decode.recurSeq: a T-row window equals T one-row calls`, the rowqmv/simd_qmm/
+  row_attn width-invariance tests, `keyed_sample` pinned to TensorFold's reference tokens,
+  seeded cold==warm in `tests/test_hybrid_reuse_equivalence.sh`.

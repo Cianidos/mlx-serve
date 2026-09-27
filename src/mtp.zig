@@ -1526,6 +1526,7 @@ pub const sidecar_rel_paths = [_][]const u8{
     "model-mtp.safetensors", // others
     "optiq/mtp.safetensors", // oMLX OptiQ (delta-encoded norms — folded at load)
     "mtp_head.safetensors", // Nemotron-H heads (sevren-ai packs, bare keys)
+    "mtp-4bit.safetensors", // Nemotron-H heads (TensorFold's Vontra packs)
 };
 
 /// Relative path (one of `sidecar_rel_paths`) of the first sidecar file under
@@ -1566,6 +1567,7 @@ const mtp_marker_keys = [_][]const u8{
     "mtp.eh_proj.weight",
     "language_model.mtp.eh_proj.weight",
     "attn.mixer.q_proj.weight", // Nemotron-H head (bare keys, dense `eh_proj`)
+    "layers.0.eh_proj.weight", // Nemotron-H head (TensorFold names)
 };
 
 /// Any tensor belonging to the head (either root prefix).
@@ -2239,9 +2241,13 @@ pub fn loadMtp(
         }
     };
 
-    // Nemotron-H layout: bare keys, `attn.*` + `moe.*` blocks, dense `eh_proj`.
+    // Nemotron-H layout: bare keys, `attn.*` + `moe.*` blocks, dense `eh_proj`;
+    // or the same head under TensorFold's `layers.0/1` names.
     if (weights.get("attn.mixer.q_proj.weight") != null) {
-        return loadNemotronMtp(allocator, s, &weights);
+        return loadNemotronMtp(allocator, s, &weights, .sevren);
+    }
+    if (weights.get("layers.0.eh_proj.weight") != null and weights.get("layers.1.final_layernorm.weight") != null) {
+        return loadNemotronMtp(allocator, s, &weights, .tensorfold);
     }
     // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
     // sigmoid-router MoE). Detected by its distinctive projection name.
@@ -2628,42 +2634,66 @@ fn loadHy3Mtp(
 /// → the trunk's lm_head. Attention is the trunk's (RoPE, no QK norm, no
 /// output gate); the MoE is the trunk's `nemotronMoe`. `h` is the residual
 /// BEFORE the trunk's final norm.
-fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights) !MtpModel {
-    const has_shared = weights.get("moe.mixer.shared_experts.up_proj.weight") != null;
+/// Tensor names of a Nemotron-H MTP head: sevren-ai's bare keys (dense
+/// `eh_proj`) or TensorFold's module names (4-bit `eh_proj`).
+const NemotronMtpNames = struct {
+    attn: []const u8,
+    moe: []const u8,
+    eh_proj: []const u8,
+    enorm: []const u8,
+    hnorm: []const u8,
+    final_norm: []const u8,
+
+    const sevren = NemotronMtpNames{ .attn = "attn.", .moe = "moe.", .eh_proj = "eh_proj", .enorm = "enorm", .hnorm = "hnorm", .final_norm = "final_norm" };
+    const tensorfold = NemotronMtpNames{ .attn = "layers.0.", .moe = "layers.1.", .eh_proj = "layers.0.eh_proj", .enorm = "layers.0.enorm.weight", .hnorm = "layers.0.hnorm.weight", .final_norm = "layers.1.final_layernorm.weight" };
+
+    fn key(buf: []u8, block: []const u8, rest: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ block, rest }) catch unreachable;
+    }
+};
+
+fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights, names: NemotronMtpNames) !MtpModel {
+    const N = NemotronMtpNames;
+    var kb: [256]u8 = undefined;
+    const has_shared = weights.get(N.key(&kb, names.moe, "mixer.shared_experts.up_proj.weight")) != null;
     // Every tensor lands in a local that frees itself on error; `m` below is
     // built with no fallible call and takes them all over.
-    var fc1 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc1");
+    var fc1 = try loadMoeTriple(weights, N.key(&kb, names.moe, "mixer.switch_mlp.fc1"));
     errdefer fc1.deinit();
-    var fc2 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc2");
+    var fc2 = try loadMoeTriple(weights, N.key(&kb, names.moe, "mixer.switch_mlp.fc2"));
     errdefer fc2.deinit();
-    var router = try loadLinear(weights, allocator, "moe.mixer.gate", s);
+    var router = try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.gate"), s);
     errdefer router.deinit();
-    var shared_up: ?QLinear = if (has_shared) try loadLinear(weights, allocator, "moe.mixer.shared_experts.up_proj", s) else null;
+    var shared_up: ?QLinear = if (has_shared) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.shared_experts.up_proj"), s) else null;
     errdefer if (shared_up) |*l| l.deinit();
-    var shared_down: ?QLinear = if (has_shared) try loadLinear(weights, allocator, "moe.mixer.shared_experts.down_proj", s) else null;
+    var shared_down: ?QLinear = if (has_shared) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.shared_experts.down_proj"), s) else null;
     errdefer if (shared_down) |*l| l.deinit();
-    // Dense bf16 `[H, 2H]`, pre-transposed for the plain-matmul arm.
-    const eh_proj = try ownAndTranspose2D(weights, "eh_proj", s);
-    errdefer _ = mlx.mlx_array_free(eh_proj);
-    const enorm = try ownWeight(weights, "enorm");
+    // `[H, 2H]`: a bare dense key is pre-transposed for the plain-matmul arm,
+    // a `.weight` + `.scales` triple stays quantized.
+    var eh_proj: QLinear = if (weights.get(names.eh_proj) != null)
+        .{ .w = try ownAndTranspose2D(weights, names.eh_proj, s), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() }
+    else
+        try loadLinear(weights, allocator, names.eh_proj, s);
+    errdefer eh_proj.deinit();
+    const enorm = try ownWeight(weights, names.enorm);
     errdefer _ = mlx.mlx_array_free(enorm);
-    const hnorm = try ownWeight(weights, "hnorm");
+    const hnorm = try ownWeight(weights, names.hnorm);
     errdefer _ = mlx.mlx_array_free(hnorm);
-    const final_norm = try ownWeight(weights, "final_norm");
+    const final_norm = try ownWeight(weights, names.final_norm);
     errdefer _ = mlx.mlx_array_free(final_norm);
-    const input_norm = try ownWeight(weights, "attn.norm.weight");
+    const input_norm = try ownWeight(weights, N.key(&kb, names.attn, "norm.weight"));
     errdefer _ = mlx.mlx_array_free(input_norm);
-    const post_attn_norm = try ownWeight(weights, "moe.norm.weight");
+    const post_attn_norm = try ownWeight(weights, N.key(&kb, names.moe, "norm.weight"));
     errdefer _ = mlx.mlx_array_free(post_attn_norm);
-    var q = try loadLinear(weights, allocator, "attn.mixer.q_proj", s);
+    var q = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.q_proj"), s);
     errdefer q.deinit();
-    var k = try loadLinear(weights, allocator, "attn.mixer.k_proj", s);
+    var k = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.k_proj"), s);
     errdefer k.deinit();
-    var v = try loadLinear(weights, allocator, "attn.mixer.v_proj", s);
+    var v = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.v_proj"), s);
     errdefer v.deinit();
-    var o = try loadLinear(weights, allocator, "attn.mixer.o_proj", s);
+    var o = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.o_proj"), s);
     errdefer o.deinit();
-    const expert_bias = try ownWeight(weights, "moe.mixer.gate.e_score_correction_bias");
+    const expert_bias = try ownWeight(weights, N.key(&kb, names.moe, "mixer.gate.e_score_correction_bias"));
     errdefer _ = mlx.mlx_array_free(expert_bias);
 
     const shared: ?transformer_mod.SimpleMlpWeights = if (shared_up) |up| .{
@@ -2680,7 +2710,7 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
         .quant_bits = 0,
         .quant_group_size = 0,
         .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
-        .eh_proj = .{ .w = eh_proj, .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() },
+        .eh_proj = eh_proj,
         .pre_fc_norm_emb = enorm,
         .pre_fc_norm_hidden = hnorm,
         .final_norm = final_norm,
@@ -4164,7 +4194,7 @@ test "mtp: a Nemotron-H head missing any one tensor fails to load and frees what
     };
     const L = struct {
         fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
-            return loadNemotronMtp(a, s, w);
+            return loadNemotronMtp(a, s, w, .sevren);
         }
     };
     // Without the shared expert's up_proj the head is a valid no-shared-expert head.
@@ -6513,4 +6543,66 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             }
         }
     }
+}
+
+test "mtp: TensorFold's Nemotron-H head (`mtp-4bit.safetensors`, layers.0/1 names) loads as the Nemotron layout" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp-4bit.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const Entry = struct { key: [*:0]const u8, shape: []const c_int, dt: mlx.mlx_dtype = .bfloat16 };
+        const entries = [_]Entry{
+            .{ .key = "layers.0.eh_proj.weight", .shape = &.{ 8, 16 } },
+            .{ .key = "layers.0.enorm.weight", .shape = &.{8} },
+            .{ .key = "layers.0.hnorm.weight", .shape = &.{8} },
+            .{ .key = "layers.0.norm.weight", .shape = &.{8} },
+            .{ .key = "layers.0.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
+            .{ .key = "layers.0.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
+            .{ .key = "layers.0.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
+            .{ .key = "layers.0.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
+            .{ .key = "layers.1.norm.weight", .shape = &.{8} },
+            .{ .key = "layers.1.final_layernorm.weight", .shape = &.{8} },
+            .{ .key = "layers.1.mixer.gate.weight", .shape = &.{ 4, 8 } },
+            .{ .key = "layers.1.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
+            .{ .key = "layers.1.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 8 } },
+            .{ .key = "layers.1.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 8, 6 } },
+            .{ .key = "layers.1.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
+            .{ .key = "layers.1.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
+        };
+        for (entries) |e| {
+            var total: usize = 1;
+            for (e.shape) |d| total *= @intCast(d);
+            const data = try allocator.alloc(f32, total);
+            defer allocator.free(data);
+            for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
+            const f = mlx.mlx_array_new_data(data.ptr, e.shape.ptr, @intCast(e.shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(arr);
+            try mlx.check(mlx.mlx_astype(&arr, f, e.dt, s));
+            try mlx.check(mlx.mlx_array_eval(arr));
+            _ = mlx.mlx_map_string_to_array_insert(map, e.key, arr);
+        }
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    try testing.expectEqualStrings("mtp-4bit.safetensors", resolveMtpSidecarInDir(io, allocator, tmp_dir.dir) orelse return error.SidecarNotFound);
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+    try testing.expectEqual(Layout.nemotron, m.layout);
+    try testing.expect(m.eh_proj != null);
+    try testing.expect(m.mlp == .nemotron_moe);
+    try testing.expect(m.mlp.nemotron_moe.shared != null);
+    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w));
 }
