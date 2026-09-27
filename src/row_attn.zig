@@ -143,7 +143,7 @@ pub const Tree = struct { depth: mlx.mlx_array, path: mlx.mlx_array, max_depth: 
 /// [1, HKV, L, D] (the cache views after this step's update) -> [1, H, W, D].
 /// `tree` null: a chain.
 pub fn sdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, tree: ?Tree, s: mlx.mlx_stream) !bool {
-    if (!fits(q, k, v)) return false;
+    if (!mlx.streamIsGpu(s) or !fits(q, k, v)) return false;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const h = qs[1];

@@ -19507,7 +19507,7 @@ pub const Transformer = struct {
     /// Verify rows can form a draft tree: every per-row piece of this forward
     /// follows a row's ancestors (row-exact kernels, the GDN fold).
     pub fn specTreeSupported(self: *const Transformer) bool {
-        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnVerifyFoldEnabled();
+        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnVerifyFoldEnabled() and gdnDecodeRecurEnabled();
     }
 
     /// The quantized head's first `rows` vocab rows only (a draft vocabulary).

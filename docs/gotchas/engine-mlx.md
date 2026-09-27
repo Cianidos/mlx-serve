@@ -5305,6 +5305,10 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   look at the KV scheme, so the refusal surfaced mid-decode.
 - Fix: the affine scales and biases move with their rows (groups run along head_dim, so a
   row is self-contained); the stored rows equal what serial appends would write.
+- Second half (PR #590 review): past the fused-KV crossover the packed-KV kernels served
+  serial steps and verify rows, ignoring the tree mask and splitting their bits. Exact
+  decode now never reads packed KV (`resolveKvAttnFused`); trees also need the GDN recur.
 - Guard: `KVCache.compactRows: a tree's accepted path lands as serial appends would, dense
   and quantized`; smoke matrix `drafter` / `drafter_kv8` cells (red on the old binary);
-  same-load serial vs drafter byte check under `--kv-quant 8`.
+  same-load serial vs drafter byte check under `--kv-quant 8`; the smoke's long-context
+  drafted == serial check with `kv_attn_mode: "fused"` (0/4 before, 4/4 after).

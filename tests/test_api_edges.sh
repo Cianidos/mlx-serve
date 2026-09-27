@@ -90,6 +90,20 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"stop\":[\"\"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":60,\"stop_sequences\":[\"four\"],\"messages\":[$CNT],\"temperature\":0}"
 [[ "$(echo "$BODY" | J 'd["stop_reason"]')" == stop_sequence && "$(echo "$BODY" | J 'd["stop_sequence"]')" == four ]] && ok "/v1/messages echoes the matched stop_sequence" || bad "/v1/messages stop_sequence echo" "$(echo "$BODY" | head -c 160)"
 
+echo "=== ignore_eos ==="
+# vLLM contract: with ignore_eos the reply runs to max_tokens even though the
+# model wants to stop; finish_reason flips to length. Same prompt WITHOUT the
+# field must still stop on EOS (finish stop, fewer than max_tokens tokens).
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":32,\"temperature\":0,\"ignore_eos\":true}"
+FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
+[[ "$FR" == length && "$NT" == 32 ]] && ok "ignore_eos runs to max_tokens (length, 32 tokens)" || bad "ignore_eos chat" "fr=$FR tokens=$NT"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0,\"ignore_eos\":true}"
+FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
+[[ "$FR" == length && "$NT" == 32 ]] && ok "ignore_eos on /v1/completions runs to max_tokens" || bad "ignore_eos completions" "fr=$FR tokens=$NT"
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":32,\"temperature\":0}"
+FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
+[[ "$FR" == stop && "$NT" -lt 32 ]] && ok "without ignore_eos, EOS still stops early" || bad "eos still stops" "fr=$FR tokens=$NT"
+
 echo "=== structured output ==="
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":\"notaschema\"}},\"max_tokens\":20}"
 expect_status 400 "json_schema with a non-object schema"

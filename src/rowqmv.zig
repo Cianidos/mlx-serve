@@ -162,7 +162,7 @@ pub fn qmv(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
 
 /// `qmv` with mlx-lm's relu2 on the bf16 output (`relu2`): bf16(max(bf16(acc), 0)^2).
 pub fn qmvAct(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, relu2: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!fits(w, sc, bi, bits, group_size) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    if (!mlx.streamIsGpu(s) or !fits(w, sc, bi, bits, group_size) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const ws = mlx.getShape(w);
     if (ws.len != 2) return null;
     const xs = mlx.getShape(x);
@@ -272,7 +272,7 @@ fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array
 /// kernel. Each (row, slot) pair is computed on its own, the same way at any R.
 /// `q1`/`q2` = (bits, group size) of fc1/fc2.
 pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.mlx_array, fc2: [3]mlx.mlx_array, q1: [2]u32, q2: [2]u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!fits(fc1[0], fc1[1], fc1[2], q1[0], q1[1]) or !fits(fc2[0], fc2[1], fc2[2], q2[0], q2[1])) return null;
+    if (!mlx.streamIsGpu(s) or !fits(fc1[0], fc1[1], fc1[2], q1[0], q1[1]) or !fits(fc2[0], fc2[1], fc2[2], q2[0], q2[1])) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(ids) != .uint32) return null;
     const xs = mlx.getShape(x);
     const w1 = mlx.getShape(fc1[0]);
@@ -332,7 +332,7 @@ var router_cfgs: std.AutoHashMapUnmanaged(RouterKey, mlx.mlx_fast_metal_kernel_c
 /// `x [R, D] @ w.T` for a dense bf16 w [E, D] (a router), 1..MAX_ROWS rows,
 /// or null outside the kernel.
 pub fn router(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
+    if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
     if (xs.len != 2 or ws.len != 2 or xs[1] != ws[1] or @rem(ws[1], 4 * ROUTER_SG) != 0) return null;

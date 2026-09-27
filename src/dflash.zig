@@ -455,12 +455,22 @@ pub const QUANT_GROUP: u32 = 64;
 /// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
 /// affine width → that, anything else ("0", "off") → dense bf16.
 pub fn quantBitsFromEnv() u32 {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return DEFAULT_QUANT_BITS;
+    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
     const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
     return switch (v) {
         2, 3, 4, 5, 6, 8 => v,
         else => 0,
     };
+}
+
+/// A NAX chip (M5) drafts faster from a 4-bit assistant; M1-M4 keep 8-bit.
+pub fn defaultQuantBits(nax: bool) u32 {
+    return if (nax) 4 else DEFAULT_QUANT_BITS;
+}
+
+test "defaultQuantBits: 4-bit assistant on NAX, 8-bit elsewhere" {
+    try testing.expectEqual(@as(u32, 4), defaultQuantBits(true));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, defaultQuantBits(false));
 }
 
 /// Widest supported group that divides the contraction dim, or null when the
