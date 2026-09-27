@@ -453,6 +453,7 @@ private struct ModelSettingsWindowRoot: View {
             ModelSettingsSheet(request: request)
                 .environmentObject(appState)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
                 .appAppearance()
         }
     }

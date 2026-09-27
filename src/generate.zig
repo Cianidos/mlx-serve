@@ -18801,8 +18801,12 @@ test "mtp: nextMtp on a Nemotron-H trunk emits the serial stream, greedy and see
             var prng = std.Random.DefaultPrng.init(@intCast(seed));
             const r = prng.random();
             for (host) |*v| v.* = (r.float(f32) - 0.5) * 0.4;
-            const f = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+            const f32w = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32w);
+            // bf16 in, bf16 scales out: the row kernels' geometry, as a real pack.
+            var f = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(f);
+            try mlx.check(mlx.mlx_astype(&f, f32w, .bfloat16, st));
             var triple = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(triple);
             try mlx.check(mlx.mlx_quantize(&triple, f, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, st));
@@ -18932,6 +18936,8 @@ test "mtp: nextMtp on a Nemotron-H trunk emits the serial stream, greedy and see
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     try testing.expect(mtp_mod.hasMtpHead(io, allocator, dir_path));
+    // Exact mode is on only while a DFlash drafter is bound; this pins its MTP rounds.
+    config.dflash_bound = true;
 
     var tok_dummy: Tokenizer = undefined; // never read by the Generator
     const prompt = [_]u32{ 3, 7, 1, 12, 5, 9, 4, 2, 11, 6, 14, 8 };

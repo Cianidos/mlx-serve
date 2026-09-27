@@ -22,9 +22,16 @@ struct FileSelection: Equatable {
     /// per quant subfolder (see `MlxVariant`); each is fetched into its own
     /// model dir, so the prefix must come off on the way to disk.
     var subfolder: String? = nil
+    /// When set, pull ONLY this subfolder's files and KEEP the prefix: a pack's
+    /// `drafter/` lands at `<model_dir>/drafter/`, where the server finds it.
+    var packFolder: String? = nil
 
     /// Chat-model default: top-level files + `mtp/`, all needed extensions.
     static let chatDefault = FileSelection()
+
+    static func packFolder(_ folder: String) -> FileSelection {
+        FileSelection(packFolder: folder)
+    }
 
     /// One quant subfolder of a multi-variant MLX repo.
     static func mlxVariant(_ folder: String) -> FileSelection {

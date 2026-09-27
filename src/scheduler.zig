@@ -2696,6 +2696,8 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    config.drafter_override = o.drafter;
+    o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
     chat_config.default_enable_thinking = o.enable_thinking;
     chat_config.default_reasoning_effort = o.reasoning_effort;
@@ -3324,6 +3326,17 @@ pub fn coldLoadDrafterDir(
     return drafter_dir;
 }
 
+/// The drafter a load uses: "" = none, null = the in-dir probe decides.
+/// `--no-drafter`/`--drafter` win over the per-model `drafter` setting.
+pub fn drafterFor(no_drafter: bool, explicit: []const u8, setting: ?[]const u8) ?[]const u8 {
+    if (no_drafter) return "";
+    if (explicit.len > 0) return explicit;
+    const s = setting orelse return null;
+    if (std.mem.eql(u8, s, "off")) return "";
+    if (std.mem.eql(u8, s, "auto")) return null;
+    return s;
+}
+
 /// Should a cold load bring up the checkpoint's vision tower?
 pub fn coldLoadVision(has_vision: bool) bool {
     return has_vision and !no_vision_global;
@@ -3342,6 +3355,15 @@ test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to it
     try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/other"));
     // No --drafter at launch: nothing to carry, the in-dir probe decides.
     try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
+}
+
+test "drafterFor: launch flags win, then the per-model setting, then the in-dir probe" {
+    try testing.expectEqualStrings("", drafterFor(true, "/d", "/s").?);
+    try testing.expectEqualStrings("/d", drafterFor(false, "/d", "off").?);
+    try testing.expectEqualStrings("", drafterFor(false, "", "off").?);
+    try testing.expectEqualStrings("/s", drafterFor(false, "", "/s").?);
+    try testing.expectEqual(@as(?[]const u8, null), drafterFor(false, "", "auto"));
+    try testing.expectEqual(@as(?[]const u8, null), drafterFor(false, "", null));
 }
 
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
@@ -3981,22 +4003,18 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // to the Gemma cross-attention drafter loader.
     var drafter_ptr: ?*DrafterModel = null;
     var dflash_ptr: ?*DflashModel = null;
-    // An explicit `--drafter` always wins; otherwise the checkpoint's own
+    // Launch flags, then the per-model setting; otherwise the checkpoint's own
     // `drafter/` subdir is the sidecar (dflash.resolveInDirDrafter). That is
     // what makes the drafter a LOAD-time dependency rather than a launch
     // flag: a hot model switch brings its own, and no pairing table has to
     // decide which sidecar goes with which checkpoint.
-    const in_dir_drafter: ?[]u8 = if (params.no_drafter or params.drafter_dir.len > 0)
-        null
+    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
+    const in_dir_drafter: ?[]u8 = if (chosen_drafter == null)
+        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir)
     else
-        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir);
+        null;
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
-    const drafter_dir: []const u8 = if (params.no_drafter)
-        ""
-    else if (params.drafter_dir.len > 0)
-        params.drafter_dir
-    else
-        in_dir_drafter orelse "";
+    const drafter_dir: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
         const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
         if (env_off) {
@@ -4022,7 +4040,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
@@ -4061,7 +4079,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
                     "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
                     "  matching layer types in the target's non-shared K/V layers)\n",
-                .{ params.drafter_dir, @errorName(err) },
+                .{ drafter_dir, @errorName(err) },
             );
             return err;
         };
@@ -4094,6 +4112,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             );
         }
     }
+    params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
+    params.config.dflash_bound = xfm_ptr.config.dflash_bound;
     errdefer if (drafter_ptr) |d| {
         d.deinit();
         sch.allocator.destroy(d);

@@ -4,6 +4,14 @@ import AppKit
 @MainActor
 class DownloadManager: ObservableObject {
     @Published var downloads: [String: DownloadState] = [:]
+    /// New files per checked pack, keyed by repo (`PackUpdateCheck`).
+    @Published var packUpdates: [String: PackUpdate] = [:]
+    /// Latest HF listing per checked repo (path -> size), read by the socket's gem catalog.
+    @Published var packListings: [String: [String: Int64]] = [:]
+    /// The last manual "Check for Updates", keyed by `LocalModel.id`.
+    @Published var updateChecks: [String: UpdateCheck] = [:]
+    /// (checked, total) while that check runs.
+    @Published var updateSweep: (Int, Int)? = nil
 
     /// In-flight `download`/`downloadGguf` tasks keyed by repoId, so the
     /// Cancel button can interrupt them. Removed in the wrapper's `defer`.
@@ -262,7 +270,9 @@ class DownloadManager: ObservableObject {
             // single `optiq/mtp.safetensors`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
-            if let sub = selection.subfolder {
+            if let folder = selection.packFolder {
+                guard path.hasPrefix(folder + "/") else { return nil }
+            } else if let sub = selection.subfolder {
                 guard path.hasPrefix(sub + "/") else { return nil }
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
@@ -846,6 +856,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
             }
 
+            if destDirOverride == nil { PackSource(repo: repoId, subfolder: selection.subfolder).write(dir: destDir) }
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
                                                fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
@@ -885,55 +896,130 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
-            await self?.downloadCompanionDrafterIfNeeded(for: repoId)
+            await self?.autoFillSocket(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
     }
 
-    // MARK: - Companion drafter
-    //
-    // The Gemma 4 assistant drafter is a DEPENDENCY of the model it pairs with,
-    // not something to shop for: it only ever works alongside one Gemma 4 size,
-    // and picking it yourself means knowing that. It used to have its own Model
-    // Browser destination, which mostly generated the question "which of these
-    // is mine?". Now it rides along with its target, the same way a ds4 GGUF
-    // quant pulls its MTP head (`resolveGgufDownloadFiles`).
+    // MARK: - Speculation gems (the Model Settings socket)
 
-    /// The drafter repo that pairs with `repoId`, or nil when there isn't one.
-    ///
-    /// Dense Gemma 4 only. The MoE target (26B-A4B) is excluded on purpose —
-    /// the drafter REGRESSES decode there (verify pays expert routing, so the
-    /// server defaults it off on MoE targets), and fetching a checkpoint we
-    /// then refuse to use is worse than not having it. GGUF Gemma is excluded
-    /// too: it runs on llama.cpp, which has no drafter path at all.
-    nonisolated static func companionDrafterRepo(forRepoId repoId: String) -> String? {
-        let base = (repoId as NSString).lastPathComponent.lowercased()
-        // Muse-Glimmer pairs with its DFlash assistant (one published size).
-        if base.contains("muse-glimmer"), !base.contains("assistant"), !base.contains("gguf") {
-            return "meta-models/Muse-Glimmer-30B-assistant"
-        }
-        guard base.contains("gemma-4") || base.contains("gemma4") else { return nil }
-        // A drafter must not pull itself — that download is an infinite regress.
-        guard !base.contains("assistant"), !base.contains("gguf") else { return nil }
-        // One parser for "which Gemma size is this?" — `gemmaVariantFor` is the
-        // same one the pairing and auto-sync paths use, so a new size can't be
-        // taught to one of them and not the other.
-        guard let variant = gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B else { return nil }
-        return variant.drafterRepoId
+    /// Separate-repo gems live here, outside every model root: a drafter's
+    /// config reads as a chat model to discovery.
+    nonisolated static var draftersRoot: String {
+        NSString(string: "~/.mlx-serve/drafters").expandingTildeInPath
     }
 
-    /// Fetch `repoId`'s drafter after it lands, unless it's already here.
-    /// Failures stay silent (the Downloads pane still shows the failed row):
-    /// an alert naming a repo the user never asked for reads as a bug in the
-    /// download they DID ask for.
-    private func downloadCompanionDrafterIfNeeded(for repoId: String) async {
-        guard !Task.isCancelled,
-              downloads[repoId]?.status == .completed,
-              let drafter = Self.companionDrafterRepo(forRepoId: repoId),
-              !isReady(drafter) else { return }
-        await download(repoId: drafter, alertOnFailure: false)
+    nonisolated static func gemDir(repo: String) -> String {
+        (draftersRoot as NSString).appendingPathComponent(repo)
+    }
+
+    nonisolated static func downloadedGemRepos() -> [String] {
+        let fm = FileManager.default
+        var out: [String] = []
+        for org in (try? fm.contentsOfDirectory(atPath: draftersRoot)) ?? [] {
+            for name in (try? fm.contentsOfDirectory(atPath: (draftersRoot as NSString).appendingPathComponent(org))) ?? [] {
+                let repo = "\(org)/\(name)"
+                if fm.fileExists(atPath: (gemDir(repo: repo) as NSString).appendingPathComponent("config.json")) { out.append(repo) }
+            }
+        }
+        return out
+    }
+
+    /// Where `gem`'s files sit for the model at `modelDir`, nil when not downloaded.
+    /// A Gemma assistant fetched by an older build lives in a model root.
+    func gemPath(_ gem: DrafterGem, modelDir: String) -> String? {
+        guard gem.needsDownload else { return nil }
+        let fm = FileManager.default
+        func ready(_ dir: String) -> Bool { fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) }
+        if let sub = gem.subfolder {
+            let dir = (modelDir as NSString).appendingPathComponent(sub)
+            return ready(dir) ? dir : nil
+        }
+        let dir = Self.gemDir(repo: gem.repo)
+        if ready(dir) { return dir }
+        return existingModelDir(for: gem.repo).flatMap { ready($0) ? $0 : nil }
+    }
+
+    /// Progress key of a gem fetch: a pack subfolder rides its model's row.
+    nonisolated static func gemKey(_ gem: DrafterGem) -> String { gem.repo }
+
+    func isFetchingGem(_ gem: DrafterGem) -> Bool {
+        gemFetches.contains(Self.gemKey(gem))
+    }
+
+    /// Fetch a gem's files: a pack's `drafter/` into the model dir (prefix kept),
+    /// a separate repo into `draftersRoot`. `onFinish(ok)` runs on the main actor.
+    func startGem(_ gem: DrafterGem, modelDir: String, onFinish: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        let key = Self.gemKey(gem)
+        guard activeTasks[key] == nil else { return }
+        gemFetches.insert(key)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await self.fetchGem(gem, modelDir: modelDir, alertOnFailure: true)
+            if Task.isCancelled { self.removeGemPartials(gem, modelDir: modelDir) }
+            self.gemFetches.remove(key)
+            self.activeTasks.removeValue(forKey: key)
+            onFinish(ok && !Task.isCancelled)
+        }
+        activeTasks[key] = task
+    }
+
+    /// Stop a gem fetch. Never the generic `cancel(_:)`: with no task running it
+    /// wipes the repo's download dir, which for a pack gem is the live model.
+    func cancelGem(_ gem: DrafterGem) {
+        guard gemFetches.contains(Self.gemKey(gem)) else { return }
+        activeTasks[Self.gemKey(gem)]?.cancel()
+    }
+
+    /// Delete a gem's files (the socket's "remove" with delete).
+    func removeGem(_ gem: DrafterGem, modelDir: String) {
+        guard let dir = gemPath(gem, modelDir: modelDir) else { return }
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
+    private func fetchGem(_ gem: DrafterGem, modelDir: String, alertOnFailure: Bool) async -> Bool {
+        let dest = gem.subfolder != nil ? modelDir : Self.gemDir(repo: gem.repo)
+        await download(repoId: gem.repo,
+                       selection: gem.subfolder.map { .packFolder($0) } ?? .chatDefault,
+                       alertOnFailure: alertOnFailure, destDirOverride: dest)
+        return downloads[gem.repo]?.status == .completed
+    }
+
+    private func removeGemPartials(_ gem: DrafterGem, modelDir: String) {
+        let dir = gem.subfolder.map { (modelDir as NSString).appendingPathComponent($0) } ?? Self.gemDir(repo: gem.repo)
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where f.hasSuffix(".partial") || f.hasSuffix(".partial.parts") {
+            try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(f))
+        }
+        downloads.removeValue(forKey: gem.repo)
+    }
+
+    /// A fresh download fills its socket with the default gem when it fits in
+    /// RAM and the user has not chosen one. A pack's own `drafter/` stays
+    /// "auto" (the server finds it); a separate repo is written as a path.
+    /// Failures stay silent: the user asked for the model, not the drafter.
+    private func autoFillSocket(for repoId: String) async {
+        guard !Task.isCancelled, downloads[repoId]?.status == .completed,
+              let modelDir = existingModelDir(for: repoId),
+              [nil, "auto"].contains(ModelSettingsFile.load().override(for: modelDir)?.drafter),
+              let entries = await fetchListing(repoId: repoId) else { return }
+        let files = PackUpdateCheck.sizes(entries)
+        packListings[repoId] = files
+        let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
+        let modelGB = Double(Self.selectNeededFiles(from: entries).reduce(0) { $0 + $1.1 }) / 1e9
+        guard let gem = DrafterGems.defaultGem(gems),
+              DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
+        if gemPath(gem, modelDir: modelDir) == nil {
+            guard await fetchGem(gem, modelDir: modelDir, alertOnFailure: false) else { return }
+        }
+        guard gem.subfolder == nil, let path = gemPath(gem, modelDir: modelDir) else { return }
+        var file = ModelSettingsFile.load()
+        var o = file.override(for: modelDir) ?? ModelOverride()
+        DrafterSocket.gem(gem).write(into: &o, gemPath: path)
+        file.set(o, for: modelDir)
+        try? file.save()
     }
 
     // MARK: - Turbo LoRA (on demand)
@@ -993,10 +1079,60 @@ class DownloadManager: ObservableObject {
         activeTasks[repoId] = task
     }
 
+    /// Apply a checked update in place: fetch only the missing and changed
+    /// files into the model's own dir. A cancel keeps the model and drops only partials.
+    func startUpdate(_ check: UpdateCheck, onFinish: @escaping @MainActor () -> Void) {
+        let repo = check.repo, dir = check.dir
+        guard activeTasks[repo] == nil else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch check.selection {
+            case .gguf:
+                let files = PackUpdateCheck.wanted(await self.fetchListing(repoId: repo) ?? [], selection: check.selection).map(\.0)
+                if !files.isEmpty { await self.downloadGguf(repoId: repo, files: files, destDirOverride: dir) }
+            default:
+                for sel in Self.fileSelections(check.selection) {
+                    await self.download(repoId: repo, selection: sel, destDirOverride: dir)
+                    if Task.isCancelled || self.downloads[repo]?.status != .completed { break }
+                }
+            }
+            if Task.isCancelled {
+                self.downloads.removeValue(forKey: repo)
+                Self.removePartials(under: dir)
+            }
+            self.activeTasks.removeValue(forKey: repo)
+            onFinish()
+        }
+        activeTasks[repo] = task
+    }
+
+    private static func fileSelections(_ selection: UpdateSelection) -> [FileSelection] {
+        switch selection {
+        case .chat(let drafter): return [.chatDefault] + (drafter ? [.packFolder(DrafterGems.packFolder)] : [])
+        case .variant(let sub): return [.mlxVariant(sub)]
+        case .media(let sel): return [sel]
+        case .gguf: return []
+        }
+    }
+
+    private static func removePartials(under dir: String) {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(atPath: dir) else { return }
+        while let f = en.nextObject() as? String {
+            if f.hasSuffix(".partial") || f.hasSuffix(".partial.parts") {
+                try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(f))
+            }
+        }
+    }
+
     /// Repo ids whose `activeTasks` entry is a SINGLE-FILE fetch into a pack
     /// already on disk (the Turbo adapter, the ACE-Step cover tokenizer), not a
     /// full pack download — `cancelPackFile` must never cancel the latter.
     private(set) var packFileFetches: Set<String> = []
+    /// Keys of in-flight gem fetches (`startGem`).
+    private(set) var gemFetches: Set<String> = []
+    /// One pack-update sweep at a time: model scans run at 1 Hz during a download.
+    var packSweepRunning = false
 
     /// Whether a single-file fetch is in flight for this pack. Panes render
     /// their own progress from it; a full pack download must NOT read as one.
@@ -1400,8 +1536,8 @@ class DownloadManager: ObservableObject {
     /// resume/retry/disk-space shape, looped over each file; progress is
     /// `fileIndex/fileCount` and byte progress spans them all. A nested subfolder
     /// (`<quant>/<quant>-00001-of-…`) is created as needed, mirroring HF's layout.
-    func downloadGguf(repoId: String, files shards: [String]) async {
-        let destDir = newLayoutDir(for: repoId)
+    func downloadGguf(repoId: String, files shards: [String], destDirOverride: String? = nil) async {
+        let destDir = destDirOverride ?? newLayoutDir(for: repoId)
         let primaryName = ((shards.first ?? "") as NSString).lastPathComponent
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching \(primaryName)...")
 
@@ -1501,6 +1637,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.progress = Double(baseDownloaded) / Double(totalSize)
             }
 
+            if destDirOverride == nil { PackSource(repo: repoId).write(dir: destDir) }
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: shards.count, fileCount: shards.count)
         } catch {
             if Task.isCancelled { return }

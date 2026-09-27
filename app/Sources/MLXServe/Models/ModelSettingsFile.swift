@@ -40,6 +40,8 @@ struct ModelOverride: Equatable {
     var kvQuant: KvQuantChoice?
     var mtp: Bool?
     var mtpAcceptance: MtpAcceptanceChoice?
+    /// `drafter`: "off", "auto" or a drafter dir (the speculation socket, `DrafterSocket`).
+    var drafter: String?
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
@@ -69,6 +71,7 @@ struct ModelOverride: Equatable {
         if let a = rest.removeValue(forKey: "mtp_acceptance") {
             if let s = a as? String { mtpAcceptance = MtpAcceptanceChoice(rawValue: s) }
         }
+        if let d = rest.removeValue(forKey: "drafter") { drafter = d as? String }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
         extra = rest
     }
@@ -76,7 +79,7 @@ struct ModelOverride: Equatable {
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
-        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || !templateKwargs.isEmpty
+        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || drafter != nil || !templateKwargs.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
@@ -86,12 +89,13 @@ struct ModelOverride: Equatable {
         if let kvQuant { out["kv_quant"] = kvQuant.rawValue }
         if let mtp { out["mtp"] = mtp }
         if let mtpAcceptance { out["mtp_acceptance"] = mtpAcceptance.rawValue }
+        if let drafter { out["drafter"] = drafter }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
         return out
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
-        a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance
+        a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.drafter == b.drafter
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }

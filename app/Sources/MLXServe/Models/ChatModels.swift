@@ -474,6 +474,8 @@ struct ModelInfo {
     var mtpLoaded: Bool = false
     /// `meta.mtp_available`: the checkpoint ships an MTP head. nil on older servers.
     var mtpAvailable: Bool? = nil
+    /// `meta.spec_exact`: drafted output is byte-identical to serial decoding. nil on older servers.
+    var specExact: Bool? = nil
     /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
     var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
@@ -1178,6 +1180,16 @@ enum GemmaVariant: String, CaseIterable, Hashable {
     /// `curl -sI https://huggingface.co/api/models/<repo>` first.
     var drafterRepoId: String {
         "mlx-community/gemma-4-\(rawValue)-it-assistant-bf16"
+    }
+
+    /// Safetensors size of the drafter repo (HF listing, 2026-09).
+    var drafterSizeGB: Double {
+        switch self {
+        case .E2B, .E4B: 0.16
+        case .gemma12B: 0.85
+        case .moe26B: 0.84
+        case .gemma31B: 0.94
+        }
     }
 
     /// Last path component of the drafter repo — also the on-disk dir name

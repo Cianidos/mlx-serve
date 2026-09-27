@@ -201,6 +201,7 @@ class APIClient {
             drafterPath: meta["drafter_path"] as? String,
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
             mtpAvailable: meta["mtp_available"] as? Bool,
+            specExact: meta["spec_exact"] as? Bool,
             kvQuant: meta["kv_quant"] as? String ?? "",
             loaded: topLoaded,
             state: topState,
@@ -226,21 +227,20 @@ class APIClient {
     /// side-load must NOT carry it — it loads BESIDE the chat model, and
     /// stealing the default would re-route every aliased chat request to a
     /// model that 400s them.
-    static func loadModelBody(id: String, drafterPath: String?, setDefault: Bool) -> [String: Any] {
+    static func loadModelBody(id: String, setDefault: Bool) -> [String: Any] {
         var body: [String: Any] = ["model": id]
-        if let drafterPath { body["drafter_path"] = drafterPath }
         if setDefault { body["default"] = true }
         return body
     }
 
-    func loadModel(port: UInt16, id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
+    func loadModel(port: UInt16, id: String, setDefault: Bool = false) async throws -> ModelInfo {
         let url = serverURL(port: port, path: "/v1/load-model")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Load can take 10–60 s on a fresh model; raise above the default.
         request.timeoutInterval = 180
-        let body = Self.loadModelBody(id: id, drafterPath: drafterPath, setDefault: setDefault)
+        let body = Self.loadModelBody(id: id, setDefault: setDefault)
         // withoutEscapingSlashes: `id` may be an absolute path (the
         // auto-downloaded encoder registers by path) — keep it readable in
         // logs. The server unescapes either form.

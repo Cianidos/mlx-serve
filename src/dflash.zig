@@ -371,6 +371,7 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// drafts against the same mask token at any width. NAX-capable machines
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
+pub const TREE_BLOCK_CAP: u32 = 8;
 
 /// A no-wide-lane block cap with the machine row it came from, for the
 /// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
@@ -392,7 +393,10 @@ pub const BlockCap = struct {
 /// silicon rows are one-liners (an M1 row lands when the user measures it).
 /// `chip` is sysctl machdep.cpu.brand_string ("Apple M3 Ultra"); the GPU
 /// arch string cannot tell Ultra from Max, hence the CPU brand.
-pub fn blockCapForMachine(chip: []const u8) BlockCap {
+/// `tree`: a DFlash2 draft-tree round (selector + `specTreeSupported`), whose
+/// wins on the 27B were all measured at block 8.
+pub fn blockCapForMachine(chip: []const u8, tree: bool) BlockCap {
+    if (tree) return .{ .cap = TREE_BLOCK_CAP, .label = "draft tree", .measured = true };
     if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra", .measured = true };
     // The DEFAULT VALUE and the M4 ROW are the same number doing two
     // different jobs: on an M4 it is the measured sweep at the top of this
@@ -749,6 +753,7 @@ pub const DflashModel = struct {
             });
             return error.DflashTargetMismatch;
         }
+        target.config.dflash_bound = true;
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
@@ -2547,12 +2552,14 @@ test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" 
     // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
     // 1.33-1.43x at block 8 on the same pairing); everything else without a
     // wide lane keeps the M4-measured default.
-    const ultra = blockCapForMachine("Apple M3 Ultra");
+    const ultra = blockCapForMachine("Apple M3 Ultra", false);
     try testing.expectEqual(@as(u32, 8), ultra.cap);
     try testing.expectEqualStrings("m3-ultra", ultra.label);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max").cap);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max").cap);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max", false).cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max", false).cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("", false).cap);
+    // A draft-tree round on an M4 was measured at 8.
+    try testing.expectEqual(@as(u32, 8), blockCapForMachine("Apple M4 Max", true).cap);
     // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
     // block-8 one is left alone.
     try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));

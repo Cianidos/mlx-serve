@@ -2060,3 +2060,12 @@
 "Keep n-gram table in memory (Qwen3.8-Flash-Next)" = "将 n-gram 表保留在内存中（Qwen3.8-Flash-Next）";
 "Qwen3.8-Flash-Next looks up rows in a ~30 GB n-gram table on every token. Off (default): the table stays on disk and only the rows a prompt needs are read, so it costs almost no memory. On: the whole table is loaded into GPU memory beside the weights, for a few percent faster prompt processing and up to ~15% faster replies at long context. On a Mac without ~30 GB to spare, the first request after a load can stall for a minute or more while the table is pulled in. Other models ignore this setting." = "Qwen3.8-Flash-Next 每生成一个 token 都要在约 30 GB 的 n-gram 表中查找若干行。关闭（默认）：表留在磁盘上，只读取提示词需要的行，几乎不占内存。开启：整张表与权重一起载入 GPU 内存，提示词处理快几个百分点，长上下文下回复最多快约 15%。如果这台 Mac 腾不出约 30 GB，加载后的第一个请求可能要卡住一分钟以上等表载入。其他模型忽略此设置。";
 "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded." = "内存：加载 Qwen3.8-Flash-Next 时多占约 30 GB。";
+"Check for Updates" = "检查更新";
+"Compare every model with its Hugging Face repo" = "将每个模型与其 Hugging Face 仓库比对";
+"Checking %lld/%lld…" = "正在检查 %lld/%lld…";
+"Local copy" = "本地副本";
+"Not on Hugging Face under this name, so there is nothing to update from." = "Hugging Face 上没有同名仓库，因此无从更新。";
+"Replace Files?" = "替换文件？";
+"Replace" = "替换";
+"%lld file differs from Hugging Face and will be replaced." = "%lld 个文件与 Hugging Face 不同，将被替换。";
+"%lld files differ from Hugging Face and will be replaced." = "%lld 个文件与 Hugging Face 不同，将被替换。";

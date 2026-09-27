@@ -1632,20 +1632,18 @@ private struct SpecDecodeSectionContent: View {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
-    /// `draftBlockSize` stays CLI-only — `recommendedBlockSize` in drafter.zig
-    /// auto-picks per target (E2B=2, E4B=4, 31B=8, 26B-A4B=4); the field is
-    /// kept in ServerOptions so power users who set it via CLI keep working.
-
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
         // (`drafter > PLD > regular` in src/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
-        let drafterActive = !appState.serverOptions.drafterPath.isEmpty
+        let drafterActive = server.chatModelInfo?.drafterLoaded ?? false
         let pldUsable = appState.serverOptions.enablePLD && !drafterActive
 
-        DrafterRow()
+        Text(L10n.text("Drafters are chosen per model: Model Settings, Speculation."))
+            .font(.app(.caption2))
+            .foregroundStyle(.secondary)
         if let m = meta["enablePLD"] {
             let suffix = drafterActive
                 ? " Locked off while Drafter is on (Drafter takes priority)."
@@ -2181,172 +2179,6 @@ private struct Ds4PerformanceSectionContent: View {
     }
 }
 
-// MARK: - Drafter row
-
-/// Three-state speculative-decoding toggle for the Gemma 4 assistant drafter.
-private struct DrafterRow: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-    @EnvironmentObject var downloads: DownloadManager
-
-    private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
-    }
-
-    /// Drafter the loaded model would pair with — nil for non-Gemma-4 or
-    /// when no matching checkpoint is on disk.
-    private var recommended: LocalDrafter? {
-        guard let info = server.modelInfo else { return nil }
-        return downloads.recommendedDrafterFor(
-            modelPath: appState.selectedModelPath,
-            architecture: info.architecture,
-            isMoE: info.isMoE
-        )
-    }
-
-    /// True when the loaded target is a Gemma 4 model (any size). Tells us
-    /// whether to surface "drafter not found" (worth fixing) vs "drafter is
-    /// Gemma 4 only" (architectural).
-    private var targetIsGemma4: Bool {
-        let arch = server.modelInfo?.architecture ?? ""
-        return arch == "gemma4" || arch == "gemma4_text"
-    }
-
-    private var isMoeTarget: Bool { server.modelInfo?.isMoE ?? false }
-
-    private var explainer: String {
-        if let r = recommended {
-            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent)."
-        }
-        // Server hasn't reported a model yet — either it's not started or
-        // we're mid-handshake. Don't claim the architecture is wrong.
-        if server.modelInfo == nil {
-            if appState.selectedModelPath.isEmpty {
-                return "Select a model to check drafter compatibility."
-            }
-            return "Start the server to check drafter compatibility."
-        }
-        // Server reported a model but didn't include `architecture` in its
-        // /v1/models meta — that field landed in the same release that
-        // unhid this row, so an older bundled binary will leave it empty.
-        if (server.modelInfo?.architecture ?? "").isEmpty {
-            return "Drafter status unavailable (server build pre-dates this UI). Use --drafter via CLI."
-        }
-        if !targetIsGemma4 {
-            return "Drafter is Gemma 4 only."
-        }
-        if isMoeTarget {
-            return "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead."
-        }
-        return "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically."
-    }
-
-    /// The drafter this target would pair with, whether or not it's on disk —
-    /// what the Download button fetches.
-    private var pairedDrafterRepo: String? {
-        DownloadManager.companionDrafterRepo(forRepoId: appState.selectedModelPath)
-    }
-
-    private var toggleEnabled: Bool { recommended != nil }
-
-    var body: some View {
-        // `explainer` is state-dependent (names the discovered checkpoint, or
-        // why there isn't one), so the searchable text follows the UI.
-        SearchableRow(searchText: ["Enable Assistant MTP Drafter model", explainer]) {
-            rowBody
-        }
-    }
-
-    @ViewBuilder
-    private var rowBody: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                HStack(spacing: 6) {
-                    Text(L10n.text("Enable Assistant MTP Drafter model"))
-                        .font(.app(.body))
-                    if dirty.dirty(\.drafterPath) {
-                        Image(systemName: "arrow.clockwise.circle.fill")
-                            .font(.app(.caption))
-                            .foregroundStyle(.orange)
-                            .help("Restart the server to apply this change")
-                    }
-                }
-                Spacer(minLength: 12)
-                control
-                    .frame(maxWidth: 280, alignment: .trailing)
-            }
-            Text(L10n.text(explainer))
-                .font(.app(.caption2))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // Status pill — green for "ready", yellow for the MoE caution.
-            if let r = recommended {
-                HStack(spacing: 8) {
-                    statusPill(
-                        text: "✓ \(r.url.lastPathComponent)",
-                        warn: false
-                    )
-                    if isMoeTarget && !appState.serverOptions.drafterPath.isEmpty {
-                        statusPill(
-                            text: "⚠ Drafter regresses ~30% on MoE — PLD is recommended",
-                            warn: true
-                        )
-                    }
-                }
-                .padding(.top, 2)
-            } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
-                // A dense Gemma 4 is loaded but its drafter isn't on disk —
-                Button(L10n.text(
-                       downloads.downloads[repo]?.status == .downloading
-                       ? "Downloading drafter…" : "Download drafter"
-)) {
-                    downloads.start(repoId: repo) { appState.refreshModels() }
-                }
-                .controlSize(.small)
-                .disabled(downloads.downloads[repo]?.status == .downloading)
-                .padding(.top, 2)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var control: some View {
-        // Off writes `drafterOptOut` as well as clearing the path: the app pairs
-        // a dense Gemma 4 with its drafter on its own now, so an empty path
-        // alone would read as "not paired yet" and pair itself again at the next
-        // model switch. Turning it back on clears the opt-out.
-        let isOn = Binding<Bool>(
-            get: { !appState.serverOptions.drafterPath.isEmpty },
-            set: { newValue in
-                appState.serverOptions.drafterOptOut = !newValue
-                if newValue {
-                    if let r = recommended {
-                        appState.serverOptions.drafterPath = r.url.path
-                    }
-                } else {
-                    appState.serverOptions.drafterPath = ""
-                }
-            }
-        )
-        Toggle("", isOn: isOn)
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .disabled(!toggleEnabled)
-    }
-
-    @ViewBuilder
-    private func statusPill(text: String, warn: Bool) -> some View {
-        let fg: Color = warn ? .orange : .green
-        Text(text)
-            .font(.app(.caption2).monospacedDigit())
-            .foregroundStyle(fg)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(fg.opacity(0.10))
-            .clipShape(Capsule())
-    }
-}
 
 // MARK: - Per-request defaults section
 

@@ -16945,8 +16945,16 @@ pub const Transformer = struct {
             break :blk true;
         };
 
+        var cfg = config;
+        if (cfg.rowExactArch()) {
+            const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
+            if (firstRowExactMiss(&cfg, weights, gather_only)) |key| {
+                log.info("[row-exact] {s} is outside the row kernels: verify rows are not byte-exact\n", .{key});
+            } else cfg.row_exact_covered = true;
+        }
+
         return .{
-            .config = config,
+            .config = cfg,
             .cache = cache,
             .s = s,
             .allocator = allocator,
@@ -33317,7 +33325,7 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
     return computeQuantParams(cfg, w, sc, in_dim);
 }
 
-/// A row-exact 4-bit matmul: Nemotron-H's thin MoE trunk streams faster
+/// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
 /// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
 /// whose multi-row MMA reads each weight once. Null outside both.
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
@@ -33473,7 +33481,8 @@ fn nemotronSharedExpert(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *c
     var x_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x_flat);
     try mlx.check(mlx.mlx_reshape(&x_flat, x, &[_]c_int{ x_shape[0] * x_shape[1], x_shape[2] }, 2, s));
-    const up_act = (if (cfg.rowExactDecode()) try rowqmv.qmvAct(x_flat, sm.up_w, sm.up_s, sm.up_b, 4, quantParamsOrDense(cfg, sm.up_w, sm.up_s, lastDim(x_flat)).group_size, true, s) else null) orelse blk: {
+    const up_qp = quantParamsOrDense(cfg, sm.up_w, sm.up_s, lastDim(x_flat));
+    const up_act = (if (cfg.rowExactDecode()) try rowqmv.qmvAct(x_flat, sm.up_w, sm.up_s, sm.up_b, up_qp.bits, up_qp.group_size, true, s) else null) orelse blk: {
         const up = try projectWithConfig(cfg, x_flat, sm.up_w, sm.up_s, sm.up_b, s);
         defer _ = mlx.mlx_array_free(up);
         break :blk try reluSquaredOp(up, s);
@@ -33540,8 +33549,8 @@ fn nemotronMoeDecodeExperts(res: *mlx.mlx_array, x_flat: mlx.mlx_array, nm: *con
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
         try mlx.check(mlx.mlx_astype(&inds_u32, inds_flat, .uint32, s));
-        const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, @intCast(mlx.getShape(nm.fc2_w)[2] * 8));
-        if (try rowqmv.experts(x_flat, inds_u32, k_count, .{ nm.fc1_w, nm.fc1_s, nm.fc1_b }, .{ nm.fc2_w, nm.fc2_s, nm.fc2_b }, fc1_qp.group_size, fc2_qp.group_size, s)) |y| {
+        const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, @intCast(mlx.getShape(nm.fc1_w)[1]));
+        if (try rowqmv.experts(x_flat, inds_u32, k_count, .{ nm.fc1_w, nm.fc1_s, nm.fc1_b }, .{ nm.fc2_w, nm.fc2_s, nm.fc2_b }, .{ fc1_qp.bits, fc1_qp.group_size }, .{ fc2_qp.bits, fc2_qp.group_size }, s)) |y| {
             defer _ = mlx.mlx_array_free(y);
             try mlx.check(mlx.mlx_reshape(res, y, &out_shape, 3, s));
             return;
@@ -41721,6 +41730,27 @@ fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_stream
 
 /// A pack qmv2's ternary kernel may serve once its biases check out: affine
 /// 2-bit group-128 without rotations (Hadamard packs bind per weight).
+/// The first quantized trunk projection the row-exact kernels cannot take
+/// (not 4-bit affine in their geometry), or null when they cover the pack.
+/// Vision towers, the MTP head and a gather-only embedding never reach a verify row.
+fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        if (!std.mem.endsWith(u8, key, ".scales")) continue;
+        if (std.mem.indexOf(u8, key, "vision") != null or std.mem.indexOf(u8, key, "visual") != null or
+            std.mem.indexOf(u8, key, "mtp") != null) continue;
+        const base = key[0 .. key.len - ".scales".len];
+        var buf: [256]u8 = undefined;
+        const w = weights.map.get(std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch return key) orelse continue;
+        if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
+        const bi = weights.map.get(std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return key) orelse return key;
+        const qp = computeQuantParams(config, w, kv.value_ptr.*, null);
+        if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
+    }
+    return null;
+}
+
 fn ternaryKernelCandidate(config: *const ModelConfig) bool {
     return config.hadamard_block == 0 and config.quant_mode == .affine and
         config.quant_bits == 2 and config.quant_group_size == 128;
@@ -41792,6 +41822,39 @@ test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embed
         const bad = (try firstNonTernaryBias(&w, .{ .ctx = null }, s)).?;
         try std.testing.expect(std.mem.eql(u8, bad, "m.k.biases") or std.mem.eql(u8, bad, "m.v.biases"));
     }
+}
+
+test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
+    const Q = struct {
+        fn put(w: *Weights, base: []const u8, bits: c_int) !void {
+            const st = mlx.gpuStream();
+            var zeros = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zeros);
+            try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ 64, 128 }, 2, .bfloat16, st));
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, zeros, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", .{}, st));
+            for ([_][]const u8{ ".weight", ".scales", ".biases" }, 0..) |suf, i| {
+                var a = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
+                try w.map.put(try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ base, suf }), a);
+            }
+        }
+    };
+    var cfg = ModelConfig{};
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    try Q.put(&w, "m.layers.0.q", 4);
+    try Q.put(&w, "m.layers.1.q", 6);
+    try Q.put(&w, "m.layers.2.q", 8);
+    try Q.put(&w, "vision_tower.fc", 3);
+    try Q.put(&w, "mtp.layers.0.fc", 3);
+    try std.testing.expectEqual(@as(?[]const u8, null), firstRowExactMiss(&cfg, &w, .{ .ctx = null }));
+    try Q.put(&w, "m.layers.3.q", 3);
+    try std.testing.expectEqualStrings("m.layers.3.q.scales", firstRowExactMiss(&cfg, &w, .{ .ctx = null }).?);
 }
 
 test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {

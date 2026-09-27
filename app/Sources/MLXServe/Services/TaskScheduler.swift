@@ -633,14 +633,7 @@ final class TaskScheduler: ObservableObject {
     private func switchModel(to path: String) async -> Bool {
         if case .hotSwitch(let id) = AppState.modelSwitchAction(forStatus: appState.server.status, path: path) {
             do {
-                // Through DrafterPairing like the picker's own switch — a raw
-                // disk read here would re-enable a drafter the user turned off.
-                let drafter = DrafterPairing.decide(
-                    modelPath: path,
-                    optedOut: appState.serverOptions.drafterOptOut,
-                    onDiskPath: appState.downloads.recommendedDrafterFromPath(path)?.url.path)
-                _ = try await appState.server.loadModel(
-                    id: id, drafterPath: drafter.isEmpty ? nil : drafter, setDefault: true)
+                _ = try await appState.server.loadModel(id: id, setDefault: true)
                 return true
             } catch {
                 // Hot-swap failed (unsupported arch, memory 503) — restart.

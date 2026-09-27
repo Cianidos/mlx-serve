@@ -447,6 +447,12 @@ pub const ModelConfig = struct {
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
+    /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
+    drafter_override: ?[]const u8 = null,
+    /// Every quantized projection fits the row-exact kernels (`Transformer.init`).
+    row_exact_covered: bool = false,
+    /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
+    dflash_bound: bool = false,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -895,9 +901,15 @@ pub const ModelConfig = struct {
         return null;
     }
 
-    /// Decode-width 4-bit projections go through `rowqmv`, whose rows get the
-    /// same bits at any window width: a verify row reproduces serial decoding.
+    /// Decode-width projections go through the row-exact kernels, whose rows
+    /// get the same bits at any window width: a verify row reproduces serial
+    /// decoding. Only where every projection fits them AND a DFlash drafter is
+    /// bound: serial and MTP keep the faster stock paths otherwise.
     pub fn rowExactDecode(self: *const ModelConfig) bool {
+        return self.row_exact_covered and self.dflash_bound and self.rowExactArch();
+    }
+
+    pub fn rowExactArch(self: *const ModelConfig) bool {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return true;
         return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
     }
@@ -1322,13 +1334,15 @@ pub const ModelConfig = struct {
         });
     }
 
-    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
     /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
     /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.drafter_override) |p| allocator.free(p);
+        self.drafter_override = null;
     }
 };
 
@@ -7480,4 +7494,16 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.tie_word_embeddings);
     try testing.expect(!config.norm_has_offset);
     try testing.expect(!config.has_pre_ff_norm);
+}
+
+test "rowExactDecode: a covered trunk decodes exact only while a DFlash drafter is bound" {
+    var cfg = ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.row_exact_covered = true;
+    // Serial and MTP keep the stock paths: exact mode costs MTP ~30%.
+    try std.testing.expect(!cfg.rowExactDecode());
+    cfg.dflash_bound = true;
+    try std.testing.expect(cfg.rowExactDecode());
+    cfg.row_exact_covered = false;
+    try std.testing.expect(!cfg.rowExactDecode());
 }

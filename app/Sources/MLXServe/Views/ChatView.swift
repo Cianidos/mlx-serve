@@ -2722,7 +2722,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
                 }
-                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server).environmentObject(appState.downloads) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what

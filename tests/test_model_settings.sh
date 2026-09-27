@@ -105,5 +105,27 @@ check "[4] malformed file: load -> 200 (got $CODE), globals apply (ctx $(row "$M
     "$([ "$CODE" = "200" ] && [ "$(row "$MODEL_A" ctx)" = "16384" ] && echo 1 || echo 0)"
 check "[4] malformed file logged" "$(grep -q "\[model-settings\] .*malformed" "$LOG" && echo 1 || echo 0)"
 
+# [5] the per-model drafter: "off" silences a pack's own drafter/, "auto" brings it back
+DRAFT_MODEL="${DRAFT_MODEL:-/Volumes/G Drive SSD/models/mlx-community/LFM2.5-2.6B-8bit}"
+if [ -f "$DRAFT_MODEL/drafter/config.json" ]; then
+    drafter_loaded() {
+        curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c "
+import sys, json
+want = sys.argv[1].rstrip('/')
+print(next((m['meta'].get('drafter_loaded') for m in json.load(sys.stdin)['data'] if want.endswith('/' + m['id'])), None))
+" "$DRAFT_MODEL"
+    }
+    for want in off:False auto:True; do
+        printf '{ "%s": { "drafter": "%s" } }' "$DRAFT_MODEL" "${want%%:*}" >"$SETTINGS"
+        post unload-model "{\"model\":\"$DRAFT_MODEL\"}" >/dev/null
+        CODE="$(post load-model "{\"model\":\"$DRAFT_MODEL\"}")"
+        GOT="$(drafter_loaded)"
+        check "[5] drafter ${want%%:*}: load -> $CODE, drafter_loaded $GOT" \
+            "$([ "$CODE" = "200" ] && [ "$GOT" = "${want##*:}" ] && echo 1 || echo 0)"
+    done
+else
+    echo "  SKIP [5]: no pack with a drafter/ (DRAFT_MODEL=$DRAFT_MODEL)"
+fi
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]

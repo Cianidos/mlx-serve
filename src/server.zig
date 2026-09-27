@@ -6506,7 +6506,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6535,6 +6535,7 @@ fn renderModelEntry(
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
             if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
             gen_top_p_str,

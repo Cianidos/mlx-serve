@@ -1,4 +1,4 @@
-//! Row-exact 4-bit matmul for 1..MAX_ROWS rows, ported from TensorFold's
+//! Row-exact 4/6/8-bit matmul for 1..MAX_ROWS rows, ported from TensorFold's
 //! `simd_qmm.py` (MIT, see NOTICE). Every row runs one fixed FMA chain per
 //! 64-input group, the groups split over S chunks combined by a fixed tree; S
 //! depends on the shape only. `mma` (2+ rows) runs the chain on 8x8 fp32
@@ -24,7 +24,18 @@ const HEADER =
     \\  for (int e = 1; e < 8; e++) t = fma(bf8(v, e), one, t);
     \\  return t;
     \\}
-    \\inline float pre(int s) { return as_type<float>(uint(127 - 4 * s) << 23); }
+    \\// Value 8j + p of a 64-group's words (j = k-slot, p = pass): 4 and 8 bits
+    \\// masked in place, the input pre-scaled by wpre(p) to cancel the shift;
+    \\// 6 bits straddle words, so they are shifted down and wpre is 1.
+    \\template <int BITS> inline float wpre(int p) {
+    \\  return BITS == 6 ? 1.0f : as_type<float>(uint(127 - (BITS == 4 ? 4 * p : 8 * (p % 4))) << 23);
+    \\}
+    \\template <int BITS> inline float wfield(const thread uint* lw, int j, int p) {
+    \\  const int bit = (8 * j + p) * BITS, off = bit % 32;
+    \\  const uint w0 = lw[bit / 32];
+    \\  if (BITS == 6) return float((off <= 26 ? w0 >> off : (w0 >> off) | (lw[bit / 32 + 1] << (32 - off))) & 63u);
+    \\  return float(w0 & (((1u << BITS) - 1u) << off));
+    \\}
 ;
 
 const LOAD8 = "  #define LOAD8(r, j) ((((const device uint4*)X)[size_t(r) * (K / 8) + (j)]))\n";
@@ -40,6 +51,7 @@ const SCALAR =
     \\                 + int(lane) / S;
     \\  constexpr int G = K / 64;
     \\  const float one = ONE[0];
+    \\  constexpr int WQ = BITS / 2;
     \\  const device uint4* wr[NR];
     \\  const device bfloat* sr[NR];
     \\  const device bfloat* br[NR];
@@ -47,18 +59,16 @@ const SCALAR =
     \\  PRAGMA_UNROLL
     \\  for (int u = 0; u < NR; u++) {
     \\    const int nn = min(n0 + SLOTS * u, N - 1);
-    \\    wr[u] = (const device uint4*)(W + size_t(nn) * (K / 8));
+    \\    wr[u] = (const device uint4*)(W + size_t(nn) * (K * BITS / 32));
     \\    sr[u] = SC + size_t(nn) * G;
     \\    br[u] = BI + size_t(nn) * G;
     \\    acc[u] = 0.0f;
     \\  }
-    \\  uint4 na[NR], nb[NR];
+    \\  uint4 nw[NR][WQ];
     \\  PRAGMA_UNROLL
-    \\  for (int u = 0; u < NR; u++) { na[u] = uint4(0); nb[u] = uint4(0); }
-    \\  if (c < G) {
+    \\  for (int u = 0; u < NR; u++)
     \\    PRAGMA_UNROLL
-    \\    for (int u = 0; u < NR; u++) { na[u] = wr[u][2 * c]; nb[u] = wr[u][2 * c + 1]; }
-    \\  }
+    \\    for (int q = 0; q < WQ; q++) nw[u][q] = c < G ? wr[u][WQ * c + q] : uint4(0);
     \\  for (int b0 = 0; b0 < G; b0 += XB) {
     \\    const int nbk = min(XB, G - b0);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -66,17 +76,21 @@ const SCALAR =
     \\      const int gl = idx / 8, i = idx % 8;
     \\      const uint4 v = LOAD8(0, 8 * (b0 + gl) + i);
     \\      PRAGMA_UNROLL
-    \\      for (int s = 0; s < 8; s++) xs[gl * XP + 8 * s + i] = bf8(v, s) * pre(s);
+    \\      for (int s = 0; s < 8; s++) xs[gl * XP + 8 * s + i] = bf8(v, s) * wpre<BITS>(s);
     \\      xs[gl * XP + 64 + i] = sum8(v, one);
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    for (int g = b0 + c; g < b0 + nbk; g += S) {
-    \\      uint4 wa[NR], wb[NR];
+    \\      uint wd[NR][2 * BITS];
     \\      PRAGMA_UNROLL
-    \\      for (int u = 0; u < NR; u++) { wa[u] = na[u]; wb[u] = nb[u]; }
+    \\      for (int u = 0; u < NR; u++)
+    \\        PRAGMA_UNROLL
+    \\        for (int q = 0; q < 2 * BITS; q++) wd[u][q] = nw[u][q / 4][q % 4];
     \\      if (g + S < G) {
     \\        PRAGMA_UNROLL
-    \\        for (int u = 0; u < NR; u++) { na[u] = wr[u][2 * (g + S)]; nb[u] = wr[u][2 * (g + S) + 1]; }
+    \\        for (int u = 0; u < NR; u++)
+    \\          PRAGMA_UNROLL
+    \\          for (int q = 0; q < WQ; q++) nw[u][q] = wr[u][WQ * (g + S) + q];
     \\      }
     \\      const threadgroup float* xg = xs + (g - b0) * XP;
     \\      const float4 p0 = *(const threadgroup float4*)(xg + 64), p1 = *(const threadgroup float4*)(xg + 68);
@@ -87,15 +101,12 @@ const SCALAR =
     \\      for (int u = 0; u < NR; u++) P[u] = 0.0f;
     \\      PRAGMA_UNROLL
     \\      for (int s = 0; s < 8; s++) {
-    \\        const uint mask = 0xFu << (4 * s);
     \\        const float4 lo = *(const threadgroup float4*)(xg + 8 * s), hi = *(const threadgroup float4*)(xg + 8 * s + 4);
     \\        const float xq[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
     \\        PRAGMA_UNROLL
-    \\        for (int u = 0; u < NR; u++) {
-    \\          const uint wd[8] = {wa[u].x, wa[u].y, wa[u].z, wa[u].w, wb[u].x, wb[u].y, wb[u].z, wb[u].w};
+    \\        for (int u = 0; u < NR; u++)
     \\          PRAGMA_UNROLL
-    \\          for (int i = 0; i < 8; i++) P[u] = fma(xq[i], float(wd[i] & mask), P[u]);
-    \\        }
+    \\          for (int i = 0; i < 8; i++) P[u] = fma(xq[i], wfield<BITS>(wd[u], i, s), P[u]);
     \\      }
     \\      PRAGMA_UNROLL
     \\      for (int u = 0; u < NR; u++) {
@@ -126,6 +137,7 @@ const SCALAR_ROWS =
     \\                 + int(lane) / S;
     \\  constexpr int G = K / 64;
     \\  const float one = ONE[0];
+    \\  constexpr int WQ = BITS / 2;
     \\  const device uint4* wr[NR];
     \\  const device bfloat* sr[NR];
     \\  const device bfloat* br[NR];
@@ -133,18 +145,16 @@ const SCALAR_ROWS =
     \\  PRAGMA_UNROLL
     \\  for (int u = 0; u < NR; u++) {
     \\    const int nn = min(n0 + SLOTS * u, N - 1);
-    \\    wr[u] = (const device uint4*)(W + size_t(nn) * (K / 8));
+    \\    wr[u] = (const device uint4*)(W + size_t(nn) * (K * BITS / 32));
     \\    sr[u] = SC + size_t(nn) * G;
     \\    br[u] = BI + size_t(nn) * G;
     \\    for (int r = 0; r < RR; r++) acc[u][r] = 0.0f;
     \\  }
-    \\  uint4 na[NR], nb[NR];
+    \\  uint4 nw[NR][WQ];
     \\  PRAGMA_UNROLL
-    \\  for (int u = 0; u < NR; u++) { na[u] = uint4(0); nb[u] = uint4(0); }
-    \\  if (c < G) {
+    \\  for (int u = 0; u < NR; u++)
     \\    PRAGMA_UNROLL
-    \\    for (int u = 0; u < NR; u++) { na[u] = wr[u][2 * c]; nb[u] = wr[u][2 * c + 1]; }
-    \\  }
+    \\    for (int q = 0; q < WQ; q++) nw[u][q] = c < G ? wr[u][WQ * c + q] : uint4(0);
     \\  for (int b0 = 0; b0 < G; b0 += XB) {
     \\    const int nbk = min(XB, G - b0);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -152,17 +162,21 @@ const SCALAR_ROWS =
     \\      const int r = idx / (nbk * 8), gl = (idx / 8) % nbk, i = idx % 8;
     \\      const uint4 v = LOAD8(r, 8 * (b0 + gl) + i);
     \\      PRAGMA_UNROLL
-    \\      for (int s = 0; s < 8; s++) xs[r][gl * XP + 8 * s + i] = bf8(v, s) * pre(s);
+    \\      for (int s = 0; s < 8; s++) xs[r][gl * XP + 8 * s + i] = bf8(v, s) * wpre<BITS>(s);
     \\      xs[r][gl * XP + 64 + i] = sum8(v, one);
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    for (int g = b0 + c; g < b0 + nbk; g += S) {
-    \\      uint4 wa[NR], wb[NR];
+    \\      uint wd[NR][2 * BITS];
     \\      PRAGMA_UNROLL
-    \\      for (int u = 0; u < NR; u++) { wa[u] = na[u]; wb[u] = nb[u]; }
+    \\      for (int u = 0; u < NR; u++)
+    \\        PRAGMA_UNROLL
+    \\        for (int q = 0; q < 2 * BITS; q++) wd[u][q] = nw[u][q / 4][q % 4];
     \\      if (g + S < G) {
     \\        PRAGMA_UNROLL
-    \\        for (int u = 0; u < NR; u++) { na[u] = wr[u][2 * (g + S)]; nb[u] = wr[u][2 * (g + S) + 1]; }
+    \\        for (int u = 0; u < NR; u++)
+    \\          PRAGMA_UNROLL
+    \\          for (int q = 0; q < WQ; q++) nw[u][q] = wr[u][WQ * (g + S) + q];
     \\      }
     \\      // The chain per row is the one-row kernel's (s, then i); the masked
     \\      // weights are built once for every row.
@@ -172,14 +186,11 @@ const SCALAR_ROWS =
     \\        for (int r = 0; r < RR; r++) P[u][r] = 0.0f;
     \\      PRAGMA_UNROLL
     \\      for (int s = 0; s < 8; s++) {
-    \\        const uint mask = 0xFu << (4 * s);
     \\        float wf[NR][8];
     \\        PRAGMA_UNROLL
-    \\        for (int u = 0; u < NR; u++) {
-    \\          const uint wd[8] = {wa[u].x, wa[u].y, wa[u].z, wa[u].w, wb[u].x, wb[u].y, wb[u].z, wb[u].w};
+    \\        for (int u = 0; u < NR; u++)
     \\          PRAGMA_UNROLL
-    \\          for (int i = 0; i < 8; i++) wf[u][i] = float(wd[i] & mask);
-    \\        }
+    \\          for (int i = 0; i < 8; i++) wf[u][i] = wfield<BITS>(wd[u], i, s);
     \\        PRAGMA_UNROLL
     \\        for (int r = 0; r < RR; r++) {
     \\          const threadgroup float* xg = xs[r] + (g - b0) * XP;
@@ -229,7 +240,6 @@ const MMA =
     \\  const int nb = int(threadgroup_position_in_grid.x) * (8 * NT);
     \\  const int rb = int(threadgroup_position_in_grid.y) * (8 * RT);
     \\  threadgroup float red[S > 1 ? S * RT * NT * 64 : 1];
-    \\  const device uint2* W2 = (const device uint2*)W;
     \\  int wrow[NT];
     \\  for (int t = 0; t < NT; t++) wrow[t] = min(nb + 8 * t + fm, N - 1);
     \\  int xr0[RT], xr1[RT];
@@ -238,9 +248,14 @@ const MMA =
     \\  for (int rt = 0; rt < RT; rt++)
     \\    for (int t = 0; t < NT; t++) { acc[rt][t][0] = 0.0f; acc[rt][t][1] = 0.0f; }
     \\  for (int g = c; g < G; g += S) {
-    \\    uint2 wv[NT];
+    \\    uint wv[NT][BITS / 2];
     \\    PRAGMA_UNROLL
-    \\    for (int t = 0; t < NT; t++) wv[t] = W2[size_t(wrow[t]) * (K / 16) + 4 * g + fn / 2];
+    \\    for (int t = 0; t < NT; t++) {
+    \\      const device uint* wp = (const device uint*)W + size_t(wrow[t]) * (K * BITS / 32) + 2 * BITS * g + (BITS / 2) * (fn / 2);
+    \\      if (BITS == 4) { const uint2 v = *(const device uint2*)wp; wv[t][0] = v.x; wv[t][1] = v.y; }
+    \\      else if (BITS == 8) { const uint4 v = *(const device uint4*)wp; wv[t][0] = v.x; wv[t][1] = v.y; wv[t][2] = v.z; wv[t][3] = v.w; }
+    \\      else { wv[t][0] = wp[0]; wv[t][1] = wp[1]; wv[t][2] = wp[2]; }
+    \\    }
     \\    uint4 xa[RT], xb[RT];
     \\    float xs0[RT], xs1[RT];
     \\    PRAGMA_UNROLL
@@ -259,8 +274,7 @@ const MMA =
     \\      for (int t = 0; t < NT; t++) P[rt][t] = simdgroup_matrix<float, 8, 8>(0.0f);
     \\    PRAGMA_UNROLL
     \\    for (int s = 0; s < 8; s++) {
-    \\      const float ps = pre(s);
-    \\      const uint mask = 0xFu << (4 * s);
+    \\      const float ps = wpre<BITS>(s);
     \\      simdgroup_matrix<float, 8, 8> bm[RT];
     \\      PRAGMA_UNROLL
     \\      for (int rt = 0; rt < RT; rt++) {
@@ -270,8 +284,8 @@ const MMA =
     \\      PRAGMA_UNROLL
     \\      for (int t = 0; t < NT; t++) {
     \\        simdgroup_matrix<float, 8, 8> am;
-    \\        am.thread_elements()[0] = float(wv[t].x & mask);
-    \\        am.thread_elements()[1] = float(wv[t].y & mask);
+    \\        am.thread_elements()[0] = wfield<BITS>(wv[t], 0, s);
+    \\        am.thread_elements()[1] = wfield<BITS>(wv[t], 1, s);
     \\        PRAGMA_UNROLL
     \\        for (int rt = 0; rt < RT; rt++) simdgroup_multiply_accumulate(P[rt][t], am, bm[rt], P[rt][t]);
     \\      }
@@ -314,7 +328,8 @@ const MMA =
 ;
 
 const Kind = enum { scalar, rows, mma };
-/// Widest window `rows` serves: past it `mma` is cheaper.
+/// Widest window `rows` serves: past it `mma` is cheaper. At 6 and 8 bits
+/// `mma` is cheaper from two rows.
 pub const SCALAR_ROWS_MAX = 3;
 
 /// Chunks the K groups split into: a function of the shape only (it sets the bits).
@@ -335,24 +350,24 @@ fn rowsFit(rows: c_int, n: c_int) bool {
     return rows * splits(n) * 76 * 4 <= 32 * 1024;
 }
 
-const PlanKey = struct { kind: Kind, rows: c_int, n: c_int, k: c_int };
+const PlanKey = struct { kind: Kind, rows: c_int, n: c_int, k: c_int, bits: c_int };
 const Plan = struct { kernel: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config };
 var plans: std.AutoHashMapUnmanaged(PlanKey, Plan) = .{};
 /// Kernels by (kind, baked constants): a new row count reuses the compiled one.
-const KernelKey = struct { kind: Kind, k: c_int, n: c_int, s: c_int, a: c_int, b: c_int, rr: c_int = 1, xb: c_int = XB };
+const KernelKey = struct { kind: Kind, k: c_int, n: c_int, bits: c_int, s: c_int, a: c_int, b: c_int, rr: c_int = 1, xb: c_int = XB };
 var kernels: std.AutoHashMapUnmanaged(KernelKey, mlx.mlx_fast_metal_kernel) = .{};
-/// Shapes (n, k) whose one-row calls take `mma`: there the scalar chain's bits differ.
-var mma_one_row: std.AutoHashMapUnmanaged([2]c_int, void) = .{};
-var prepared: std.AutoHashMapUnmanaged([2]c_int, void) = .{};
+/// Shapes (n, k, bits) whose one-row calls take `mma`: there the scalar chain's bits differ.
+var mma_one_row: std.AutoHashMapUnmanaged([3]c_int, void) = .{};
+var prepared: std.AutoHashMapUnmanaged([3]c_int, void) = .{};
 var one_arr: mlx.mlx_array = .{ .ctx = null };
 
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     if (kernels.get(key)) |k| return k;
     const a = std.heap.c_allocator;
     const consts = if (key.kind != .mma)
-        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int S = {d};\n  constexpr int SGS = {d};\n  constexpr int NR = {d};\n  constexpr int XB = {d};\n  constexpr int RR = {d};\n", .{ key.k, key.n, key.s, key.a, key.b, key.xb, key.rr })
+        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int SGS = {d};\n  constexpr int NR = {d};\n  constexpr int XB = {d};\n  constexpr int RR = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b, key.xb, key.rr })
     else
-        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int S = {d};\n  constexpr int NT = {d};\n  constexpr int RT = {d};\n", .{ key.k, key.n, key.s, key.a, key.b });
+        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int NT = {d};\n  constexpr int RT = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b });
     defer a.free(consts);
     const body = switch (key.kind) {
         .scalar => SCALAR,
@@ -361,7 +376,7 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     };
     const source = try std.mem.concatWithSentinel(a, u8, &.{ consts, LOAD8, body, "  #undef LOAD8\n" }, 0);
     defer a.free(source);
-    const name = try std.fmt.allocPrintSentinel(a, "msv_simd_qmm_{s}_k{d}_n{d}_s{d}_{d}_{d}_r{d}_x{d}", .{ @tagName(key.kind), key.k, key.n, key.s, key.a, key.b, key.rr, key.xb }, 0);
+    const name = try std.fmt.allocPrintSentinel(a, "msv_simd_qmm_{s}_k{d}_n{d}_b{d}_s{d}_{d}_{d}_r{d}_x{d}", .{ @tagName(key.kind), key.k, key.n, key.bits, key.s, key.a, key.b, key.rr, key.xb }, 0);
     defer a.free(name);
     const in_names = [_][*:0]const u8{ "X", "W", "SC", "BI", "ONE" };
     const out_names = [_][*:0]const u8{"OUT"};
@@ -375,8 +390,8 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-fn planFor(kind: Kind, rows: c_int, n: c_int, k: c_int) !Plan {
-    const pk = PlanKey{ .kind = kind, .rows = rows, .n = n, .k = k };
+fn planFor(kind: Kind, rows: c_int, n: c_int, k: c_int, bits: c_int) !Plan {
+    const pk = PlanKey{ .kind = kind, .rows = rows, .n = n, .k = k, .bits = bits };
     if (plans.get(pk)) |p| return p;
     const s = splits(n);
     const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -393,33 +408,34 @@ fn planFor(kind: Kind, rows: c_int, n: c_int, k: c_int) !Plan {
         // stays a multiple of S, so each chunk still visits its groups in order.
         const rr: c_int = if (kind == .rows) rows else 1;
         const xb: c_int = if (kind == .rows) @max(s, @divTrunc(XB, rr) & ~(s - 1)) else XB;
-        kkey = .{ .kind = kind, .k = k, .n = n, .s = s, .a = sgs, .b = nr, .rr = rr, .xb = xb };
+        kkey = .{ .kind = kind, .k = k, .n = n, .bits = bits, .s = s, .a = sgs, .b = nr, .rr = rr, .xb = xb };
     } else {
         const rt: c_int = @min(RT_MAX, @divTrunc(rows + 7, 8));
         const nt = tiles(n, rt * 8, s);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(n + 8 * nt - 1, 8 * nt) * s * 32, @divTrunc(rows + 8 * rt - 1, 8 * rt), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, s * 32, 1, 1));
-        kkey = .{ .kind = kind, .k = k, .n = n, .s = s, .a = nt, .b = rt };
+        kkey = .{ .kind = kind, .k = k, .n = n, .bits = bits, .s = s, .a = nt, .b = rt };
     }
     const p = Plan{ .kernel = try kernelFor(kkey), .config = config };
     try plans.put(std.heap.c_allocator, pk, p);
     return p;
 }
 
-/// A 4-bit affine bf16 matrix [N, K/8] in groups of 64 with K % 64 == 0 and N % 8 == 0.
+/// A 4, 6 or 8-bit affine bf16 matrix [N, K * bits / 32] in groups of 64
+/// with K % 64 == 0 and N % 8 == 0.
 pub fn fits(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32) bool {
-    if (bits != 4 or group_size != 64 or bi.ctx == null) return false;
+    if ((bits != 4 and bits != 6 and bits != 8) or group_size != 64 or bi.ctx == null) return false;
     if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return false;
     const ws = mlx.getShape(w);
-    return ws.len == 2 and @rem(ws[1] * 8, 64) == 0 and @rem(ws[0], 8) == 0;
+    return ws.len == 2 and @rem(ws[1] * 32, 64 * @as(c_int, @intCast(bits))) == 0 and @rem(ws[0], 8) == 0;
 }
 
-fn launch(kind: Kind, x2: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, rows: c_int, n: c_int, k: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+fn launch(kind: Kind, x2: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, rows: c_int, n: c_int, k: c_int, bits: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     if (one_arr.ctx == null) {
         const one: f32 = 1.0;
         one_arr = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32);
     }
-    const p = try planFor(kind, rows, n, k);
+    const p = try planFor(kind, rows, n, k, bits);
     const inputs = [_]mlx.mlx_array{ x2, w, sc, bi, one_arr };
     const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);
@@ -443,18 +459,20 @@ fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, 
     if (xs.len == 0 or xs.len > 8) return null;
     const ws = mlx.getShape(w);
     const k = xs[xs.len - 1];
-    if (k != ws[1] * 8) return null;
+    const b: c_int = @intCast(bits);
+    if (k * b != ws[1] * 32) return null;
     var rows: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| rows *= d;
     if (rows < 1 or rows > MAX_ROWS) return null;
     const n = ws[0];
-    const shape = [2]c_int{ n, k };
-    if (force == null and !prepared.contains(shape)) try prepare(w, sc, bi, s);
-    const kind: Kind = force orelse if (mma_one_row.contains(shape) or rows > SCALAR_ROWS_MAX or !rowsFit(rows, n)) .mma else if (rows == 1) .scalar else .rows;
+    const shape = [3]c_int{ n, k, b };
+    if (force == null and !prepared.contains(shape)) try prepare(w, sc, bi, bits, s);
+    const rows_max: c_int = if (bits == 4) SCALAR_ROWS_MAX else 1;
+    const kind: Kind = force orelse if (mma_one_row.contains(shape) or rows > rows_max or !rowsFit(rows, n)) .mma else if (rows == 1) .scalar else .rows;
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, k }, 2, s));
-    const y = try launch(kind, x2, w, sc, bi, rows, n, k, s);
+    const y = try launch(kind, x2, w, sc, bi, rows, n, k, b, s);
     defer _ = mlx.mlx_array_free(y);
     var out_shape: [8]c_int = undefined;
     @memcpy(out_shape[0..xs.len], xs);
@@ -466,11 +484,11 @@ fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, 
 
 /// Once per shape: whether one-row `scalar` calls give `mma`'s rows bit for
 /// bit on this GPU; where they do not, one-row calls of the shape take `mma`.
-fn prepare(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) anyerror!void {
+fn prepare(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, s: mlx.mlx_stream) anyerror!void {
     const ws = mlx.getShape(w);
     const n = ws[0];
-    const k = ws[1] * 8;
-    const shape = [2]c_int{ n, k };
+    const k = @divExact(ws[1] * 32, @as(c_int, @intCast(bits)));
+    const shape = [3]c_int{ n, k, @intCast(bits) };
     try prepared.put(std.heap.c_allocator, shape, {});
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
@@ -481,7 +499,7 @@ fn prepare(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_st
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
-    const full = (try qmmKind(.mma, x, w, sc, bi, 4, 64, s)).?;
+    const full = (try qmmKind(.mma, x, w, sc, bi, bits, 64, s)).?;
     defer _ = mlx.mlx_array_free(full);
     var same_all = true;
     var r: c_int = 0;
@@ -489,7 +507,7 @@ fn prepare(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_st
         var xr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xr);
         try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ r, 0 }, 2, &[_]c_int{ r + 1, k }, 2, &[_]c_int{ 1, 1 }, 2, s));
-        const one = (try qmmKind(.scalar, xr, w, sc, bi, 4, 64, s)).?;
+        const one = (try qmmKind(.scalar, xr, w, sc, bi, bits, 64, s)).?;
         defer _ = mlx.mlx_array_free(one);
         var fr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(fr);
@@ -536,16 +554,16 @@ fn expectSame(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
     try testing.expect(same);
 }
 
-test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, and matches f32 truth" {
+test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, and matches f32 truth at 4, 6 and 8 bits" {
     const s = mlx.gpuStream();
     // Qwen3.8-27B's shapes, cut down: every split count (32 / 16 / 8) and odd tile counts.
     const Shape = struct { n: c_int, k: c_int };
-    for ([_]Shape{ .{ .n = 64, .k = 512 }, .{ .n = 1024, .k = 5120 }, .{ .n = 4104, .k = 1024 }, .{ .n = 2056, .k = 640 } }, 0..) |sh, si| {
+    for ([_]u32{ 4, 6, 8 }) |bits| for ([_]Shape{ .{ .n = 64, .k = 512 }, .{ .n = 1024, .k = 5120 }, .{ .n = 4104, .k = 1024 }, .{ .n = 2056, .k = 640 } }, 0..) |sh, si| {
         const wf = try randBf16(&.{ sh.n, sh.k }, 0.02, 100 + si, s);
         defer _ = mlx.mlx_array_free(wf);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
         var w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(w);
         var sc = mlx.mlx_array_new();
@@ -557,13 +575,13 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
         const x = try randBf16(&.{ MAX_ROWS, sh.k }, 1.0, 7 + si, s);
         defer _ = mlx.mlx_array_free(x);
-        const all = (try qmm(x, w, sc, bi, 4, 64, s)) orelse return error.Declined;
+        const all = (try qmm(x, w, sc, bi, bits, 64, s)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(all);
         var r: c_int = 0;
         while (r < MAX_ROWS) : (r += 1) {
             const xr = try rowsOf(x, r, r + 1, s);
             defer _ = mlx.mlx_array_free(xr);
-            const one = (try qmm(xr, w, sc, bi, 4, 64, s)).?;
+            const one = (try qmm(xr, w, sc, bi, bits, 64, s)).?;
             defer _ = mlx.mlx_array_free(one);
             const want = try rowsOf(all, r, r + 1, s);
             defer _ = mlx.mlx_array_free(want);
@@ -572,7 +590,7 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         for ([_][2]c_int{ .{ 2, 5 }, .{ 0, 8 }, .{ 3, 12 }, .{ 6, 8 }, .{ 9, 13 } }) |win| {
             const xw = try rowsOf(x, win[0], win[1], s);
             defer _ = mlx.mlx_array_free(xw);
-            const got = (try qmm(xw, w, sc, bi, 4, 64, s)).?;
+            const got = (try qmm(xw, w, sc, bi, bits, 64, s)).?;
             defer _ = mlx.mlx_array_free(got);
             const want = try rowsOf(all, win[0], win[1], s);
             defer _ = mlx.mlx_array_free(want);
@@ -581,7 +599,7 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         // f32 truth: x @ dequant(w).T
         var wd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wd);
-        try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
         var wt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wt);
         try mlx.check(mlx.mlx_transpose(&wt, wd, s));
@@ -614,5 +632,5 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         try mlx.check(mlx.mlx_array_item_float32(&a, sd));
         try mlx.check(mlx.mlx_array_item_float32(&b, st));
         try testing.expect(@sqrt(a / b) < 1e-2);
-    }
+    };
 }

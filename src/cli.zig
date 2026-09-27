@@ -265,7 +265,7 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 pub fn shouldDownload(path: []const u8) bool {
     if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        const sidecar_dirs = [_][]const u8{ "mtp/", "g2p/", "speech_tokenizer/" };
+        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/" };
         for (sidecar_dirs) |d| {
             if (std.mem.startsWith(u8, path, d)) break;
         } else return false;
@@ -903,6 +903,7 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(shouldDownload("tokenizer.json"));
     try testing.expect(shouldDownload("chat_template.jinja"));
     try testing.expect(shouldDownload("mtp/weights.safetensors"));
+    try testing.expect(shouldDownload("drafter/model.safetensors"));
     try testing.expect(!shouldDownload(".gitattributes"));
     try testing.expect(!shouldDownload("README.md"));
     try testing.expect(!shouldDownload("assets/demo.png"));

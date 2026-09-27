@@ -32,22 +32,10 @@ class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
             guard oldValue != selectedModelPath, !selectedModelPath.isEmpty else { return }
-            // Drafter pairing: a drafter is paired to a specific Gemma 4 size,
-            // and carrying the wrong one over crashes the server with
-            // `DrafterTargetMismatch` — so every model change re-decides from
-            // scratch (`DrafterPairing.decide`). It pairs a dense Gemma 4 with
-            // the drafter that came down with it whether or not one was on
-            // before: the checkpoint is a dependency of the model now, not
-            // something the user went shopping for. `drafterOptOut` is what
-            // makes an explicit off stick.
-            syncDrafterPairing()
+            // The drafter follows the model: the server reads its `drafter`
+            // entry in model-settings.json at every load, hot switch included.
             switch Self.modelSwitchAction(forStatus: server.status, path: selectedModelPath) {
             case .hotSwitch(let id):
-                // The decision `syncDrafterPairing()` just made, not a
-                // second read of the disk: a hot-switch that ignores the
-                // user's off switch loads a drafter the restart path
-                // wouldn't, and only one of the two would be reproducible.
-                let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
                 let mgr = server
                 // Tracked so `useModelAndAwaitReady` can await this exact
                 // switch — hot-switch never moves `server.status` off
@@ -72,7 +60,7 @@ class AppState: ObservableObject {
                 pendingModelLoadTask = Task { @MainActor in
                     defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
                     do {
-                        _ = try await mgr.loadModel(id: id, drafterPath: drafterPath, setDefault: true)
+                        _ = try await mgr.loadModel(id: id, setDefault: true)
                     } catch {
                         // Register-by-path failed (unsupported arch, partial
                         // download) or the load 503'd (memory) — a full
@@ -582,6 +570,10 @@ class AppState: ObservableObject {
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
         // ServerOptions blob hasn't been written yet. After that the bridges
         // above (var maxTokens / var contextSize) keep them in sync.
+        // Held until the first model scan: the save below drops these keys.
+        if let legacy = ServerOptions.legacyDrafter() {
+            UserDefaults.standard.set(["path": legacy.path, "optedOut": legacy.optedOut], forKey: Self.pendingDrafterMigrationKey)
+        }
         var opts = ServerOptions.load()
         if UserDefaults.standard.object(forKey: "serverOptions") == nil {
             let storedMax = UserDefaults.standard.integer(forKey: "maxTokens")
@@ -800,32 +792,31 @@ class AppState: ObservableObject {
         let repaired = reconciledModelSelection(current: selectedModelPath,
                                                 pickablePaths: baseModels.map(\.path))
         if repaired != selectedModelPath { selectedModelPath = repaired }
-        adoptNewlyAvailableDrafter()
+        migrateGlobalDrafter()
+        Task { await downloads.checkPackUpdates(models: models) }
     }
 
-    // MARK: - Drafter pairing
+    // MARK: - Drafter migration
 
-    /// Re-decide the drafter for the selected model. Called on every model
-    /// change — it both pairs and UNPAIRS, because a drafter carried onto the
-    /// wrong Gemma 4 size is `DrafterTargetMismatch` at server start.
-    private func syncDrafterPairing() {
-        let paired = DrafterPairing.decide(
-            modelPath: selectedModelPath,
-            optedOut: serverOptions.drafterOptOut,
-            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
-        if serverOptions.drafterPath != paired { serverOptions.drafterPath = paired }
-    }
+    private static let pendingDrafterMigrationKey = "pendingDrafterMigration"
 
-    /// The model list changed (a download landed): fill in a pairing that
-    /// wasn't possible a moment ago — downloading a Gemma 4 fetches its drafter
-    /// too, and it finishes after the model is already selected.
-    private func adoptNewlyAvailableDrafter() {
-        guard serverOptions.drafterPath.isEmpty, !serverOptions.drafterOptOut else { return }
-        let paired = DrafterPairing.decide(
-            modelPath: selectedModelPath,
-            optedOut: false,
-            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
-        if !paired.isEmpty { serverOptions.drafterPath = paired }
+    /// Once: the old global drafter becomes per-model `drafter` entries (every
+    /// Gemma with its paired drafter on disk, plus the selected model).
+    private func migrateGlobalDrafter() {
+        guard let pending = UserDefaults.standard.dictionary(forKey: Self.pendingDrafterMigrationKey) else { return }
+        UserDefaults.standard.removeObject(forKey: Self.pendingDrafterMigrationKey)
+        var pairs: [String: String] = [:]
+        for m in localModels where m.isChatPickable {
+            let gems = DrafterGems.gems(forRepoId: m.name, packFiles: nil, localDrafter: false, mtpAvailable: false)
+            guard gems.contains(where: { $0.kind == .gemmaAssistant }),
+                  let d = downloads.recommendedDrafterFromPath(m.path) else { continue }
+            pairs[m.path] = d.url.path
+        }
+        var file = ModelSettingsFile.load()
+        DrafterMigration.migrate(&file, pairs: pairs, selected: selectedModelPath,
+                                 globalPath: pending["path"] as? String ?? "",
+                                 optedOut: pending["optedOut"] as? Bool ?? false)
+        try? file.save()
     }
 
     /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s

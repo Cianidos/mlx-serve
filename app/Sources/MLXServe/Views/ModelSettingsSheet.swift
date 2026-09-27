@@ -30,6 +30,7 @@ struct ModelSettingsSheet: View {
     let request: ModelSettingsRequest
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
     @Environment(\.dismiss) private var dismiss
 
     @State private var override = ModelOverride()
@@ -38,6 +39,9 @@ struct ModelSettingsSheet: View {
     @State private var customValue = ""
     @State private var busy = false
     @State private var error: String?
+    @State private var socket: DrafterSocket = .automatic
+    @State private var initialSocket: DrafterSocket = .automatic
+    @State private var modelGB: Double = 0
 
     private var live: ModelInfo? {
         server.allModels.first { request.path.hasSuffix("/" + $0.name) || $0.name == request.path }
@@ -65,9 +69,23 @@ struct ModelSettingsSheet: View {
         return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp)
     }
 
+    private var repoId: String {
+        appState.localModels.first { $0.path == request.path }?.name ?? (request.path as NSString).lastPathComponent
+    }
+
+
+    /// What the server actually loaded, and whether drafts are byte-exact.
+    private var specLine: String? {
+        guard let live, live.loaded else { return nil }
+        let exact = live.specExact.map { $0 ? ", byte-exact" : ", not byte-exact" } ?? ""
+        if live.drafterLoaded { return "Loaded: drafter \((live.drafterPath.map { ($0 as NSString).lastPathComponent }) ?? "")\(exact)" }
+        if live.mtpLoaded { return "Loaded: MTP head\(exact)" }
+        return "Loaded without speculation"
+    }
+
     private var formHeight: CGFloat {
         var n = isGguf ? 1 : 2
-        if rows.mtp { n += 1 }
+        if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
@@ -148,14 +166,14 @@ struct ModelSettingsSheet: View {
                     ForEach(KvQuantChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
                 }
-                if rows.mtp {
-                Picker("MTP", selection: Binding(
-                    get: { override.mtp.map { $0 ? 1 : 0 } ?? -1 },
-                    set: { override.mtp = $0 < 0 ? nil : $0 == 1 })) {
-                    Text("Default").tag(-1)
-                    Text("On").tag(1)
-                    Text("Off").tag(0)
-                }
+                if !isGguf {
+                    Section("Speculation") {
+                        SpeculationSocketRow(socket: $socket, repoId: repoId,
+                                             modelDir: request.path, modelGB: modelGB, mtpAvailable: rows.mtp)
+                        if let specLine {
+                            Text(specLine).font(.app(.caption)).foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 if rows.acceptance {
                 Picker("MTP acceptance", selection: Binding(
@@ -232,12 +250,24 @@ struct ModelSettingsSheet: View {
             .padding(16)
         }
         .frame(width: 440)
-        .onAppear { override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride() }
+        .onAppear {
+            override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride()
+            let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
+                                                 listing: downloads.packListings[repoId])
+            socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }
+            initialSocket = socket
+            modelGB = Self.weightsGB(in: request.path)
+        }
+        .task { await downloads.checkPackUpdate(repoId: repoId, dir: request.path, force: true) }
     }
 
     private func save() async {
         busy = true
         defer { busy = false }
+        if socket != initialSocket {
+            let gemPath: String? = if case .gem(let g) = socket { downloads.gemPath(g, modelDir: request.path) } else { nil }
+            socket.write(into: &override, gemPath: gemPath)
+        }
         var file = ModelSettingsFile.load()
         file.set(override, for: request.path)
         do {
@@ -262,5 +292,101 @@ struct ModelSettingsSheet: View {
             }
         }
         dismiss()
+    }
+
+    private static func weightsGB(in dir: String) -> Double {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        let bytes = files.filter { $0.hasSuffix(".safetensors") }
+            .reduce(UInt64(0)) { $0 + DownloadManager.resolvedFileSize((dir as NSString).appendingPathComponent($1)) }
+        return Double(bytes) / 1e9
+    }
+}
+
+/// The speculation socket: one slot, the gems that fit this model. Slotting a
+/// gem that is not on disk downloads it; emptying a downloaded one offers to
+/// delete its files.
+struct SpeculationSocketRow: View {
+    @Binding var socket: DrafterSocket
+    @EnvironmentObject var downloads: DownloadManager
+    let repoId: String
+    let modelDir: String
+    let modelGB: Double
+    let mtpAvailable: Bool
+    @State private var removing: DrafterGem?
+
+    private var gems: [DrafterGem] {
+        Self.gems(repoId: repoId, modelDir: modelDir, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
+    }
+
+    static func gems(repoId: String, modelDir: String, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
+        let local = FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json"))
+        return DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: local, mtpAvailable: mtpAvailable)
+    }
+
+    private var fetching: DrafterGem? { gems.first { downloads.isFetchingGem($0) } }
+
+    var body: some View {
+        LabeledContent("Drafter") {
+            if let g = fetching {
+                HStack(spacing: 8) {
+                    ProgressView(value: downloads.downloads[g.repo]?.progress ?? 0).frame(width: 100)
+                    Button("Cancel") {
+                        downloads.cancelGem(g)
+                        socket = .empty
+                    }
+                }
+            } else {
+                Menu(Self.label(socket)) {
+                    Button("Automatic") { choose(.automatic) }
+                    Button("Empty") { choose(.empty) }
+                    if !gems.isEmpty { Divider() }
+                    ForEach(gems) { g in
+                        Button(itemLabel(g)) { pick(g) }.disabled(!onDisk(g) && !fits(g))
+                    }
+                }
+                .fixedSize()
+            }
+        }
+        .alert("Remove drafter", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+               presenting: removing) { g in
+            Button("Keep Files", role: .cancel) {}
+            Button("Delete Files", role: .destructive) { downloads.removeGem(g, modelDir: modelDir) }
+                .keyboardShortcut(.defaultAction)
+        } message: { g in
+            Text("Also delete the \(g.label) files (\(SystemMemoryInfo.preciseGB(g.sizeGB)))?").font(.app(.body))
+        }
+    }
+
+    static func label(_ s: DrafterSocket) -> String {
+        switch s {
+        case .automatic: "Automatic"
+        case .empty: "Empty"
+        case .gem(let g): g.label
+        case .custom(let p): (p as NSString).lastPathComponent
+        }
+    }
+
+    private func onDisk(_ g: DrafterGem) -> Bool {
+        !g.needsDownload || downloads.gemPath(g, modelDir: modelDir) != nil
+    }
+
+    private func fits(_ g: DrafterGem) -> Bool {
+        DrafterGems.fits(g, modelGB: modelGB, memory: .current())
+    }
+
+    private func itemLabel(_ g: DrafterGem) -> String {
+        if onDisk(g) { return g.label }
+        let size = SystemMemoryInfo.preciseGB(g.sizeGB)
+        return fits(g) ? "\(g.label) (download \(size))" : "\(g.label) (\(size), does not fit in memory)"
+    }
+
+    private func pick(_ g: DrafterGem) {
+        guard !onDisk(g) else { socket = .gem(g); return }
+        downloads.startGem(g, modelDir: modelDir) { ok in if ok { socket = .gem(g) } }
+    }
+
+    private func choose(_ s: DrafterSocket) {
+        if case .gem(let g) = socket, g.needsDownload, downloads.gemPath(g, modelDir: modelDir) != nil { removing = g }
+        socket = s
     }
 }

@@ -669,8 +669,8 @@ class ServerManager: ObservableObject {
     /// `setDefault` = a model SWITCH: the server re-points its default, so
     /// the refreshed list sorts the new model first (`modelInfo` follows) and
     /// aliased requests route to it — the parts a restart used to provide.
-    func loadModel(id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
-        let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath, setDefault: setDefault)
+    func loadModel(id: String, setDefault: Bool = false) async throws -> ModelInfo {
+        let info = try await api.loadModel(port: port, id: id, setDefault: setDefault)
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).

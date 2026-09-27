@@ -121,6 +121,7 @@ struct BenchmarkView: View {
             ModelSettingsSheet(request: $0)
                 .environmentObject(appState)
                 .environmentObject(server)
+                .environmentObject(appState.downloads)
         }
         .sheet(item: $sheetSource) { item in
             BenchmarkSessionSheet(source: item.source)

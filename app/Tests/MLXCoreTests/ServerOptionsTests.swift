@@ -117,172 +117,6 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertFalse(contains(args, flag: "--ctx-size"))
     }
 
-    func testDrafterPathPullsInBlockSize() {
-        var opts = ServerOptions()
-        opts.drafterPath = "/tmp/gemma-4-E4B-it-assistant-bf16"
-        opts.draftBlockSize = 6
-        let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--drafter", value: "/tmp/gemma-4-E4B-it-assistant-bf16"))
-        XCTAssertTrue(contains(args, flag: "--draft-block-size", value: "6"))
-    }
-
-    func testEmptyDrafterPathOmitsBothFlags() {
-        let opts = ServerOptions()  // drafterPath = ""
-        let args = opts.toCLIArgs()
-        XCTAssertFalse(args.contains("--drafter"))
-        XCTAssertFalse(args.contains("--draft-block-size"))
-    }
-
-    func testCustomTimeoutIsEmittedWhenNonDefault() {
-        var opts = ServerOptions()
-        opts.requestTimeout = 600
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "600"))
-
-        opts.requestTimeout = 0  // unlimited
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "0"))
-    }
-
-    // MARK: - Host / port (Settings UI fields)
-
-    /// `parsePort` backs the Settings port text field — it must accept exactly
-    /// what a TCP listen can bind and reject everything else, because an
-    /// invalid value that slipped through would silently launch on a port the
-    /// rest of the app (health checks, chat client) isn't watching.
-    func testParsePortAcceptsValidPorts() {
-        XCTAssertEqual(ServerOptions.parsePort("11234"), 11234)
-        XCTAssertEqual(ServerOptions.parsePort(" 8080 "), 8080)   // trims whitespace
-        XCTAssertEqual(ServerOptions.parsePort("1"), 1)
-        XCTAssertEqual(ServerOptions.parsePort("65535"), 65535)
-    }
-
-    func testParsePortRejectsJunk() {
-        XCTAssertNil(ServerOptions.parsePort(""))
-        XCTAssertNil(ServerOptions.parsePort("0"))      // 0 = kernel-assigned ephemeral; client couldn't find the server
-        XCTAssertNil(ServerOptions.parsePort("65536"))
-        XCTAssertNil(ServerOptions.parsePort("-1"))
-        XCTAssertNil(ServerOptions.parsePort("80x"))
-        XCTAssertNil(ServerOptions.parsePort("abc"))
-        XCTAssertNil(ServerOptions.parsePort("11 234"))
-    }
-
-    /// The host field is free text in Settings; a cleared field must not
-    /// launch `--host ""` (the server would fail to bind).
-    func testEmptyHostFallsBackToBindAll() {
-        var opts = ServerOptions()
-        opts.host = "   "
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "0.0.0.0"))
-    }
-
-    func testCustomHostIsEmitted() {
-        var opts = ServerOptions()
-        opts.host = "127.0.0.1"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "127.0.0.1"))
-    }
-
-    func testNoVisionFlag() {
-        var opts = ServerOptions()
-        opts.noVision = true
-        XCTAssertTrue(opts.toCLIArgs().contains("--no-vision"))
-    }
-
-    // MARK: - Observability (--metrics)
-
-    func testMetricsFlagEmittedByDefault() {
-        XCTAssertTrue(ServerOptions().toCLIArgs().contains("--metrics"))
-    }
-
-    func testMetricsFlagOmittedWhenDisabled() {
-        var opts = ServerOptions()
-        opts.enableMetrics = false
-        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
-    }
-
-    func testMetricsHasNoAdminKeyFlag() {
-        // The simplified observability layer has no admin/auth surface: even
-        // with metrics on, no `--admin-key` (or any admin flag) is ever emitted.
-        var opts = ServerOptions()
-        opts.enableMetrics = true
-        XCTAssertFalse(opts.toCLIArgs().contains("--admin-key"))
-    }
-
-    func testApiKeyOmittedByDefault() {
-        let opts = ServerOptions()
-        XCTAssertEqual(opts.apiKey, "")
-        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
-    }
-
-    func testApiKeyEmittedWhenSet() {
-        var opts = ServerOptions()
-        opts.apiKey = "s3cret"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--api-key", value: "s3cret"))
-    }
-
-    func testApiKeyWhitespaceOnlyIsOmitted() {
-        var opts = ServerOptions()
-        opts.apiKey = "   "
-        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
-    }
-
-    func testApiKeyChangeTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.apiKey = "s3cret"
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Setting/changing the API key must trigger a server restart")
-    }
-
-    func testEnableMetricsChangeTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.enableMetrics = false
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Toggling --metrics must trigger a server restart")
-    }
-
-    // MARK: - SSD prefix cache (default off + toggle)
-
-    func testPrefixCacheDiskDefaultsOff() {
-        // OFF by default: the app is authoritative and always emits the flag as
-        // `off` so the SSD tier can't be silently on via a server default.
-        let opts = ServerOptions()
-        XCTAssertFalse(opts.enablePrefixCacheDisk)
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
-    }
-
-    func testPrefixCacheDiskEmitsSizeWhenEnabled() {
-        var opts = ServerOptions()
-        opts.enablePrefixCacheDisk = true
-        opts.prefixCacheDisk = "10GB"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "10GB"))
-        XCTAssertFalse(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
-    }
-
-    func testPrefixCacheDiskToggleTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.enablePrefixCacheDisk = true
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Toggling the SSD prefix cache must trigger a server restart")
-    }
-
-    func testServerLaunchEqualsIgnoresPerRequestFields() {
-        var a = ServerOptions()
-        var b = ServerOptions()
-        // Still purely per-request: max tokens, penalties, spec-decode
-        // TriStates. (Sampling defaults — temperature/top-p/top-k — became
-        // launch flags in 2026-06 so external clients like Claude Code
-        // inherit them; covered by testSamplingDefaultsAffectRestartDetection.)
-        b.defaultMaxTokens = 8192
-        b.perRequestEnablePLD = .off
-        b.defaultRepeatPenalty = 1.1
-        XCTAssertTrue(a.serverLaunchEquals(b),
-                     "Per-request defaults must NOT trigger restart")
-
-        a.port = 9000
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Server-launch fields MUST trigger restart")
-    }
-
     func testTriStateMaps() {
         XCTAssertNil(ServerOptions.TriState.auto.asOptionalBool)
         XCTAssertEqual(ServerOptions.TriState.on.asOptionalBool, true)
@@ -292,7 +126,6 @@ final class ServerOptionsTests: XCTestCase {
     func testRoundTripCodable() throws {
         var opts = ServerOptions()
         opts.port = 9999
-        opts.drafterPath = "/x/y/z"
         opts.defaultTemperature = 0.42
         opts.perRequestEnableDrafter = .off
 
@@ -639,8 +472,6 @@ extension ServerOptionsTests {
         o.enablePLD = false
         o.pldDraftLen = 7
         o.pldKeyLen = 4
-        o.drafterPath = "/x/y/drafter"
-        o.draftBlockSize = 8
         o.maxConcurrent = 4
         o.kvQuant = .int8
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it

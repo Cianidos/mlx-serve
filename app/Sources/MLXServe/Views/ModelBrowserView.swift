@@ -816,6 +816,24 @@ private struct MyModelsPane: View {
                 Text(L10n.format(total == 1 ? "%lld model on disk" : "%lld models on disk", Int64(total)))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
+                if let (done, count) = downloads.updateSweep {
+                    ProgressView().controlSize(.mini)
+                    Text(L10n.format("Checking %lld/%lld\u{2026}", Int64(done), Int64(count)))
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Check for Updates") {
+                        Task { await downloads.checkAllForUpdates(models: appState.localModels) }
+                    }
+                    .buttonStyle(.link)
+                    .font(.app(.caption))
+                    .help("Compare every model with its Hugging Face repo")
+                    if !downloads.updateChecks.isEmpty {
+                        Text(verbatim: PackUpdateCheck.summary(downloads.updateChecks.values.map(\.result)))
+                            .font(.app(.caption))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
                 if !freeDiskSpace.isEmpty {
                     Text(L10n.format("%@ available", freeDiskSpace))
@@ -1837,6 +1855,8 @@ private struct LocalModelRow: View {
     @State private var card: ModelCardRequest?
     @State private var settings: ModelSettingsRequest?
     @State private var hasOverrides = false
+    @State private var badge = SocketBadge(stone: nil, skull: false)
+    @State private var confirmReplace: UpdateCheck?
 
     private var settingsRequest: ModelSettingsRequest {
         ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
@@ -1861,11 +1881,33 @@ private struct LocalModelRow: View {
     /// `activateFileViewerSelecting` selects either — which is the behaviour
     /// you want: a quant row reveals its own file, not its repo folder.
     private func refreshOverrides() {
-        hasOverrides = ModelSettingsFile.load().override(for: model.path)?.hasSettings ?? false
+        let o = ModelSettingsFile.load().override(for: model.path)
+        hasOverrides = o?.hasSettings ?? false
+        guard model.isChatPickable, model.quantFile == nil else { return }
+        badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
+                                  isMoE: model.numExperts != nil, options: appState.serverOptions)
     }
 
     private func revealInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
+    }
+
+    /// The manual check's verdict, else the daily check's pending update.
+    private var updateCheck: UpdateCheck? {
+        if let check = downloads.updateChecks[model.id] { return check }
+        guard let update = downloads.packUpdates[model.name] else { return nil }
+        let drafter = downloads.packListings[model.name]?.keys.contains { $0.hasPrefix(DrafterGems.packFolder + "/") } ?? false
+        let off = ModelSettingsFile.load().override(for: model.path)?.drafter == "off"
+        return UpdateCheck(result: .update(update), repo: model.name, dir: model.path, selection: .chat(drafter: drafter && !off))
+    }
+
+    private func applyUpdate(_ check: UpdateCheck) {
+        downloads.startUpdate(check) {
+            appState.refreshModels()
+            guard downloads.downloads[check.repo]?.status == .completed else { return }
+            downloads.updateChecks[model.id] = nil
+            downloads.packUpdates[model.name] = nil
+        }
     }
 
     private func performDelete() {
@@ -1907,6 +1949,12 @@ private struct LocalModelRow: View {
                             .background(Color.purple.opacity(0.15), in: Capsule())
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
+                    if let stone = badge.stone {
+                        GemIcon(name: "gem-\(stone.rawValue).png").help(stone.label)
+                    }
+                    if badge.skull {
+                        GemIcon(name: "gem-skull.png").help("Lossy MTP acceptance (Typical / TokenV3)")
+                    }
                 }
                 // The id itself, under the readable name.
                 Text(L10n.text(model.displayLabel))
@@ -1942,6 +1990,14 @@ private struct LocalModelRow: View {
                     // Only flag genuinely unsupported architectures. Drafters
                     // declare `gemma4_assistant` (not in supportedModelTypes)
                     // intentionally — the badge above already explains them.
+                    if case .localCopy = downloads.updateChecks[model.id]?.result {
+                        Text("Local copy")
+                            .font(.app(.caption2).weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                            .help("Not on Hugging Face under this name, so there is nothing to update from.")
+                    }
                     if model.kind != .drafter, !model.isSupportedArchitecture {
                         Text("Unsupported")
                             .font(.app(.caption2).weight(.medium))
@@ -1986,6 +2042,18 @@ private struct LocalModelRow: View {
                     // opens the pane that owns the model instead, and lets the
                     // pane load it the way it always has.
                     UseMediaModelButton(modality: modality, name: model.name)
+                }
+                if let check = updateCheck, case .update(let update) = check.result {
+                    Button {
+                        if update.replaces > 0 { confirmReplace = check } else { applyUpdate(check) }
+                    } label: {
+                        Image(systemName: "arrow.down.circle")
+                            .foregroundStyle(.tint)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.app(.callout))
+                    .disabled(downloads.downloads[check.repo]?.status == .downloading)
+                    .help("Update from \(check.repo): \(update.files) file\(update.files == 1 ? "" : "s"), \(ByteCountFormatter.string(fromByteCount: update.bytes, countStyle: .file))")
                 }
                 if model.isChatPickable {
                     Button { settings = settingsRequest } label: {
@@ -2036,7 +2104,7 @@ private struct LocalModelRow: View {
                 .font(.app(.callout))
                 .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 150, alignment: .trailing)
+            .frame(width: 172, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -2050,8 +2118,17 @@ private struct LocalModelRow: View {
         } message: {
             Text(ModelRowActions.deleteMessage(model))
         }
+        .alert("Replace Files?", isPresented: Binding(get: { confirmReplace != nil }, set: { if !$0 { confirmReplace = nil } }), presenting: confirmReplace) { check in
+            Button("Cancel", role: .cancel) {}
+            Button("Replace", role: .destructive) { applyUpdate(check) }
+                .keyboardShortcut(.defaultAction)
+        } message: { check in
+            if case .update(let u) = check.result {
+                Text(L10n.format(u.replaces == 1 ? "%lld file differs from Hugging Face and will be replaced." : "%lld files differ from Hugging Face and will be replaced.", Int64(u.replaces)))
+            }
+        }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
-        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server).environmentObject(downloads) }
         .onAppear(perform: refreshOverrides)
         .contextMenu {
             if model.isChatPickable, useState == .idle {
@@ -2087,6 +2164,16 @@ private struct LocalModelRow: View {
 }
 
 // MARK: - Active Download Row
+
+private struct GemIcon: View {
+    let name: String
+
+    var body: some View {
+        if let image = BundledAsset.image(name) {
+            Image(nsImage: image).resizable().frame(width: 16, height: 16)
+        }
+    }
+}
 
 private struct ActiveDownloadRow: View {
     let repoId: String

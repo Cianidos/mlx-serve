@@ -1,4 +1,4 @@
-//! Row-exact 4-bit affine matvecs, ported from TensorFold's `rows.py` (MIT, see NOTICE).
+//! Row-exact 4/6/8-bit affine matvecs, ported from TensorFold's `rows.py` (MIT, see NOTICE).
 //! Every input row is its own simdgroup running one row's loop, so a row's bits never
 //! depend on how many rows share the call: serial decode and a verify window agree.
 const std = @import("std");
@@ -8,50 +8,76 @@ pub const MAX_ROWS = 16;
 /// Output rows a simdgroup.
 const RPS = 4;
 
-/// MLX's 4-bit `qmv_fast` loop (load_vector + qdot): a lane's 16 inputs are
-/// pre-divided by 1, 16, 256, 4096 so masked nibbles need no shift, and their
-/// sum adds each run of 4 in bf16 first, as MLX does on bfloat16_t. The tail
-/// of a K that is not a multiple of 512 runs one more 16-input chunk on the
-/// lanes below (K % 512) / 16. Reads nothing but its own row of x.
+/// MLX's `qmv_fast` loop (load_vector + qdot) at BITS 4, 6 or 8. A lane
+/// loads VPL inputs a block (16 at 4-bit, else 8), pre-divided so masked
+/// fields need no shift; the 4/6-bit sum adds each run of 4 in bf16 first, as
+/// MLX does on bfloat16_t, the 8-bit one adds each input in float. The tail of
+/// a K that is not a multiple of the 32 * VPL block runs one more chunk on the
+/// lanes below (K % block) / VPL. Reads nothing but its own row of x.
 pub const HEADER =
-    \\inline float rq_load16(const device bfloat* x, thread float* xt) {
+    \\template <int BITS>
+    \\inline float rq_load(const device bfloat* x, thread float* xt) {
     \\  float sum = 0.0f;
-    \\  for (int i = 0; i < 16; i += 4) {
-    \\    const bfloat a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
-    \\    sum += float(bfloat(float(bfloat(float(bfloat(float(a) + float(b))) + float(c))) + float(d)));
-    \\    xt[i] = float(a); xt[i + 1] = float(b) / 16.0f; xt[i + 2] = float(c) / 256.0f; xt[i + 3] = float(d) / 4096.0f;
+    \\  if (BITS == 8) {
+    \\    for (int i = 0; i < 8; i++) { sum += float(x[i]); xt[i] = float(x[i]); }
+    \\  } else {
+    \\    constexpr float d1 = BITS == 4 ? 16.0f : 64.0f, d2 = BITS == 4 ? 256.0f : 16.0f, d3 = BITS == 4 ? 4096.0f : 4.0f;
+    \\    for (int i = 0; i < (BITS == 4 ? 16 : 8); i += 4) {
+    \\      const bfloat a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
+    \\      sum += float(bfloat(float(bfloat(float(bfloat(float(a) + float(b))) + float(c))) + float(d)));
+    \\      xt[i] = float(a); xt[i + 1] = float(b) / d1; xt[i + 2] = float(c) / d2; xt[i + 3] = float(d) / d3;
+    \\    }
     \\  }
     \\  return sum;
     \\}
-    \\inline float rq_qdot16(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
-    \\  const device uint16_t* ws = (const device uint16_t*)w;
+    \\template <int BITS>
+    \\inline float rq_qdot(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
     \\  float accum = 0.0f;
-    \\  for (int i = 0; i < 4; i++)
-    \\    accum += (xt[4 * i] * (ws[i] & 0x000f) + xt[4 * i + 1] * (ws[i] & 0x00f0) +
-    \\              xt[4 * i + 2] * (ws[i] & 0x0f00) + xt[4 * i + 3] * (ws[i] & 0xf000));
+    \\  if (BITS == 4) {
+    \\    const device uint16_t* ws = (const device uint16_t*)w;
+    \\    for (int i = 0; i < 4; i++)
+    \\      accum += (xt[4 * i] * (ws[i] & 0x000f) + xt[4 * i + 1] * (ws[i] & 0x00f0) +
+    \\                xt[4 * i + 2] * (ws[i] & 0x0f00) + xt[4 * i + 3] * (ws[i] & 0xf000));
+    \\  } else if (BITS == 6) {
+    \\    for (int i = 0; i < 2; i++) {
+    \\      const device uint8_t* b = w + 3 * i;
+    \\      const thread float* v = xt + 4 * i;
+    \\      accum += (b[0] & 0x3f) * v[0];
+    \\      accum += (b[0] & 0xc0) * v[1];
+    \\      accum += (b[1] & 0x0f) * (v[1] * 256.0f);
+    \\      accum += (b[1] & 0xf0) * v[2];
+    \\      accum += (b[2] & 0x03) * (v[2] * 256.0f);
+    \\      accum += (b[2] & 0xfc) * v[3];
+    \\    }
+    \\  } else {
+    \\    for (int i = 0; i < 8; i++) accum += xt[i] * w[i];
+    \\  }
     \\  return scale * accum + sum * bias;
     \\}
-    \\template <int K, int GS, int RPS>
+    \\template <int K, int GS, int RPS, int BITS>
     \\inline void rq_rowdot(const device uint8_t* w, const device bfloat* sc, const device bfloat* bi,
     \\                      const device bfloat* x, uint lane, thread float* acc) {
-    \\  constexpr int KB = K / 2;
+    \\  constexpr int VPL = BITS == 4 ? 16 : 8;
+    \\  constexpr int BPL = VPL * BITS / 8;
+    \\  constexpr int BLOCK = 32 * VPL;
+    \\  constexpr int KB = K * BITS / 8;
     \\  constexpr int KG = K / GS;
-    \\  constexpr int FULL = K / 512 * 512;
-    \\  w += lane * 8;
-    \\  sc += lane / (GS / 16);
-    \\  bi += lane / (GS / 16);
-    \\  x += lane * 16;
+    \\  constexpr int FULL = K / BLOCK * BLOCK;
+    \\  w += lane * BPL;
+    \\  sc += lane / (GS / VPL);
+    \\  bi += lane / (GS / VPL);
+    \\  x += lane * VPL;
     \\  for (int j = 0; j < RPS; j++) acc[j] = 0.0f;
-    \\  for (int k0 = 0; k0 < FULL; k0 += 512) {
-    \\    float xt[16];
-    \\    const float sum = rq_load16(x, xt);
-    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot16(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
-    \\    w += 256; sc += 512 / GS; bi += 512 / GS; x += 512;
+    \\  for (int k0 = 0; k0 < FULL; k0 += BLOCK) {
+    \\    float xt[VPL];
+    \\    const float sum = rq_load<BITS>(x, xt);
+    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot<BITS>(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
+    \\    w += 32 * BPL; sc += BLOCK / GS; bi += BLOCK / GS; x += BLOCK;
     \\  }
-    \\  if (FULL < K && int(lane) < (K - FULL) / 16) {
-    \\    float xt[16];
-    \\    const float sum = rq_load16(x, xt);
-    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot16(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
+    \\  if (FULL < K && int(lane) < (K - FULL) / VPL) {
+    \\    float xt[VPL];
+    \\    const float sum = rq_load<BITS>(x, xt);
+    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot<BITS>(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
     \\  }
     \\  for (int j = 0; j < RPS; j++) acc[j] = simd_sum(acc[j]);
     \\}
@@ -64,7 +90,7 @@ const QMV_SOURCE =
     \\const int r = int(thread_position_in_threadgroup.x) / 32;
     \\const int row0 = int(thread_position_in_grid.y) * RPS;
     \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS>((const device uint8_t*)w + size_t(row0) * (K / 2), scales + size_t(row0) * (K / GS),
+    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + size_t(row0) * (K * BITS / 8), scales + size_t(row0) * (K / GS),
     \\                      biases + size_t(row0) * (K / GS), x + size_t(r) * K, lane, acc);
     \\if (lane == 0)
     \\  for (int j = 0; j < RPS; j++) {
@@ -78,7 +104,7 @@ const QMV_SOURCE =
 ;
 
 var qmv_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const CfgKey = struct { rows: c_int, n: c_int, k: c_int, gs: u32, relu2: bool };
+const CfgKey = struct { rows: c_int, n: c_int, k: c_int, bits: u32, gs: u32, relu2: bool };
 var cfg_cache: std.AutoHashMapUnmanaged(CfgKey, mlx.mlx_fast_metal_kernel_config) = .{};
 
 pub fn newKernel(name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -104,20 +130,29 @@ fn qmvConfig(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "N", key.n));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RPS", RPS));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "RELU2", key.relu2));
     try cfg_cache.put(std.heap.c_allocator, key, config);
     return config;
 }
 
-/// A 4-bit affine bf16 matrix [..., N, K/8] the kernels read: groups of 32, 64
-/// or 128, K a multiple of 64, N a multiple of 8.
+/// A 4, 6 or 8-bit affine bf16 matrix [..., N, K * bits / 32] the kernels
+/// read: groups of 32, 64 or 128, K a multiple of 64, N a multiple of 8.
 pub fn fits(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32) bool {
-    if (bits != 4 or bi.ctx == null) return false;
+    if ((bits != 4 and bits != 6 and bits != 8) or bi.ctx == null) return false;
     if (group_size != 32 and group_size != 64 and group_size != 128) return false;
     if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return false;
     const ws = mlx.getShape(w);
     if (ws.len < 2) return false;
-    return @rem(ws[ws.len - 1] * 8, 64) == 0 and @rem(ws[ws.len - 2], 8) == 0;
+    const packed_bits = ws[ws.len - 1] * 32;
+    const b: c_int = @intCast(bits);
+    return @rem(packed_bits, b) == 0 and @rem(@divTrunc(packed_bits, b), 64) == 0 and @rem(ws[ws.len - 2], 8) == 0;
+}
+
+/// Input width K of a matrix `fits` admits.
+fn inWidth(w: mlx.mlx_array, bits: u32) c_int {
+    const ws = mlx.getShape(w);
+    return @divTrunc(ws[ws.len - 1] * 32, @as(c_int, @intCast(bits)));
 }
 
 /// `x [..., K] @ w.T` for 1..MAX_ROWS rows, or null outside the kernel.
@@ -133,7 +168,7 @@ pub fn qmvAct(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx
     const xs = mlx.getShape(x);
     if (xs.len == 0 or xs.len > 8) return null;
     const k = xs[xs.len - 1];
-    if (k != ws[1] * 8) return null;
+    if (k != inWidth(w, bits)) return null;
     var rows: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| rows *= d;
     if (rows < 1 or rows > MAX_ROWS) return null;
@@ -145,7 +180,7 @@ pub fn qmvAct(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, qmv_kernel.?, in_vec, try qmvConfig(.{ .rows = rows, .n = n, .k = k, .gs = group_size, .relu2 = relu2 }), s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, qmv_kernel.?, in_vec, try qmvConfig(.{ .rows = rows, .n = n, .k = k, .bits = bits, .gs = group_size, .relu2 = relu2 }), s));
     var y = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
@@ -168,7 +203,7 @@ const EXPERT_UP_SOURCE =
     \\const int row0 = (int(threadgroup_position_in_grid.y) * SG + int(simdgroup_index_in_threadgroup)) * RPS;
     \\const size_t at = e * N + size_t(row0);
     \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS>((const device uint8_t*)w + at * (K / 2), scales + at * (K / GS), biases + at * (K / GS),
+    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + at * (K * BITS / 8), scales + at * (K / GS), biases + at * (K / GS),
     \\                      x + size_t(p / TOPK) * K, lane, acc);
     \\if (lane == 0)
     \\  for (int j = 0; j < RPS; j++) {
@@ -185,7 +220,7 @@ const EXPERT_DOWN_SOURCE =
     \\const int row0 = (int(threadgroup_position_in_grid.y) * SG + int(simdgroup_index_in_threadgroup)) * RPS;
     \\const size_t at = e * N + size_t(row0);
     \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS>((const device uint8_t*)w + at * (K / 2), scales + at * (K / GS), biases + at * (K / GS),
+    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + at * (K * BITS / 8), scales + at * (K / GS), biases + at * (K / GS),
     \\                      x + size_t(p) * K, lane, acc);
     \\if (lane == 0)
     \\  for (int j = 0; j < RPS; j++) y[size_t(p) * N + row0 + j] = bfloat(acc[j]);
@@ -194,7 +229,7 @@ const EXPERT_DOWN_SOURCE =
 const EXPERT_SG = 2;
 var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var down_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ExpertKey = struct { up: bool, pairs: c_int, topk: c_int, n: c_int, k: c_int, gs: u32 };
+const ExpertKey = struct { up: bool, pairs: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32 };
 var expert_cfgs: std.AutoHashMapUnmanaged(ExpertKey, mlx.mlx_fast_metal_kernel_config) = .{};
 
 fn expertConfig(key: ExpertKey) !mlx.mlx_fast_metal_kernel_config {
@@ -210,12 +245,13 @@ fn expertConfig(key: ExpertKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RPS", RPS));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SG", EXPERT_SG));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
     if (key.up) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", key.topk));
     try expert_cfgs.put(std.heap.c_allocator, key, config);
     return config;
 }
 
-fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, pairs: c_int, topk: c_int, gs: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, pairs: c_int, topk: c_int, q: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
     const kslot = if (up) &up_kernel else &down_kernel;
     if (kslot.* == null) kslot.* = try newKernel(if (up) "msv_rowqmv_expert_up" else "msv_rowqmv_expert_down", &.{ "x", "ids", "w", "scales", "biases" }, &.{"y"}, if (up) EXPERT_UP_SOURCE else EXPERT_DOWN_SOURCE);
     const ws = mlx.getShape(w);
@@ -224,7 +260,7 @@ fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    const key = ExpertKey{ .up = up, .pairs = pairs, .topk = topk, .n = ws[1], .k = ws[2] * 8, .gs = gs };
+    const key = ExpertKey{ .up = up, .pairs = pairs, .topk = topk, .n = ws[1], .k = inWidth(w, q[0]), .bits = q[0], .gs = q[1] };
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kslot.*.?, in_vec, try expertConfig(key), s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
@@ -234,8 +270,9 @@ fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array
 /// mlx-lm's SwitchMLP (fc1, relu2, fc2) on x [R, D] bf16 for the uint32
 /// expert ids [R * TOPK] (row-major): [R * TOPK, D] bf16, or null outside the
 /// kernel. Each (row, slot) pair is computed on its own, the same way at any R.
-pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.mlx_array, fc2: [3]mlx.mlx_array, gs1: u32, gs2: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!fits(fc1[0], fc1[1], fc1[2], 4, gs1) or !fits(fc2[0], fc2[1], fc2[2], 4, gs2)) return null;
+/// `q1`/`q2` = (bits, group size) of fc1/fc2.
+pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.mlx_array, fc2: [3]mlx.mlx_array, q1: [2]u32, q2: [2]u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!fits(fc1[0], fc1[1], fc1[2], q1[0], q1[1]) or !fits(fc2[0], fc2[1], fc2[2], q2[0], q2[1])) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(ids) != .uint32) return null;
     const xs = mlx.getShape(x);
     const w1 = mlx.getShape(fc1[0]);
@@ -245,10 +282,10 @@ pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.ml
     const pairs = rows * topk;
     if (rows < 1 or rows > MAX_ROWS or mlx.mlx_array_size(ids) != @as(usize, @intCast(pairs))) return null;
     const block = RPS * EXPERT_SG;
-    if (xs[1] != w1[2] * 8 or w2[2] != @divTrunc(w1[1], 8) or @rem(w1[1], block) != 0 or @rem(w2[1], block) != 0) return null;
-    const act = try expertLaunch(true, x, ids, fc1[0], fc1[1], fc1[2], pairs, topk, gs1, s);
+    if (xs[1] != inWidth(fc1[0], q1[0]) or inWidth(fc2[0], q2[0]) != w1[1] or @rem(w1[1], block) != 0 or @rem(w2[1], block) != 0) return null;
+    const act = try expertLaunch(true, x, ids, fc1[0], fc1[1], fc1[2], pairs, topk, q1, s);
     defer _ = mlx.mlx_array_free(act);
-    return try expertLaunch(false, act, ids, fc2[0], fc2[1], fc2[2], pairs, topk, gs2, s);
+    return try expertLaunch(false, act, ids, fc2[0], fc2[1], fc2[2], pairs, topk, q2, s);
 }
 
 /// Dense bf16 router logits for R rows, w [E, D]: one threadgroup of SG
@@ -356,10 +393,10 @@ const Quant = struct {
     }
 };
 
-fn quantize(wf: mlx.mlx_array, gs: c_int, s: mlx.mlx_stream) !Quant {
+fn quantize(wf: mlx.mlx_array, gs: c_int, bits: c_int, s: mlx.mlx_stream) !Quant {
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
     var q = Quant{ .w = mlx.mlx_array_new(), .sc = mlx.mlx_array_new(), .bi = mlx.mlx_array_new() };
     try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
     try mlx.check(mlx.mlx_vector_array_get(&q.sc, triple, 1));
@@ -384,10 +421,10 @@ fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
 }
 
 /// Max |got - truth| relative to max |truth|, truth = f32 x @ dequant(w).T.
-fn relErr(got: mlx.mlx_array, x: mlx.mlx_array, q: Quant, gs: c_int, s: mlx.mlx_stream) !f32 {
+fn relErr(got: mlx.mlx_array, x: mlx.mlx_array, q: Quant, gs: c_int, bits: c_int, s: mlx.mlx_stream) !f32 {
     var wt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_dequantize(&wt, q.w, q.sc, q.bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wt, q.w, q.sc, q.bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
     var wtt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wtt);
     try mlx.check(mlx.mlx_transpose(&wtt, wt, s));
@@ -429,22 +466,22 @@ test "rowqmv.qmv: every row of an R-row call equals its one-row call bit for bit
     const rnd = prng.random();
     // Nemotron-H's shapes: K = 2688 (not a multiple of 512), 4096, 1856, 3712.
     const Shape = struct { n: c_int, k: c_int, gs: c_int };
-    for ([_]Shape{ .{ .n = 1024, .k = 2688, .gs = 64 }, .{ .n = 512, .k = 4096, .gs = 64 }, .{ .n = 2688, .k = 1856, .gs = 64 }, .{ .n = 256, .k = 3712, .gs = 32 }, .{ .n = 264, .k = 640, .gs = 128 } }) |sh| {
+    for ([_]u32{ 4, 6, 8 }) |bits| for ([_]Shape{ .{ .n = 1024, .k = 2688, .gs = 64 }, .{ .n = 512, .k = 4096, .gs = 64 }, .{ .n = 2688, .k = 1856, .gs = 64 }, .{ .n = 256, .k = 3712, .gs = 32 }, .{ .n = 264, .k = 640, .gs = 128 } }) |sh| {
         const wf = try randBf16(a, &.{ sh.n, sh.k }, 0.02, rnd, s);
         defer _ = mlx.mlx_array_free(wf);
-        const q = try quantize(wf, sh.gs, s);
+        const q = try quantize(wf, sh.gs, @intCast(bits), s);
         defer q.deinit();
         const x = try randBf16(a, &.{ MAX_ROWS, sh.k }, 1.0, rnd, s);
         defer _ = mlx.mlx_array_free(x);
 
-        const all = (try qmv(x, q.w, q.sc, q.bi, 4, @intCast(sh.gs), s)) orelse return error.Declined;
+        const all = (try qmv(x, q.w, q.sc, q.bi, bits, @intCast(sh.gs), s)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(all);
-        try testing.expect(try relErr(all, x, q, sh.gs, s) < 2e-2);
+        try testing.expect(try relErr(all, x, q, sh.gs, @intCast(bits), s) < 2e-2);
         var r: c_int = 0;
         while (r < MAX_ROWS) : (r += 1) {
             const one_x = try sliceRows(x, r, r + 1, s);
             defer _ = mlx.mlx_array_free(one_x);
-            const one = (try qmv(one_x, q.w, q.sc, q.bi, 4, @intCast(sh.gs), s)).?;
+            const one = (try qmv(one_x, q.w, q.sc, q.bi, bits, @intCast(sh.gs), s)).?;
             defer _ = mlx.mlx_array_free(one);
             const row = try sliceRows(all, r, r + 1, s);
             defer _ = mlx.mlx_array_free(row);
@@ -453,12 +490,35 @@ test "rowqmv.qmv: every row of an R-row call equals its one-row call bit for bit
         // A 3-row window starting mid-batch gives the same rows too.
         const win_x = try sliceRows(x, 5, 8, s);
         defer _ = mlx.mlx_array_free(win_x);
-        const win = (try qmv(win_x, q.w, q.sc, q.bi, 4, @intCast(sh.gs), s)).?;
+        const win = (try qmv(win_x, q.w, q.sc, q.bi, bits, @intCast(sh.gs), s)).?;
         defer _ = mlx.mlx_array_free(win);
         const want = try sliceRows(all, 5, 8, s);
         defer _ = mlx.mlx_array_free(want);
         try expectBitEqual(win, want, s);
-    }
+    };
+}
+
+test "rowqmv.qmv: a one-row call is bit-equal to stock quantized_matmul at 4, 6 and 8 bits" {
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x27b);
+    const rnd = prng.random();
+    // Qwen3.8-27B's widths: K = 5120 (hidden) and 17408 (MLP).
+    const Shape = struct { n: c_int, k: c_int, gs: c_int };
+    for ([_]u32{ 4, 6, 8 }) |bits| for ([_]Shape{ .{ .n = 512, .k = 5120, .gs = 64 }, .{ .n = 256, .k = 17408, .gs = 64 }, .{ .n = 264, .k = 5120, .gs = 32 }, .{ .n = 136, .k = 5120, .gs = 128 } }) |sh| {
+        const wf = try randBf16(a, &.{ sh.n, sh.k }, 0.02, rnd, s);
+        defer _ = mlx.mlx_array_free(wf);
+        const q = try quantize(wf, sh.gs, @intCast(bits), s);
+        defer q.deinit();
+        const x = try randBf16(a, &.{ 1, sh.k }, 1.0, rnd, s);
+        defer _ = mlx.mlx_array_free(x);
+        const got = (try qmv(x, q.w, q.sc, q.bi, bits, @intCast(sh.gs), s)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_quantized_matmul(&want, x, q.w, q.sc, q.bi, true, mlx.mlx_optional_int.some(sh.gs), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
+        try expectBitEqual(got, want, s);
+    };
 }
 
 test "rowqmv.qmvAct: relu2 is max(bf16(y), 0)^2 rounded to bf16, rows width-invariant" {
@@ -467,7 +527,7 @@ test "rowqmv.qmvAct: relu2 is max(bf16(y), 0)^2 rounded to bf16, rows width-inva
     var prng = std.Random.DefaultPrng.init(11);
     const wf = try randBf16(a, &.{ 3712, 2688 }, 0.02, prng.random(), s);
     defer _ = mlx.mlx_array_free(wf);
-    const q = try quantize(wf, 64, s);
+    const q = try quantize(wf, 64, 4, s);
     defer q.deinit();
     const x = try randBf16(a, &.{ 5, 2688 }, 1.0, prng.random(), s);
     defer _ = mlx.mlx_array_free(x);
@@ -502,13 +562,14 @@ test "rowqmv.qmv: declines what it cannot read" {
     var prng = std.Random.DefaultPrng.init(3);
     const wf = try randBf16(a, &.{ 64, 512 }, 0.02, prng.random(), s);
     defer _ = mlx.mlx_array_free(wf);
-    const q = try quantize(wf, 64, s);
+    const q = try quantize(wf, 64, 4, s);
     defer q.deinit();
     const x = try randBf16(a, &.{ MAX_ROWS + 1, 512 }, 1.0, prng.random(), s);
     defer _ = mlx.mlx_array_free(x);
     try testing.expect((try qmv(x, q.w, q.sc, q.bi, 4, 64, s)) == null);
     const x1 = try sliceRows(x, 0, 1, s);
     defer _ = mlx.mlx_array_free(x1);
+    try testing.expect((try qmv(x1, q.w, q.sc, q.bi, 3, 64, s)) == null);
     try testing.expect((try qmv(x1, q.w, q.sc, q.bi, 8, 64, s)) == null);
 }
 
@@ -534,9 +595,9 @@ fn takeExpert(bank: mlx.mlx_array, e: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
-fn dequantF32(q: [3]mlx.mlx_array, gs: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+fn dequantF32(q: [3]mlx.mlx_array, gs: c_int, bits: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var w = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_dequantize(&w, q[0], q[1], q[2], mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&w, q[0], q[1], q[2], mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
     return w;
 }
 
@@ -550,13 +611,14 @@ test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 Swi
     const D: c_int = 2688;
     const I: c_int = 1856;
     const TOPK: c_int = 6;
+    for ([_]u32{ 4, 6, 8 }) |bits| {
     const f1 = try randBf16(a, &.{ E, I, D }, 0.03, rnd, s);
     defer _ = mlx.mlx_array_free(f1);
     const f2 = try randBf16(a, &.{ E, D, I }, 0.03, rnd, s);
     defer _ = mlx.mlx_array_free(f2);
-    const q1 = try quantize(f1, 64, s);
+    const q1 = try quantize(f1, 64, @intCast(bits), s);
     defer q1.deinit();
-    const q2 = try quantize(f2, 64, s);
+    const q2 = try quantize(f2, 64, @intCast(bits), s);
     defer q2.deinit();
     const fc1 = [3]mlx.mlx_array{ q1.w, q1.sc, q1.bi };
     const fc2 = [3]mlx.mlx_array{ q2.w, q2.sc, q2.bi };
@@ -567,7 +629,7 @@ test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 Swi
     const ids = mlx.mlx_array_new_data(&idv, &[_]c_int{MAX_ROWS * TOPK}, 1, .uint32);
     defer _ = mlx.mlx_array_free(ids);
 
-    const all = (try experts(x, ids, TOPK, fc1, fc2, 64, 64, s)) orelse return error.Declined;
+    const all = (try experts(x, ids, TOPK, fc1, fc2, .{ bits, 64 }, .{ bits, 64 }, s)) orelse return error.Declined;
     defer _ = mlx.mlx_array_free(all);
     try testing.expectEqualSlices(c_int, &.{ MAX_ROWS * TOPK, D }, mlx.getShape(all));
 
@@ -578,7 +640,7 @@ test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 Swi
         var idw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(idw);
         try mlx.check(mlx.mlx_slice(&idw, ids, &[_]c_int{win[0] * TOPK}, 1, &[_]c_int{win[1] * TOPK}, 1, &[_]c_int{1}, 1, s));
-        const got = (try experts(xw, idw, TOPK, fc1, fc2, 64, 64, s)).?;
+        const got = (try experts(xw, idw, TOPK, fc1, fc2, .{ bits, 64 }, .{ bits, 64 }, s)).?;
         defer _ = mlx.mlx_array_free(got);
         const want = try sliceRows(all, win[0] * TOPK, win[1] * TOPK, s);
         defer _ = mlx.mlx_array_free(want);
@@ -599,9 +661,9 @@ test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 Swi
         defer for (w1s ++ w2s) |t| {
             _ = mlx.mlx_array_free(t);
         };
-        const d1 = try dequantF32(w1s, 64, s);
+        const d1 = try dequantF32(w1s, 64, @intCast(bits), s);
         defer _ = mlx.mlx_array_free(d1);
-        const d2 = try dequantF32(w2s, 64, s);
+        const d2 = try dequantF32(w2s, 64, @intCast(bits), s);
         defer _ = mlx.mlx_array_free(d2);
         const xr = try sliceRows(x, r, r + 1, s);
         defer _ = mlx.mlx_array_free(xr);
@@ -639,6 +701,7 @@ test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 Swi
         worst = @max(worst, @sqrt(try sumSq(d, s) / try sumSq(truth, s)));
     }
     try testing.expect(worst < 2e-2);
+    }
 }
 
 test "rowqmv.router: rows are width-invariant bit for bit and match f32 truth" {

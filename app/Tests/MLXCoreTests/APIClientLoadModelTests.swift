@@ -211,18 +211,6 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual(json["bytes_on_disk"] as? UInt64, 2_147_483_648)
     }
 
-    func testLoadModelRequestBodyShape() throws {
-        // Sanity check the request body we POST to /v1/load-model. Server
-        // expects {"model": "<id>", "drafter_path": "..."} optionally.
-        let id = "gemma-4-e4b-it-4bit"
-        let drafterPath = "/Users/me/.mlx-serve/drafters/gemma-4-e4b"
-        let body: [String: Any] = ["model": id, "drafter_path": drafterPath]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertEqual(parsed?["model"] as? String, id)
-        XCTAssertEqual(parsed?["drafter_path"] as? String, drafterPath)
-    }
-
     /// A model SWITCH must re-point the server's default (`"default": true`) —
     /// otherwise requests that omit `model` (the "mlx-serve" alias: Claude Code
     /// launcher env, curl users) keep hitting the OLD model, and /v1/models
@@ -232,23 +220,11 @@ final class APIClientLoadModelTests: XCTestCase {
     /// every aliased chat request to a model that 400s them.
     func testLoadModelBodyCarriesDefaultOnlyWhenSwitching() {
         let path = "/Users/me/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
-        let switchBody = APIClient.loadModelBody(id: path, drafterPath: nil, setDefault: true)
+        let switchBody = APIClient.loadModelBody(id: path, setDefault: true)
         XCTAssertEqual(switchBody["model"] as? String, path)
         XCTAssertEqual(switchBody["default"] as? Bool, true)
-        XCTAssertNil(switchBody["drafter_path"])
 
-        let sideLoad = APIClient.loadModelBody(id: path, drafterPath: "/d/gemma-drafter", setDefault: false)
+        let sideLoad = APIClient.loadModelBody(id: path, setDefault: false)
         XCTAssertNil(sideLoad["default"])
-        XCTAssertEqual(sideLoad["drafter_path"] as? String, "/d/gemma-drafter")
-    }
-
-    func testLoadModelRequestOmitsDrafterWhenNil() throws {
-        // When drafterPath is nil, we don't emit the field so older servers
-        // don't choke parsing an unknown key.
-        let body: [String: Any] = ["model": "abc"]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertNil(parsed?["drafter_path"])
-        XCTAssertEqual(parsed?["model"] as? String, "abc")
     }
 }

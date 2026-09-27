@@ -91,14 +91,6 @@ struct ServerOptions: Codable, Equatable {
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
     var pldKeyLen: Int = 3
-    var drafterPath: String = ""        // empty = no drafter
-    /// The user turned the drafter OFF. Not a launch flag — it's the bit that
-    /// `drafterPath` can't carry: an empty path means both "nothing paired yet"
-    /// and "switched off", and the app auto-pairs a dense Gemma 4 with the
-    /// drafter that came down with it (`DrafterPairing.decide`), so without
-    /// this the off would undo itself at the next model switch.
-    var drafterOptOut: Bool = false
-    var draftBlockSize: Int = 4
 
     /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
     /// trained `mtp/` sidecar head). Default ON, mirroring the server — the head
@@ -516,8 +508,6 @@ struct ServerOptions: Codable, Equatable {
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
-        drafterPath == other.drafterPath &&
-        draftBlockSize == other.draftBlockSize &&
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
         mtpOnMoE == other.mtpOnMoE &&
@@ -671,10 +661,6 @@ struct ServerOptions: Codable, Equatable {
         args += [enablePLD ? "--pld" : "--no-pld"]
         args += ["--pld-draft-len", "\(pldDraftLen)"]
         args += ["--pld-key-len", "\(pldKeyLen)"]
-        if !drafterPath.isEmpty {
-            args += ["--drafter", drafterPath,
-                     "--draft-block-size", "\(draftBlockSize)"]
-        }
         // MTP: the server auto-loads a checkpoint's `mtp/` head and defaults
         // depth to auto; `--mtp` is the one deliberate divergence (MoE ON).
         if !enableMTP {
@@ -838,6 +824,15 @@ struct ServerOptions: Codable, Equatable {
         guard let data = try? JSONEncoder().encode(self) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)
     }
+
+    /// The retired global drafter (`drafterPath` / `drafterOptOut`) as the stored
+    /// blob still has it, for `DrafterMigration`. nil once a save has dropped it.
+    static func legacyDrafter(_ defaults: UserDefaults = .standard) -> (path: String, optedOut: Bool)? {
+        guard let data = defaults.data(forKey: storageKey),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              raw["drafterPath"] != nil || raw["drafterOptOut"] != nil else { return nil }
+        return (raw["drafterPath"] as? String ?? "", raw["drafterOptOut"] as? Bool ?? false)
+    }
 }
 
 // MARK: - Migration-safe decoding
@@ -881,9 +876,6 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
-        if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .drafterOptOut) { drafterOptOut = v }
-        if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
         if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
@@ -1128,14 +1120,6 @@ extension ServerOptions {
         "pldKeyLen": .init(
             title: "PLD key length",
             explainer: "N-gram match key length for PLD lookup (default 3). Shorter keys = more matches, lower precision.",
-            needsRestart: true),
-        "drafterPath": .init(
-            title: "Drafter checkpoint",
-            explainer: "Path to a Gemma 4 assistant drafter directory (gemma-4-*-it-assistant-bf16). Must pair with a Gemma 4 target. Empty = no drafter.",
-            needsRestart: true),
-        "draftBlockSize": .init(
-            title: "Drafter block size",
-            explainer: "Tokens per drafter round (default 4 = 3 drafter steps + 1 verify token).",
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",
