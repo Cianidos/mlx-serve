@@ -825,6 +825,34 @@ macOS has no dynamic type. `NSFont.preferredFont(forTextStyle: .body)` hands eve
 
 That is what a PR got wrong, and it failed quietly. It made the app-wide Text Size a percentage and scaled it through `dynamicTypeSize`, so typing 150 % moved the chat transcript and nothing else: the transcript is AppKit, and it multiplied the number itself (`ChatMetrics.transcriptFontSize`), while every SwiftUI pane sat at 100 %. The tests stayed green because they only asserted which `DynamicTypeSize` a percentage mapped to — never that anything rendered larger — and a second defect hid behind the first, the modifier read the value straight off `UserDefaults` without observing it, so even a re-render needed a relaunch.
 
-The fix is a ladder rather than a percentage: `AppType` holds macOS's own styles snapped to whole even points with a floor of 10 (26 / 22 / 18 / 16 / 14 / 12 / 10), `Font.app(_:)` is the only way a SwiftUI view states a size and `AppType.system` / `.monospaced` the only way an AppKit one does, and the chat transcript keeps its own four-step picker because snapping its ladder would collapse the prose/code gap its own comment documents. Two steps land on one size, which is the price of even-only: `body`/`headline` are both 14, `subheadline` joins `callout` at 12.
+The fix is a ladder rather than a percentage: `AppType` holds macOS's own styles snapped to whole even points with a floor of 12 (26 / 22 / 18 / 16 / 14 / 12), `Font.app(_:)` is the only way a SwiftUI view states a size and `AppType.system` / `.monospaced` the only way an AppKit one does, and the chat transcript keeps its own four-step picker because snapping its ladder would collapse the prose/code gap its own comment documents. Two steps land on one size, which is the price of even-only: `body`/`headline` are both 14, `subheadline` joins `callout` at 12.
 
-The lesson that generalises: a name that looks like it implies a behaviour is not a behaviour. Guards: `SystemTypeTests` fails the build on a stated point size, a bare `.font(.body)`, a step that is odd or under 10, a name the table does not define, and a step that has drifted from the system size it names; the console is the same rule in `rem`, pinned by `tests/html_console_test.mjs`.
+The lesson that generalises: a name that looks like it implies a behaviour is not a behaviour. Guards: `SystemTypeTests` fails the build on a stated point size, a bare `.font(.body)`, a step that is odd or under 12, a name the table does not define, and a step that has drifted from the system size it names; the console is the same rule in `rem`, pinned by `tests/html_console_test.mjs`.
+## A control's title is not your text (2026-09-27)
+The type ladder passed every test and 183 `Button("…")` titles were still at
+whatever AppKit drew. `.font()` does not reach a button's title on macOS: the
+same button measured 317px wide with a 12pt font and 317px with a 24pt one, and
+the same held for `.bordered`, `.destructive` and `.controlSize(.small)`. A
+`Picker` splits — `.radioGroup` and `.inline` draw their own text and take a
+font, `.automatic`, `.menu` and `.segmented` are NSPopUpButton and
+NSSegmentedControl and do not — which is worse than a uniform rule, because the
+style decides.
+
+Passing the title as the label is what works, in every style:
+
+    Button { … } label: { Text("Cancel").font(.app(.value)) }   // 298px → 515px
+
+Two Swift shapes bite on the rewrite. A trailing closure sits OUTSIDE the
+parenthesised argument list, so a scanner that reads `Button(…)` alone sees no
+action and writes `label:` in front of it. And Swift will not mix a labelled
+`action:` argument with a trailing `label:` — `Button(action: f) label: { … }` is
+a syntax error, so that shape has to become `Button(action: f, label: { … })`.
+
+## A guard that scans too much passes for the wrong reason (2026-09-27)
+`ancestorSetsSize` looked for a font anywhere between a block's opening line and
+two lines past its close. That made an unrelated SIBLING's `.app(…)` vouch for a
+bare `Text` elsewhere in the same body — so 62 real offenders sat in `main` with
+the guard green. A font is inherited through the trailing-modifier idiom: the
+block's own last line, or the couple of lines after its closing brace. Scanning
+only there surfaced every one of them, and a probe injected into a view the old
+window waved through now fails.
