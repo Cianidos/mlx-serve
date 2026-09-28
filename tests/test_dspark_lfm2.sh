@@ -1,8 +1,8 @@
 #!/bin/bash
-# DSpark (LiquidAI LFM2.5) integration test — env-gated on a local target
-# whose `drafter/` subdir holds the DSpark sidecar:
+# DSpark integration test — env-gated on a local target with either an
+# in-dir `drafter/` or an explicit sidecar:
 #
-#   DSPARK_TEST_MODEL=~/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit \
+#   DSPARK_TEST_MODEL=<target> [DSPARK_TEST_DRAFTER=<sidecar>] \
 #       ./tests/test_dspark_lfm2.sh
 #
 # Pins the three things that made this port silently wrong before it was
@@ -17,9 +17,16 @@
 set -euo pipefail
 
 MODEL="${DSPARK_TEST_MODEL:-}"
+DRAFTER="${DSPARK_TEST_DRAFTER:-}"
 if [ -z "$MODEL" ]; then echo "SKIP: DSPARK_TEST_MODEL not set"; exit 0; fi
-if [ ! -f "$MODEL/drafter/config.json" ]; then
-    echo "SKIP: $MODEL/drafter/config.json not found"; exit 0
+if [ -n "$DRAFTER" ]; then
+    if [ ! -f "$DRAFTER/config.json" ]; then echo "SKIP: $DRAFTER/config.json not found"; exit 0; fi
+    DRAFTER_ARGS=(--drafter "$DRAFTER")
+else
+    if [ ! -f "$MODEL/drafter/config.json" ]; then
+        echo "SKIP: $MODEL/drafter/config.json not found and DSPARK_TEST_DRAFTER not set"; exit 0
+    fi
+    DRAFTER_ARGS=()
 fi
 
 PORT="${DSPARK_TEST_PORT:-11357}"
@@ -34,7 +41,7 @@ boot() { # $1 = log file, $2... = extra args (env via DSPARK_ENV)
     cleanup
     # shellcheck disable=SC2086
     env ${DSPARK_ENV:-} "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-        --ctx-size 8192 --prefix-cache-entries 0 --log-level debug "$@" > "$log" 2>&1 &
+        --ctx-size 8192 --prefix-cache-entries 0 --log-level debug "${DRAFTER_ARGS[@]}" "$@" > "$log" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do curl -s -m 2 "$BASE/health" > /dev/null 2>&1 && return 0; sleep 1; done
     echo "FAIL: server did not come up"; cat "$log"; exit 1
