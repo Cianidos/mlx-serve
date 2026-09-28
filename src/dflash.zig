@@ -96,6 +96,15 @@ pub const DflashConfig = struct {
     /// v1/v2 sidecar so far is neox (half-split); DSpark's is not, and the
     /// wrong half rotates silently.
     rope_traditional: bool = false,
+    /// Speculators trains sliding draft layers against a fixed context window
+    /// ending at the anchor. Older sidecars use a moving query window.
+    sliding_window_fixed_anchor: bool = false,
+    /// Visibility inside a sliding layer's synthetic block. Full-attention
+    /// layers are always bidirectional.
+    sliding_window_non_causal: bool = true,
+    /// Output vocabulary of the sidecar. Zero means the legacy config omitted
+    /// it and the target vocabulary remains authoritative.
+    draft_vocab_size: u32 = 0,
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
@@ -135,6 +144,10 @@ const Contract = struct {
         }
         return self.root.get(key);
     }
+
+    fn targetLayers(self: Contract) ?std.json.Value {
+        return self.get("target_layer_ids") orelse self.root.get("aux_hidden_state_layer_ids");
+    }
 };
 
 fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
@@ -147,7 +160,7 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     const c = Contract{ .nested = nested, .root = root };
     if (c.get("block_size") == null) return null;
     if (c.get("mask_token_id") == null) return null;
-    if (c.get("target_layer_ids") == null) return null;
+    if (c.targetLayers() == null) return null;
     return c;
 }
 
@@ -209,16 +222,35 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
 
+    const speculators_shape = root.get("transformer_layer_config") != null and root.get("aux_hidden_state_layer_ids") != null;
+    if ((root.get("transformer_layer_config") != null) != (root.get("aux_hidden_state_layer_ids") != null))
+        return error.IncompleteDflashConfig;
+    const nested_geometry: ?std.json.ObjectMap = if (root.get("transformer_layer_config")) |tc|
+        (if (tc == .object) tc.object else return error.IncompleteDflashConfig)
+    else
+        null;
+    const Geometry = struct {
+        fn get(r: std.json.ObjectMap, nested: ?std.json.ObjectMap, key: []const u8) ?std.json.Value {
+            if (nested) |n| if (n.get(key)) |v| return v;
+            return r.get(key);
+        }
+    };
+
     // DSpark export markers. `markov_rank` is the load-bearing one (the head
     // IS DSpark); the architecture string and `projector_type` cover exports
-    // that ship the row convention without one.
+    // that ship the row convention without one. `sample_from_anchor` is the
+    // explicit Speculators contract and wins when present.
     var anchor_row_drafts = root.get("markov_rank") != null;
+    if (root.get("sample_from_anchor")) |v| {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        anchor_row_drafts = v.bool;
+    }
     if (contract.get("projector_type")) |pt| if (pt == .string and std.mem.eql(u8, pt.string, "dspark")) {
         anchor_row_drafts = true;
     };
     if (root.get("architectures")) |archs| if (archs == .array) {
         for (archs.array.items) |a| {
-            if (a == .string and std.mem.indexOf(u8, a.string, "DSpark") != null) anchor_row_drafts = true;
+            if (a == .string and std.mem.indexOf(u8, a.string, "DSpark") != null and root.get("sample_from_anchor") == null) anchor_row_drafts = true;
         }
     };
 
@@ -255,37 +287,41 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (output_multiplier == 0) return error.InvalidDflashConfigValue;
     }
 
-    const tl_val = contract.get("target_layer_ids").?;
+    const tl_val = contract.targetLayers().?;
     if (tl_val != .array or tl_val.array.items.len == 0) return error.InvalidDflashTargetLayers;
     const target_layer_ids = try allocator.alloc(u32, tl_val.array.items.len);
     errdefer allocator.free(target_layer_ids);
     for (tl_val.array.items, 0..) |elem, i| {
-        target_layer_ids[i] = try jsonU32(elem);
+        const declared = try jsonU32(elem);
+        // Speculators numbers the hidden-state stream: hidden_states[4] is the
+        // output of decoder layer 3. The runtime capture seam names the decoder
+        // layer whose output it retains.
+        if (speculators_shape and declared == 0) return error.InvalidDflashTargetLayers;
+        target_layer_ids[i] = if (speculators_shape) declared - 1 else declared;
         // The encoder concatenates in list order and the fc weight is trained
         // against it; a non-ascending list is a converter bug worth naming.
         if (i > 0 and target_layer_ids[i] <= target_layer_ids[i - 1]) return error.InvalidDflashTargetLayers;
     }
 
-    const hidden_size: u32 = try jsonU32(root.get("hidden_size") orelse return error.IncompleteDflashConfig);
+    const hidden_size: u32 = try jsonU32(Geometry.get(root, nested_geometry, "hidden_size") orelse return error.IncompleteDflashConfig);
     if (conv_group_size > 0 and hidden_size % conv_group_size != 0) return error.InvalidDflashConfigValue;
-    const num_layers: u32 = try jsonU32(root.get("num_hidden_layers") orelse return error.IncompleteDflashConfig);
-    const n_heads: u32 = try jsonU32(root.get("num_attention_heads") orelse return error.IncompleteDflashConfig);
-    const kv_heads: u32 = if (root.get("num_key_value_heads")) |v| try jsonU32(v) else n_heads;
-    const head_dim: u32 = try jsonU32(root.get("head_dim") orelse return error.IncompleteDflashConfig);
-    const intermediate: u32 = try jsonU32(root.get("intermediate_size") orelse return error.IncompleteDflashConfig);
-    const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
-    const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
+    const num_layers: u32 = try jsonU32(Geometry.get(root, nested_geometry, "num_hidden_layers") orelse return error.IncompleteDflashConfig);
+    const n_heads: u32 = try jsonU32(Geometry.get(root, nested_geometry, "num_attention_heads") orelse return error.IncompleteDflashConfig);
+    const kv_heads: u32 = if (Geometry.get(root, nested_geometry, "num_key_value_heads")) |v| try jsonU32(v) else n_heads;
+    const head_dim: u32 = try jsonU32(Geometry.get(root, nested_geometry, "head_dim") orelse return error.IncompleteDflashConfig);
+    const intermediate: u32 = try jsonU32(Geometry.get(root, nested_geometry, "intermediate_size") orelse return error.IncompleteDflashConfig);
+    const eps: f32 = jsonFloat(Geometry.get(root, nested_geometry, "rms_norm_eps") orelse return error.IncompleteDflashConfig);
+    const sliding: u32 = if (Geometry.get(root, nested_geometry, "sliding_window")) |v| try jsonU32(v) else 0;
 
     // `rope_parameters.rope_theta` is the transformers-5 spelling (muse,
-    // DFlash2); DSpark ships a flat root `rope_theta`. Reading only the
-    // nested one leaves theta at 10000 and every drafted position mis-rotated.
+    // DFlash2 and Speculators); older DSpark exports use a flat root value.
     var rope_theta: f32 = 10000.0;
-    if (root.get("rope_theta")) |t| rope_theta = jsonFloat(t);
-    if (root.get("rope_parameters")) |rp| if (rp == .object) {
+    if (Geometry.get(root, nested_geometry, "rope_theta")) |t| rope_theta = jsonFloat(t);
+    if (Geometry.get(root, nested_geometry, "rope_parameters")) |rp| if (rp == .object) {
         if (rp.object.get("rope_theta")) |t| rope_theta = jsonFloat(t);
     };
     var rope_traditional = false;
-    if (root.get("rope_is_neox_style")) |v| {
+    if (Geometry.get(root, nested_geometry, "rope_is_neox_style")) |v| {
         if (v == .bool) rope_traditional = !v.bool;
     }
 
@@ -299,7 +335,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (!std.mem.eql(u8, kind, "vanilla")) return error.UnsupportedMarkovHeadType;
     }
 
-    const lt_val = root.get("layer_types") orelse return error.IncompleteDflashConfig;
+    var sliding_window_non_causal = true;
+    if (root.get("sliding_window_non_causal")) |v| {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        sliding_window_non_causal = v.bool;
+    }
+    const draft_vocab_size: u32 = if (root.get("draft_vocab_size")) |v| try jsonU32(v) else 0;
+
+    const lt_val = Geometry.get(root, nested_geometry, "layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
     const layer_types = try allocator.alloc(LayerType, num_layers);
     errdefer allocator.free(layer_types);
@@ -332,6 +375,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .markov_rank = markov_rank,
         .rope_traditional = rope_traditional,
         .anchor_row_drafts = anchor_row_drafts,
+        .sliding_window_fixed_anchor = speculators_shape,
+        .sliding_window_non_causal = sliding_window_non_causal,
+        .draft_vocab_size = draft_vocab_size,
     };
 }
 
@@ -747,6 +793,12 @@ pub const DflashModel = struct {
         if (self.config.mask_token_id >= target.config.vocab_size) {
             log.err("[dflash] mask_token_id {d} outside target vocab {d}\n", .{
                 self.config.mask_token_id, target.config.vocab_size,
+            });
+            return error.DflashTargetMismatch;
+        }
+        if (self.config.draft_vocab_size != 0 and self.config.draft_vocab_size != target.config.vocab_size) {
+            log.err("[dflash] draft_vocab_size mismatch: assistant={d}, target={d}\n", .{
+                self.config.draft_vocab_size, target.config.vocab_size,
             });
             return error.DflashTargetMismatch;
         }
@@ -1323,13 +1375,9 @@ fn projectHeads(
 }
 
 /// Additive attention bias `[1, 1, q_len, kv_len]` for one assistant layer,
-/// or null when nothing is masked. KV layout: context at absolute positions
-/// `[base_pos, base_pos + ctx_len)` followed by the block at
-/// `[anchor_pos, anchor_pos + q_len)`. Sliding layers: query q sees key k iff
-/// `|q - k| < window` (block queries sit at/after every context position, so
-/// "bidirectional sliding" reduces to a back-window over context plus full
-/// visibility inside the block whenever `q_len <= window`). Full layers see
-/// everything → null.
+/// or null when nothing is masked. KV layout is context followed by the block.
+/// Legacy sidecars use a moving bidirectional window. Speculators uses a fixed
+/// context window ending at the anchor and optionally causal block visibility.
 fn buildBlockMask(
     layer_type: LayerType,
     base_pos: usize,
@@ -1337,15 +1385,16 @@ fn buildBlockMask(
     anchor_pos: usize,
     q_len: u32,
     window: u32,
+    fixed_anchor: bool,
+    non_causal: bool,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
     if (layer_type == .full_attention) return null;
     std.debug.assert(q_len <= window);
-    // No context row falls outside the LAST query's back-window → nothing masked.
     const max_dist = anchor_pos + q_len - 1 - base_pos;
-    if (max_dist < window) return null;
+    if (!fixed_anchor and non_causal and max_dist < window) return null;
+    if (fixed_anchor) std.debug.assert(anchor_pos >= base_pos + ctx_len);
 
-    // Absolute key positions: [ctx…, block…].
     const kv_len = ctx_len + q_len;
     var k_abs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_abs);
@@ -1370,18 +1419,47 @@ fn buildBlockMask(
     const q_shape = [_]c_int{ @intCast(q_len), 1 };
     try mlx.check(mlx.mlx_reshape(&q_col, q_abs, &q_shape, 2, s));
 
-    // diff = q - k; allowed iff |diff| < window.
-    var diff = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(diff);
-    try mlx.check(mlx.mlx_subtract(&diff, q_col, k_abs, s));
-    var abs_diff = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(abs_diff);
-    try mlx.check(mlx.mlx_abs(&abs_diff, diff, s));
-    const win_arr = mlx.mlx_array_new_float(@floatFromInt(window));
-    defer _ = mlx.mlx_array_free(win_arr);
     var allowed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(allowed);
-    try mlx.check(mlx.mlx_less(&allowed, abs_diff, win_arr, s));
+    if (!fixed_anchor) {
+        var diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(diff);
+        try mlx.check(mlx.mlx_subtract(&diff, q_col, k_abs, s));
+        var abs_diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(abs_diff);
+        try mlx.check(mlx.mlx_abs(&abs_diff, diff, s));
+        const win_arr = mlx.mlx_array_new_float(@floatFromInt(window));
+        defer _ = mlx.mlx_array_free(win_arr);
+        try mlx.check(mlx.mlx_less(&allowed, abs_diff, win_arr, s));
+    } else {
+        const anchor = mlx.mlx_array_new_float(@floatFromInt(anchor_pos));
+        defer _ = mlx.mlx_array_free(anchor);
+        const window_start = mlx.mlx_array_new_float(@floatFromInt(anchor_pos -| window));
+        defer _ = mlx.mlx_array_free(window_start);
+        var before_anchor = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(before_anchor);
+        try mlx.check(mlx.mlx_less(&before_anchor, k_abs, anchor, s));
+        var in_window = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(in_window);
+        try mlx.check(mlx.mlx_greater_equal(&in_window, k_abs, window_start, s));
+        var context_visible = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(context_visible);
+        try mlx.check(mlx.mlx_logical_and(&context_visible, before_anchor, in_window, s));
+        var block_key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(block_key);
+        try mlx.check(mlx.mlx_greater_equal(&block_key, k_abs, anchor, s));
+        if (non_causal) {
+            try mlx.check(mlx.mlx_logical_or(&allowed, context_visible, block_key, s));
+        } else {
+            var through_query = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(through_query);
+            try mlx.check(mlx.mlx_less_equal(&through_query, k_abs, q_col, s));
+            var block_visible = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(block_visible);
+            try mlx.check(mlx.mlx_logical_and(&block_visible, block_key, through_query, s));
+            try mlx.check(mlx.mlx_logical_or(&allowed, context_visible, block_visible, s));
+        }
+    }
 
     const zero = mlx.mlx_array_new_float(0.0);
     defer _ = mlx.mlx_array_free(zero);
@@ -2161,7 +2239,17 @@ pub fn forwardBlock(
         // Append block K/V into spare capacity; the view spans ctx + block.
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(
+            lw.layer_type,
+            ctx.base_pos,
+            ctx_len,
+            anchor_pos,
+            q_len,
+            cfg.sliding_window,
+            cfg.sliding_window_fixed_anchor,
+            cfg.sliding_window_non_causal,
+            s,
+        );
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -2313,6 +2401,66 @@ test "dflash: muse assistant config parses with the full DFlash contract" {
 
 // The real incoai/Qwen3.8-27B-DFlash2 config shape (fetched 2026-08-18):
 // the contract nests under `dflash_config`, model_type is a bare "qwen3".
+const REDHAT_QWEN38_DSPARK_CONFIG_JSON =
+    \\{
+    \\  "architectures": ["DSparkDraftModel"],
+    \\  "aux_hidden_state_layer_ids": [4, 12, 20, 28, 36, 44, 52, 60],
+    \\  "block_size": 8,
+    \\  "confidence_head_with_markov": true,
+    \\  "draft_vocab_size": 248320,
+    \\  "enable_confidence_head": true,
+    \\  "markov_head_type": "vanilla",
+    \\  "markov_rank": 256,
+    \\  "mask_token_id": 248077,
+    \\  "sample_from_anchor": true,
+    \\  "sliding_window_non_causal": false,
+    \\  "transformer_layer_config": {
+    \\    "head_dim": 256,
+    \\    "hidden_size": 5120,
+    \\    "intermediate_size": 17408,
+    \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+    \\    "max_position_embeddings": 262144,
+    \\    "model_type": "qwen3",
+    \\    "num_attention_heads": 20,
+    \\    "num_hidden_layers": 5,
+    \\    "num_key_value_heads": 4,
+    \\    "rms_norm_eps": 1e-06,
+    \\    "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+    \\    "sliding_window": 2048,
+    \\    "vocab_size": 248320
+    \\  }
+    \\}
+;
+
+// Speculators exports auxiliary hidden-state indices, where hidden state 4 is
+// the output of decoder layer 3. The runtime capture seam names decoder layers.
+test "dflash: Speculators DSpark config normalizes nested geometry and auxiliary layer ids" {
+    const allocator = testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON, .{});
+    defer parsed.deinit();
+    try testing.expect(isDflashConfigJson(parsed.value.object));
+
+    var cfg = try parseConfigFromJson(allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON);
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 9), cfg.block_size);
+    try testing.expect(cfg.anchor_row_drafts);
+    try testing.expectEqual(@as(u32, 248077), cfg.mask_token_id);
+    try testing.expectEqualSlices(u32, &[_]u32{ 3, 11, 19, 27, 35, 43, 51, 59 }, cfg.target_layer_ids);
+    try testing.expectEqual(@as(u32, 5120), cfg.hidden_size);
+    try testing.expectEqual(@as(u32, 5), cfg.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 20), cfg.num_attention_heads);
+    try testing.expectEqual(@as(u32, 4), cfg.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 256), cfg.head_dim);
+    try testing.expectEqual(@as(u32, 17408), cfg.intermediate_size);
+    try testing.expectEqual(@as(u32, 2048), cfg.sliding_window);
+    try testing.expectApproxEqAbs(@as(f32, 1e7), cfg.rope_theta, 1.0);
+    try testing.expectEqual(@as(u32, 256), cfg.markov_rank);
+    try testing.expect(cfg.sliding_window_fixed_anchor);
+    try testing.expect(!cfg.sliding_window_non_causal);
+    try testing.expectEqual(@as(u32, 248320), cfg.draft_vocab_size);
+}
+
 const DFLASH2_CONFIG_JSON =
     \\{
     \\  "architectures": ["DFlash2DraftModel"],
@@ -3001,13 +3149,13 @@ test "dflash: buildBlockMask sliding/full arms and window edges" {
     const s = mlx.gpuStream();
 
     // Full layer: never a mask.
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.full_attention, 0, 100, 100, 4, 8, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.full_attention, 0, 100, 100, 4, 8, false, true, s));
     // Sliding, everything inside the window: no mask needed.
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.sliding_attention, 0, 4, 4, 4, 8, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.sliding_attention, 0, 4, 4, 4, 8, false, true, s));
 
     // Sliding, ctx_len 10, anchor 10, block 4, window 8: rows are queries at
     // abs 10..13, cols are ctx abs 0..9 then block abs 10..13.
-    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, s)).?;
+    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, false, true, s)).?;
     defer _ = mlx.mlx_array_free(mask);
     const msh = mlx.getShape(mask);
     try testing.expectEqualSlices(c_int, &[_]c_int{ 1, 1, 4, 14 }, msh);
@@ -3028,6 +3176,35 @@ test "dflash: buildBlockMask sliding/full arms and window edges" {
     // Block ↔ block always visible (|q-k| ≤ 3 < 8).
     try testing.expectEqual(@as(f32, 0.0), at(vals, 0, 13));
     try testing.expectEqual(@as(f32, 0.0), at(vals, 3, 10));
+}
+
+test "dflash: Speculators sliding mask uses fixed anchor context and causal block" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // Context positions 0..9, anchor 10, block positions 10..13, window 8.
+    // Speculators keeps context [2,10) for every query and makes the block causal.
+    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, true, false, s)).?;
+    defer _ = mlx.mlx_array_free(mask);
+    const vals = try TinyFix.readF32(mask, allocator, s);
+    defer allocator.free(vals);
+    const at = struct {
+        fn f(v: []const f32, row: usize, col: usize) f32 {
+            return v[row * 14 + col];
+        }
+    }.f;
+
+    for (0..4) |row| {
+        try testing.expect(std.math.isNegativeInf(at(vals, row, 1)));
+        try testing.expectEqual(@as(f32, 0.0), at(vals, row, 2));
+        try testing.expectEqual(@as(f32, 0.0), at(vals, row, 9));
+    }
+    // Synthetic block: row r sees block columns 0..r, never future slots.
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 0, 10));
+    try testing.expect(std.math.isNegativeInf(at(vals, 0, 11)));
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 2, 12));
+    try testing.expect(std.math.isNegativeInf(at(vals, 2, 13)));
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 3, 13));
 }
 
 test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" {
