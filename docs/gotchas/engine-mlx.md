@@ -5277,6 +5277,13 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   handles (a copy would stay resident beside the joined buffer) and reports
   `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
 
+## A Markov sidecar added full-vocab bias to truncated base logits (2026-09-28)
+
+- Defect: Qwen3.8 DSpark loaded and engaged, then its first round failed adding logits shaped 98304 and 248320.
+- Cause: the target's draft-only vocab trim is valid for direct argmax, but a Markov head adds a learned full-vocab bias before argmax; both operands must cover the same token space.
+- Fix: Markov sidecars always project full-vocab base logits; ordinary DFlash keeps the trim.
+- Guard: `dflash: DSpark Markov correction keeps full-vocab base logits` plus the real-checkpoint `test_dspark_lfm2.sh` run.
+
 ## Drafted output differed from serial, and seeded output from itself on a cache hit (2026-09-27)
 
 - Defect: speculative rounds on Nemotron-H / Qwen3.5 produced text that differed from serial

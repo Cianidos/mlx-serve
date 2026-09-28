@@ -730,6 +730,11 @@ pub const DflashLayer = struct {
     }
 };
 
+fn draftVocabRows(config: *const model_mod.ModelConfig, has_markov: bool) c_int {
+    if (has_markov) return 0;
+    return config.draftVocab();
+}
+
 pub const DflashModel = struct {
     config: DflashConfig,
     allocator: std.mem.Allocator,
@@ -905,6 +910,7 @@ pub const DflashModel = struct {
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        const draft_vocab = draftVocabRows(&target.config, self.markov != null);
         var out: mlx.mlx_array = undefined;
         if (self.draft_head) |*dh| {
             out = mlx.mlx_array_new();
@@ -921,8 +927,8 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
-        } else if (target.config.draftVocab() > 0) {
-            out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (draft_vocab > 0) {
+            out = try target.lmHeadRowsForDraft(x, draft_vocab);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -2436,6 +2442,17 @@ test "dflash: Speculators DSpark config normalizes nested geometry and auxiliary
     try testing.expect(cfg.sliding_window_fixed_anchor);
     try testing.expect(!cfg.sliding_window_non_causal);
     try testing.expectEqual(@as(u32, 248320), cfg.draft_vocab_size);
+}
+
+test "dflash: DSpark Markov correction keeps full-vocab base logits" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.vocab_size = 248320;
+    cfg.row_exact_covered = true;
+    cfg.dflash_bound = true;
+
+    try testing.expectEqual(@as(c_int, 98304), draftVocabRows(&cfg, false));
+    try testing.expectEqual(@as(c_int, 0), draftVocabRows(&cfg, true));
 }
 
 const DFLASH2_CONFIG_JSON =
