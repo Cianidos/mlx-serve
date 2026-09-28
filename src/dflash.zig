@@ -453,19 +453,24 @@ pub fn blockCapForMachine(chip: []const u8, tree: bool) BlockCap {
     return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
 }
 
-/// Resolve the effective block size: the config's value, capped by what the
-/// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
-/// when there is no wide lane), then clamped DOWNWARD by an explicit
-/// `--draft-block-size` (never raised past the config — the assistant was
-/// trained at its config block). Floor 2 (1 draft + t1).
-pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32) u32 {
+/// Resolve the effective block size: the config's value, capped by the
+/// target forward's efficient verify width and, without a wide lane, the
+/// machine cap. Explicit `--draft-block-size` bypasses both performance caps
+/// but never raises past the trained block. Floor 2 (1 draft + t1).
+pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32, target_cap: u32) u32 {
     const base = if (cli_explicit)
         @min(config_block, cli_block)
     else if (wide_verify_lane)
-        config_block
+        @min(config_block, target_cap)
     else
-        @min(config_block, no_lane_cap);
+        @min(config_block, @min(no_lane_cap, target_cap));
     return @max(base, 2);
+}
+
+/// GDN verification fuses at most eight rows. Width nine falls back across all
+/// linear layers even on NAX, so its wider QMM lane cannot recover the round.
+pub fn targetBlockCap(config: *const ModelConfig) u32 {
+    return if (config.supportsBatchedGdnDecode()) 8 else std.math.maxInt(u32);
 }
 
 /// True when this machine has a verify lane for widths past the split-K
@@ -2652,15 +2657,25 @@ test "dflash: out-of-range target_layer_ids rejected by name" {
     try testing.expectError(error.DflashTargetLayerOutOfRange, validateTargetLayers(&[_]u32{60}, 52));
 }
 
-test "dflash: block size resolves from config, clamped downward by explicit CLI" {
-    // A machine WITH a wide verify lane keeps the checkpoint's own block.
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit smaller CLI clamps down.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit LARGER CLI never raises past the config (training contract).
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP));
+test "dflash: block size resolves from config and target verify width" {
+    // A machine WITH a wide verify lane keeps the checkpoint's own block when
+    // the target forward has no narrower efficient width.
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, std.math.maxInt(u32)));
+    // A GDN target caps at the fused recurrent verifier's eight rows.
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(9, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, 8));
+    // Explicit CLI bypasses performance caps but remains bounded by training.
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP, 5));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
     // Floor 2.
-    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
+}
+
+test "dflash: GDN targets cap at the fused recurrence width" {
+    var cfg = ModelConfig{};
+    try testing.expectEqual(std.math.maxInt(u32), targetBlockCap(&cfg));
+    cfg.model_type = "qwen3_5_moe";
+    cfg.full_attention_interval = 4;
+    try testing.expectEqual(@as(u32, 8), targetBlockCap(&cfg));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -2708,16 +2723,16 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP, std.math.maxInt(u32)));
     // The cap is a CEILING, never a floor: an explicit smaller CLI still wins,
     // and a checkpoint whose own block is already narrow is left alone.
-    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP));
-    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP, 8));
+    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP, 8));
     // Explicit CLI is the escape hatch for a wider block on capped hardware:
     // it clamps against the CONFIG block, not the cap.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP, 5));
     // An explicit CLI also bypasses a per-silicon cap entirely.
-    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
+    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8, 5));
 }
 
 test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
@@ -2735,8 +2750,8 @@ test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" 
     try testing.expectEqual(@as(u32, 8), blockCapForMachine("Apple M4 Max", true).cap);
     // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
     // block-8 one is left alone.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap, std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap, std.math.maxInt(u32)));
 }
 
 // ── Hermetic fixtures: tiny llama trunk + tiny DFlash assistant ──

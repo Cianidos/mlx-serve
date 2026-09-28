@@ -4091,12 +4091,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.draft_block_size_explicit,
                 wide_lane,
                 block_cap.cap,
+                dflash_mod.targetBlockCap(&xfm_ptr.config),
             );
             if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
                 log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
             var cap_note_buf: [96]u8 = undefined;
+            const target_cap = dflash_mod.targetBlockCap(&xfm_ptr.config);
             const cap_note: []const u8 = if (params.draft_block_size_explicit)
                 ", user-clamped"
+            else if (d.config.block_size > sch.drafter_block_size and target_cap < d.config.block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped (target verify cap {d})", .{target_cap}) catch ", capped"
             else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
                 std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
                     block_cap.label,
