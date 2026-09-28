@@ -31,6 +31,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const gdn_decode = @import("gdn_decode.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -105,6 +106,9 @@ pub const DflashConfig = struct {
     /// Output vocabulary of the sidecar. Zero means the legacy config omitted
     /// it and the target vocabulary remains authoritative.
     draft_vocab_size: u32 = 0,
+    /// Learned per-position acceptance predictor over the block hidden and optional Markov embedding.
+    confidence_head: bool = false,
+    confidence_with_markov: bool = false,
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
@@ -341,6 +345,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         sliding_window_non_causal = v.bool;
     }
     const draft_vocab_size: u32 = if (root.get("draft_vocab_size")) |v| try jsonU32(v) else 0;
+    const confidence_head = if (root.get("enable_confidence_head")) |v| blk: {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        break :blk v.bool;
+    } else false;
+    const confidence_with_markov = if (root.get("confidence_head_with_markov")) |v| blk: {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        break :blk v.bool;
+    } else false;
+    if (confidence_with_markov and markov_rank == 0) return error.InvalidDflashConfigValue;
 
     const lt_val = Geometry.get(root, nested_geometry, "layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
@@ -378,6 +391,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .sliding_window_fixed_anchor = speculators_shape,
         .sliding_window_non_causal = sliding_window_non_causal,
         .draft_vocab_size = draft_vocab_size,
+        .confidence_head = confidence_head,
+        .confidence_with_markov = confidence_with_markov,
     };
 }
 
@@ -467,10 +482,9 @@ pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, w
     return @max(base, 2);
 }
 
-/// GDN verification fuses at most eight rows. Width nine falls back across all
-/// linear layers even on NAX, so its wider QMM lane cannot recover the round.
+/// GDN targets cap at the fused recurrence's widest supported verify width.
 pub fn targetBlockCap(config: *const ModelConfig) u32 {
-    return if (config.supportsBatchedGdnDecode()) 8 else std.math.maxInt(u32);
+    return if (config.supportsBatchedGdnDecode()) @intCast(gdn_decode.MAX_SEQ) else std.math.maxInt(u32);
 }
 
 /// True when this machine has a verify lane for widths past the split-K
@@ -654,12 +668,7 @@ pub const MarkovHead = struct {
 
     /// `logits + w2(w1[prev_token])` for ONE block position. `base_row` is
     /// `[1, 1, vocab]`; the result is a fresh array the caller owns.
-    pub fn stepLogits(
-        self: *const MarkovHead,
-        base_row: mlx.mlx_array,
-        prev_token: u32,
-        s: mlx.mlx_stream,
-    ) !mlx.mlx_array {
+    pub fn embedding(self: *const MarkovHead, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
         const idx_i32: i32 = @intCast(prev_token);
         const idx_shape = [_]c_int{1};
         const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
@@ -668,7 +677,23 @@ pub const MarkovHead = struct {
         var row = mlx.mlx_array_new(); // [1, rank]
         defer _ = mlx.mlx_array_free(row);
         try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
+        const rsh = mlx.getShape(row);
+        const shaped = [_]c_int{ 1, 1, rsh[1] };
+        var row3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&row3, row, &shaped, 3, s));
+        return row3;
+    }
 
+    /// `logits + w2(w1[prev_token])` for one block position.
+    pub fn stepLogits(self: *const MarkovHead, base_row: mlx.mlx_array, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+        const idx_i32: i32 = @intCast(prev_token);
+        const idx_shape = [_]c_int{1};
+        const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
         const rsh = mlx.getShape(row);
         const shaped = [_]c_int{ 1, 1, rsh[1] };
         var row3 = mlx.mlx_array_new();
@@ -677,10 +702,44 @@ pub const MarkovHead = struct {
 
         const bias = try self.w2.apply(row3, s);
         defer _ = mlx.mlx_array_free(bias);
-
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, base_row, bias, s));
+        return out;
+    }
+};
+
+pub const ConfidenceHead = struct {
+    weight: mlx.mlx_array, // [hidden + optional markov_rank, 1], pre-transposed
+    bias: mlx.mlx_array, // [1]
+    with_markov: bool,
+
+    pub fn deinit(self: *ConfidenceHead) void {
+        _ = mlx.mlx_array_free(self.weight);
+        _ = mlx.mlx_array_free(self.bias);
+    }
+
+    fn appendEval(self: *const ConfidenceHead, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.weight);
+        _ = mlx.mlx_vector_array_append_value(vec, self.bias);
+    }
+
+    pub fn logits(self: *const ConfidenceHead, hidden: mlx.mlx_array, markov_embed: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var features = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(features);
+        if (self.with_markov) {
+            const parts = [_]mlx.mlx_array{ hidden, markov_embed };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&features, vec, 2, s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&features, hidden));
+        }
+        var projected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(projected);
+        try mlx.check(mlx.mlx_matmul(&projected, features, self.weight, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&out, projected, self.bias, s));
         return out;
     }
 };
@@ -740,6 +799,34 @@ fn draftVocabRows(config: *const model_mod.ModelConfig, has_markov: bool) c_int 
     return config.draftVocab();
 }
 
+pub var confidence_threshold_override: ?f32 = null;
+var confidence_threshold_cache: ?f32 = null;
+
+pub fn confidenceThreshold() f32 {
+    if (confidence_threshold_override) |v| return std.math.clamp(v, 0, 1);
+    if (confidence_threshold_cache) |v| return v;
+    const raw = if (std.c.getenv("MLX_SERVE_DFLASH_CONFIDENCE")) |p| std.mem.span(p) else "0";
+    const value = std.math.clamp(std.fmt.parseFloat(f32, raw) catch 0, 0, 1);
+    confidence_threshold_cache = value;
+    return value;
+}
+
+pub fn confidencePrefixFromLogits(logits: []const f32, threshold: f32, min_drafts: u32) u32 {
+    if (!(threshold > 0.0) or logits.len == 0) return @intCast(logits.len);
+    var n: u32 = 0;
+    for (logits) |raw| {
+        const p: f32 = if (raw >= 0)
+            1.0 / (1.0 + @exp(-raw))
+        else blk: {
+            const e = @exp(raw);
+            break :blk e / (1.0 + e);
+        };
+        if (p < threshold) break;
+        n += 1;
+    }
+    return @min(@as(u32, @intCast(logits.len)), @max(@min(min_drafts, @as(u32, @intCast(logits.len))), n));
+}
+
 pub const DflashModel = struct {
     config: DflashConfig,
     allocator: std.mem.Allocator,
@@ -764,11 +851,13 @@ pub const DflashModel = struct {
 
     /// DSpark Markov head — null unless the config declares `markov_rank`.
     markov: ?MarkovHead = null,
+    confidence: ?ConfidenceHead = null,
 
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
+        if (self.confidence) |*ch| ch.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -1007,11 +1096,9 @@ fn ownWeightEither(w: *const Weights, key: []const u8, alt: []const u8) !mlx.mlx
     return ownWeight(w, alt);
 }
 
-/// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
-/// ships `<prefix>.scales` is served packed as-is (affine only — its true
-/// params are solved from the packed geometry, never assumed); a dense bf16
-/// weight is quantized to `bits` when the contraction dim allows it and
-/// pre-transposed for a plain matmul otherwise.
+/// Load `<prefix>.weight` as an assistant linear. Affine weights with `.scales`
+/// stay packed; block-FP8 weights with `.weight_scale_inv` dequantize to bf16;
+/// dense weights are load-time quantized when requested, else transposed.
 fn loadLinear(
     w: *const Weights,
     prefix: []const u8,
@@ -1041,15 +1128,91 @@ fn loadLinear(
     var kb: [256]u8 = undefined;
     const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
     defer _ = mlx.mlx_array_free(raw);
+    const dense = if (mlx.mlx_array_dtype(raw) == .uint8) blk: {
+        const scale_key = try std.fmt.bufPrint(&kb, "{s}.weight_scale_inv", .{prefix});
+        const scales = w.get(scale_key) orelse return error.UnsupportedDflashQuant;
+        break :blk try dequantBlockFp8(raw, scales, 128, s);
+    } else raw;
+    defer if (dense.ctx != raw.ctx) {
+        _ = mlx.mlx_array_free(dense);
+    };
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| return quantizeDense(dense, bits, group, s);
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
     const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
+    try mlx.check(mlx.mlx_transpose_axes(&transposed, dense, &perm, 2, s));
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+}
+
+var block_fp8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const BlockFp8Config = struct {
+    rows: c_int,
+    cols: c_int,
+    cfg: mlx.mlx_fast_metal_kernel_config,
+};
+var block_fp8_configs: [16]?BlockFp8Config = @splat(null);
+
+fn dequantBlockFp8(raw: mlx.mlx_array, scales: mlx.mlx_array, block: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const wsh = mlx.getShape(raw);
+    const ssh = mlx.getShape(scales);
+    if (!mlx.streamIsGpu(s) or block != 128 or wsh.len != 2 or ssh.len != 2 or
+        ssh[0] != @divTrunc(wsh[0] + block - 1, block) or
+        ssh[1] != @divTrunc(wsh[1] + block - 1, block)) return error.UnsupportedDflashQuant;
+    const rows = wsh[0];
+    const cols = wsh[1];
+    if (block_fp8_kernel == null) {
+        const input_names = [_][*:0]const u8{ "w", "scales", "cols", "scale_cols" };
+        const output_names = [_][*:0]const u8{"out"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        block_fp8_kernel = mlx.mlx_fast_metal_kernel_new(
+            "msv_dflash_fp8_dequant",
+            in_vec,
+            out_vec,
+            "uint i = thread_position_in_grid.x; if (i < OUT_SIZE) { uint r = i / cols; uint c = i - r * cols; fp8_e4m3 v; v.bits = w[i]; out[i] = static_cast<T>(float(v) * float(scales[(r / 128) * scale_cols + c / 128])); }",
+            "struct fp8_e4m3 { operator float16_t() thread { uint16_t v = (bits & 127) << 7; half converted = as_type<half>(v); converted *= 256.0; return (bits & 128) ? -converted : converted; } operator float() thread { return static_cast<float>(this->operator float16_t()); } uint8_t bits; };",
+            true,
+            false,
+        );
+        if (block_fp8_kernel.?.ctx == null) return error.MetalKernelCompileFailed;
+    }
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    for (&block_fp8_configs) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.rows == rows and entry.cols == cols) {
+                cfg = entry.cfg;
+                break;
+            }
+            continue;
+        }
+        cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, wsh.ptr, wsh.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(mlx.mlx_array_size(raw)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OUT_SIZE", @intCast(mlx.mlx_array_size(raw))));
+        slot.* = .{ .rows = rows, .cols = cols, .cfg = cfg };
+        break;
+    } else return error.TooManyDflashFp8Shapes;
+    const cols_arr = mlx.mlx_array_new_int(cols);
+    defer _ = mlx.mlx_array_free(cols_arr);
+    const scale_cols_arr = mlx.mlx_array_new_int(ssh[1]);
+    defer _ = mlx.mlx_array_free(scale_cols_arr);
+    const inputs = [_]mlx.mlx_array{ raw, scales, cols_arr, scale_cols_arr };
+    const input_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(input_vec);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, block_fp8_kernel.?, input_vec, cfg, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0));
+    return out;
 }
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
@@ -1173,13 +1336,28 @@ pub fn loadDflashQuant(
         errdefer _ = mlx.mlx_array_free(w1);
         const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, bits, s);
         markov = .{ .w1 = w1, .w2 = w2 };
-        // The confidence head trims the drafted block per request in the
-        // reference's ragged-verify mode; we serve a STATIC block, so its
-        // weights are deliberately unread. Say so rather than let a silently
-        // ignored trained module read as a port that covers it.
-        if (weights.get("confidence_head.proj.weight") != null) {
-            log.info("[dflash] dspark: confidence head present but unused (static verify width)\n", .{});
+    }
+
+    var confidence: ?ConfidenceHead = null;
+    errdefer if (confidence) |*ch| ch.deinit();
+    if (cfg.confidence_head) {
+        const raw = try ownWeight(&weights, "confidence_head.proj.weight");
+        defer _ = mlx.mlx_array_free(raw);
+        const shape = mlx.getShape(raw);
+        const input_dim = cfg.hidden_size + if (cfg.confidence_with_markov) cfg.markov_rank else 0;
+        if (shape.len != 2 or shape[0] != 1 or shape[1] != @as(c_int, @intCast(input_dim)))
+            return error.BadDflashConfidenceShape;
+        var transposed = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(transposed);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
+        const bias = try ownWeight(&weights, "confidence_head.proj.bias");
+        const bias_shape = mlx.getShape(bias);
+        if (bias_shape.len != 1 or bias_shape[0] != 1) {
+            _ = mlx.mlx_array_free(bias);
+            return error.BadDflashConfidenceShape;
         }
+        confidence = .{ .weight = transposed, .bias = bias, .with_markov = cfg.confidence_with_markov };
     }
 
     // Force-eval all weights so serve time never faults a lazy transpose or
@@ -1193,6 +1371,7 @@ pub fn loadDflashQuant(
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
+        if (confidence) |*ch| ch.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
 
@@ -1212,8 +1391,11 @@ pub fn loadDflashQuant(
         });
     }
     if (cfg.isDspark()) {
-        log.info("[dflash] dspark: markov head rank={d}, rope theta={d:.0} ({s})\n", .{
-            cfg.markov_rank, cfg.rope_theta, if (cfg.rope_traditional) "interleaved" else "neox",
+        log.info("[dflash] dspark: markov head rank={d}, confidence={s}, rope theta={d:.0} ({s})\n", .{
+            cfg.markov_rank,
+            if (confidence != null) "loaded" else "absent",
+            cfg.rope_theta,
+            if (cfg.rope_traditional) "interleaved" else "neox",
         });
     }
 
@@ -1227,6 +1409,7 @@ pub fn loadDflashQuant(
         .layers = layers,
         .selector = selector,
         .markov = markov,
+        .confidence = confidence,
     };
 }
 
@@ -2447,6 +2630,17 @@ test "dflash: Speculators DSpark config normalizes nested geometry and auxiliary
     try testing.expect(cfg.sliding_window_fixed_anchor);
     try testing.expect(!cfg.sliding_window_non_causal);
     try testing.expectEqual(@as(u32, 248320), cfg.draft_vocab_size);
+    try testing.expect(cfg.confidence_head);
+    try testing.expect(cfg.confidence_with_markov);
+}
+
+test "dflash: confidence prefix stops at the first low-survival position" {
+    const hi: f32 = @log(0.9 / 0.1);
+    const lo: f32 = @log(0.2 / 0.8);
+    try testing.expectEqual(@as(u32, 2), confidencePrefixFromLogits(&.{ hi, hi, lo, hi }, 0.5, 1));
+    try testing.expectEqual(@as(u32, 1), confidencePrefixFromLogits(&.{ lo, hi }, 0.5, 1));
+    try testing.expectEqual(@as(u32, 2), confidencePrefixFromLogits(&.{ lo, hi }, 0.5, 2));
+    try testing.expectEqual(@as(u32, 4), confidencePrefixFromLogits(&.{ hi, hi, lo, hi }, 0, 1));
 }
 
 test "dflash: DSpark Markov correction keeps full-vocab base logits" {
@@ -2661,8 +2855,8 @@ test "dflash: block size resolves from config and target verify width" {
     // A machine WITH a wide verify lane keeps the checkpoint's own block when
     // the target forward has no narrower efficient width.
     try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, std.math.maxInt(u32)));
-    // A GDN target caps at the fused recurrent verifier's eight rows.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(9, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, 8));
+    // A GDN target caps at the fused recurrent verifier's supported width.
+    try testing.expectEqual(@as(u32, 9), resolveBlockSize(10, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, 9));
     // Explicit CLI bypasses performance caps but remains bounded by training.
     try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP, 5));
     try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
@@ -2675,7 +2869,7 @@ test "dflash: GDN targets cap at the fused recurrence width" {
     try testing.expectEqual(std.math.maxInt(u32), targetBlockCap(&cfg));
     cfg.model_type = "qwen3_5_moe";
     cfg.full_attention_interval = 4;
-    try testing.expectEqual(@as(u32, 8), targetBlockCap(&cfg));
+    try testing.expectEqual(@as(u32, @intCast(gdn_decode.MAX_SEQ)), targetBlockCap(&cfg));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -2907,6 +3101,30 @@ pub const TinyFix = struct {
         \\}
     ;
 
+    pub const DSPARK_CONFIG =
+        \\{
+        \\  "model_type": "tiny_assistant",
+        \\  "block_size": 3,
+        \\  "sample_from_anchor": true,
+        \\  "mask_token_id": 127,
+        \\  "target_layer_ids": [0, 2],
+        \\  "hidden_size": 64,
+        \\  "intermediate_size": 128,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 16,
+        \\  "rms_norm_eps": 1e-5,
+        \\  "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        \\  "sliding_window": 8,
+        \\  "layer_types": ["sliding_attention", "full_attention"],
+        \\  "markov_rank": 32,
+        \\  "markov_head_type": "vanilla",
+        \\  "enable_confidence_head": true,
+        \\  "confidence_head_with_markov": true
+        \\}
+    ;
+
     /// `quantize`: also emit `.scales`/`.biases` for every matmul weight, the
     /// shape a sidecar published pre-quantized would ship.
     pub fn writeAssistant(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
@@ -2922,6 +3140,22 @@ pub const TinyFix = struct {
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
         try putV1AssistantWeights(map, s, quantize);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    pub fn writeDspark(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = DSPARK_CONFIG });
+        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        defer testing.allocator.free(st_path);
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try putV1AssistantWeights(map, s, false);
+        try putW(map, "markov_head.markov_w1.weight", VOCAB, 32, 200, s);
+        try putW(map, "markov_head.markov_w2.weight", VOCAB, 32, 201, s);
+        try putW(map, "confidence_head.proj.weight", 1, HIDDEN + 32, 202, s);
+        try putW(map, "confidence_head.proj.bias", 1, 0, 203, s);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
@@ -3053,6 +3287,55 @@ pub const TinyFix = struct {
         try put(map, try std.fmt.bufPrint(&buf, "{s}.biases", .{base}), lin.biases);
     }
 
+    pub fn blockFp8Weight(rows: usize, cols: usize, block: usize, seed: usize, s: mlx.mlx_stream) !struct { raw: mlx.mlx_array, scales: mlx.mlx_array, dense: mlx.mlx_array } {
+        const padded_rows = std.mem.alignForward(usize, rows, block);
+        const padded_cols = std.mem.alignForward(usize, cols, block);
+        const source = try bf16Arr(padded_rows, padded_cols, seed, s);
+        defer _ = mlx.mlx_array_free(source);
+        var source_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(source_f32);
+        try mlx.check(mlx.mlx_astype(&source_f32, source, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(source_f32));
+        const source_data = mlx.mlx_array_data_float32(source_f32) orelse return error.MlxArrayDataNull;
+        const nrb = padded_rows / block;
+        const ncb = padded_cols / block;
+        const scale_data = try testing.allocator.alloc(f32, nrb * ncb);
+        defer testing.allocator.free(scale_data);
+        const normalized_data = try testing.allocator.alloc(f32, padded_rows * padded_cols);
+        defer testing.allocator.free(normalized_data);
+        for (0..nrb) |br| for (0..ncb) |bc| {
+            var amax: f32 = 0;
+            for (0..block) |r| for (0..block) |c| {
+                amax = @max(amax, @abs(source_data[(br * block + r) * padded_cols + bc * block + c]));
+            };
+            const scale = @max(amax / 448.0, 1e-8);
+            scale_data[br * ncb + bc] = scale;
+            for (0..block) |r| for (0..block) |c| {
+                const idx = (br * block + r) * padded_cols + bc * block + c;
+                normalized_data[idx] = source_data[idx] / scale;
+            };
+        };
+        const padded_shape = [_]c_int{ @intCast(padded_rows), @intCast(padded_cols) };
+        const normalized = mlx.mlx_array_new_data(normalized_data.ptr, &padded_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(normalized);
+        var raw_padded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw_padded);
+        try mlx.check(mlx.mlx_to_fp8(&raw_padded, normalized, s));
+        var raw = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(raw);
+        try mlx.check(mlx.mlx_slice(&raw, raw_padded, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        const scale_shape = [_]c_int{ @intCast(nrb), @intCast(ncb) };
+        const scales_f32 = mlx.mlx_array_new_data(scale_data.ptr, &scale_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(scales_f32);
+        var scales = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scales);
+        try mlx.check(mlx.mlx_astype(&scales, scales_f32, .bfloat16, s));
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_slice(&dense, source, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        return .{ .raw = raw, .scales = scales, .dense = dense };
+    }
+
     pub fn readF32(arr: mlx.mlx_array, allocator: std.mem.Allocator, s: mlx.mlx_stream) ![]f32 {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
@@ -3086,6 +3369,37 @@ pub const TinyFix = struct {
         return bf;
     }
 };
+
+test "dflash: DSpark loader binds the Markov-conditioned confidence head" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp_dir.dir.realPath(io, &path_buf)];
+    try TinyFix.writeDspark(io, tmp_dir.dir, dir_path, s);
+
+    var m = try loadDflashQuant(io, allocator, s, dir_path, 0);
+    defer m.deinit();
+    const confidence = m.confidence orelse return error.TestExpectedConfidenceHead;
+    try testing.expect(m.markov != null);
+    try testing.expect(confidence.with_markov);
+    try testing.expectEqualSlices(c_int, &.{ TinyFix.HIDDEN + 32, 1 }, mlx.getShape(confidence.weight));
+    try testing.expectEqualSlices(c_int, &.{1}, mlx.getShape(confidence.bias));
+
+    const hidden = try TinyFix.capArr(1, 210, s);
+    defer _ = mlx.mlx_array_free(hidden);
+    const markov_embed = try m.markov.?.embedding(7, s);
+    defer _ = mlx.mlx_array_free(markov_embed);
+    const logits = try confidence.logits(hidden, markov_embed, s);
+    defer _ = mlx.mlx_array_free(logits);
+    const values = try TinyFix.readF32(logits, allocator, s);
+    defer allocator.free(values);
+    try testing.expectEqual(@as(usize, 1), values.len);
+    try testing.expect(std.math.isFinite(values[0]));
+}
 
 test "dflash: loadDflash keeps a dense bf16 assistant dense + pre-transposed when quantization is off" {
     const allocator = testing.allocator;
@@ -3290,6 +3604,26 @@ test "dflash: load-time quantization packs every matmul weight and tracks the de
     const p = try paritySlices(a, b);
     try testing.expect(p.cos > 0.99);
     try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+}
+
+test "dflash: block-FP8 weights dequantize by 128x128 scale blocks before affine packing" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const fp8 = try TinyFix.blockFp8Weight(129, 257, 128, 810, s);
+    defer _ = mlx.mlx_array_free(fp8.raw);
+    defer _ = mlx.mlx_array_free(fp8.scales);
+    defer _ = mlx.mlx_array_free(fp8.dense);
+
+    const dequantized = try dequantBlockFp8(fp8.raw, fp8.scales, 128, s);
+    defer _ = mlx.mlx_array_free(dequantized);
+    const want = try TinyFix.readF32(fp8.dense, allocator, s);
+    defer allocator.free(want);
+    const got = try TinyFix.readF32(dequantized, allocator, s);
+    defer allocator.free(got);
+    const p = try paritySlices(got, want);
+    try testing.expect(p.cos > 0.999);
+    try testing.expect(@abs(p.rms_ratio - 1.0) < 0.01);
 }
 
 test "dflash: a sidecar shipping packed weights loads at its own declared width" {

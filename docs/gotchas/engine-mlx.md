@@ -1646,6 +1646,27 @@ assertions in the DSV4_MINI load test; and the FULL-ACCEPT seam test
 branch the random mini can never reach — commits the block, bonus token correct, 3 serial
 tail tokens bit-identical after the round.
 
+## Qwen3.8 DSpark confidence and width nine lose to fixed width eight
+
+Red Hat's sidecar asks for eight drafts, so verify width is nine. Before extending GDN fusion,
+width nine fell to the generic recurrence and decoded 35.4 tok/s versus 55.7 at width eight.
+Extending `gdn_decode.recurSeqFold` to nine engaged correctly and passed recurrence/fold parity,
+but still lost: llmprobe 36.2 vs 58.4 tok/s, predictable 48.3 vs 72.1, novel 20.1 vs 33.2.
+The wider fold's threadgroup storage/occupancy cost outweighs one extra possible acceptance, so
+`targetBlockCap` stays 8. `enable_confidence_head` is loaded and can trim at
+`MLX_SERVE_DFLASH_CONFIDENCE`; threshold 0.3 also lost (54.7 vs 56.6 tok/s) by reducing verified
+width only 7.00 to 6.58. Default stays 0. Guards: loader/prefix-policy + end-to-end round-equivalence
+tests, and live logs proving `confidence=loaded`, `verified_avg`, and GDN engagement.
+
+## A block-FP8 sidecar is a source format, not a serving format
+
+`lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8` stores E4M3 weights with one BF16
+`weight_scale_inv` per 128x128 block. Safetensors exposes E4M3 as `uint8`, so treating it as a
+dense tensor reaches `mlx_quantize` and fails by name. `dequantBlockFp8` expands blocks in one
+Metal dispatch to BF16, then the existing load-time affine path packs the requested serving width.
+On M5 Pro, quick llmprobe A-B-B-A: BF16-source mean 55.25 tok/s, FP8-source 56.8 (+2.8%);
+acceptance stayed within run variance. Guard: 129x257 edge-block parity plus real checkpoint load.
+
 ## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
 
 DSpark shipped correct but SLOW: 13.5–14.0 tok/s against 22.6 serial on the same box.
