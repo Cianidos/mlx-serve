@@ -896,7 +896,7 @@ pub var prefix_cache_mem_explicit = false;
 /// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
 /// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+    return workingSessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
         retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
