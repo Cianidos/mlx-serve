@@ -85,6 +85,9 @@ ask > "$R1"
 echo "[2] DSpark engaged"
 boot "$L2"
 grep -q "dspark: markov head rank=" "$L2" || { echo "FAIL: sidecar not classified as DSpark"; exit 1; }
+if [ -n "${DSPARK_EXPECT_BITS:-}" ]; then
+    grep -q "weights=${DSPARK_EXPECT_BITS}-bit/gs" "$L2" || { echo "FAIL: expected ${DSPARK_EXPECT_BITS}-bit DSpark weights"; exit 1; }
+fi
 ask > "$R2"
 grep -q "\[spec-wiring\].*dflash=true" "$L2" || { echo "FAIL: dflash not wired (hybrid veto?)"; exit 1; }
 STATS=$(grep -o "mode=dflash.*per_draft_pct=[0-9.]*%" "$L2" | tail -1)

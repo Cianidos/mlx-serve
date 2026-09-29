@@ -1654,6 +1654,14 @@ dense tensor reaches `mlx_quantize` and fails by name. `dequantBlockFp8` expands
 Metal dispatch to BF16, then the existing load-time affine path packs the requested serving width.
 Guard: 129x257 edge-block parity plus real checkpoint load.
 
+## NAX DSpark pays at 3-bit; other DFlash defaults stay unchanged
+
+On M5 Pro, the Qwen3.8 FP8-source sidecar served at 4/3/3/4 bits in A-B-B-A order.
+Standard decode measured 55.2/58.3/59.7/56.4 tok/s: 3-bit mean 59.0 versus 4-bit
+55.8 (+5.7%). Predictable and novel prompt rates stayed flat. `defaultQuantBits` therefore
+selects 3-bit only for DSpark on NAX; other NAX DFlash remains 4-bit and older GPUs 8-bit.
+`MLX_SERVE_DFLASH_QUANT_BITS` remains the explicit override. Guard: four-cell unit matrix.
+
 ## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
 
 DSpark shipped correct but SLOW: 13.5–14.0 tok/s against 22.6 serial on the same box.
