@@ -501,6 +501,7 @@ pub fn wideVerifyLaneAvailable() bool {
 /// quality rides on it — the trunk verify is exact either way, so the worst
 /// a bad width can do is cost acceptance.
 pub const DEFAULT_QUANT_BITS: u32 = 8;
+const AUTO_QUANT_BITS: u32 = std.math.maxInt(u32);
 
 /// Draft-only lm_head width — DEFAULT OFF (drafts use the trunk's own head).
 /// A narrower head shrinks a read the round barely notices and pays for it in
@@ -517,10 +518,10 @@ pub const DEFAULT_DRAFT_HEAD_BITS: u32 = 0;
 /// contraction dim, dense when neither does.
 pub const QUANT_GROUP: u32 = 64;
 
-/// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
+/// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → per-sidecar auto width, a supported
 /// affine width → that, anything else ("0", "off") → dense bf16.
 pub fn quantBitsFromEnv() u32 {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
+    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return AUTO_QUANT_BITS;
     const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
     return switch (v) {
         2, 3, 4, 5, 6, 8 => v,
@@ -528,14 +529,16 @@ pub fn quantBitsFromEnv() u32 {
     };
 }
 
-/// A NAX chip (M5) drafts faster from a 4-bit assistant; M1-M4 keep 8-bit.
-pub fn defaultQuantBits(nax: bool) u32 {
-    return if (nax) 4 else DEFAULT_QUANT_BITS;
+/// NAX serves DSpark's 3-bit rows efficiently; older GPUs and DFlash families keep 8-bit.
+pub fn autoQuantBits(nax: bool, dspark: bool) u32 {
+    return if (nax and dspark) 3 else DEFAULT_QUANT_BITS;
 }
 
-test "defaultQuantBits: 4-bit assistant on NAX, 8-bit elsewhere" {
-    try testing.expectEqual(@as(u32, 4), defaultQuantBits(true));
-    try testing.expectEqual(DEFAULT_QUANT_BITS, defaultQuantBits(false));
+test "autoQuantBits: DSpark uses 3-bit on NAX; other pairings use 8-bit" {
+    try testing.expectEqual(@as(u32, 3), autoQuantBits(true, true));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(true, false));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, true));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, false));
 }
 
 /// Widest supported group that divides the contraction dim, or null when the
@@ -1267,6 +1270,10 @@ pub fn loadDflashQuant(
 ) !DflashModel {
     var cfg = try parseConfig(io, allocator, model_dir);
     errdefer cfg.deinit(allocator);
+    const serve_bits = if (bits == AUTO_QUANT_BITS)
+        autoQuantBits(transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark())
+    else
+        bits;
 
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
@@ -1279,7 +1286,7 @@ pub fn loadDflashQuant(
     // `encoder.fc` + `encoder.output_norm_enc`, z-lab DFlash2 ships root
     // `fc` + `hidden_norm`. Same tensors, keyed on which one the file has.
     const zlab_names = weights.get("fc.weight") != null;
-    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, bits, s);
+    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, serve_bits, s);
     errdefer fc.deinit();
     const enc_norm = try ownWeight(&weights, if (zlab_names) "hidden_norm.weight" else "encoder.output_norm_enc.weight");
     errdefer _ = mlx.mlx_array_free(enc_norm);
@@ -1301,20 +1308,20 @@ pub fn loadDflashQuant(
             .layer_type = cfg.layer_types[li],
             .input_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li})),
             .post_attn_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li})),
-            .q = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj", .{li}), hidden, bits, s),
+            .q = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj", .{li}), hidden, serve_bits, s),
             .q_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_norm.weight", .{li})),
-            .k = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj", .{li}), hidden, bits, s),
+            .k = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj", .{li}), hidden, serve_bits, s),
             .k_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_norm.weight", .{li})),
-            .v = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj", .{li}), hidden, bits, s),
-            .o = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj", .{li}), q_out, bits, s),
-            .gate = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj", .{li}), hidden, bits, s),
-            .up = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj", .{li}), hidden, bits, s),
-            .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, bits, s),
+            .v = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj", .{li}), hidden, serve_bits, s),
+            .o = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj", .{li}), q_out, serve_bits, s),
+            .gate = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj", .{li}), hidden, serve_bits, s),
+            .up = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj", .{li}), hidden, serve_bits, s),
+            .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, serve_bits, s),
         };
         layers_inited += 1;
         if (cfg.conv_kernel_size > 0) {
-            layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, bits, s);
-            layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, bits, s);
+            layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, serve_bits, s);
+            layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, serve_bits, s);
         }
     }
 
@@ -1325,7 +1332,7 @@ pub fn loadDflashQuant(
         errdefer _ = mlx.mlx_array_free(pred);
         const succ = try ownWeightEither(&weights, "candidate_selector.successor_codebook", "candidate_selector.successor_codebook.weight");
         errdefer _ = mlx.mlx_array_free(succ);
-        const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, bits, s);
+        const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, serve_bits, s);
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
 
@@ -1334,7 +1341,7 @@ pub fn loadDflashQuant(
     if (cfg.markov_rank > 0) {
         const w1 = try ownWeight(&weights, "markov_head.markov_w1.weight");
         errdefer _ = mlx.mlx_array_free(w1);
-        const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, bits, s);
+        const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, serve_bits, s);
         markov = .{ .w1 = w1, .w2 = w2 };
     }
 

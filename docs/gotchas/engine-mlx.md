@@ -1663,9 +1663,11 @@ tests, and live logs proving `confidence=loaded`, `verified_avg`, and GDN engage
 `lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8` stores E4M3 weights with one BF16
 `weight_scale_inv` per 128x128 block. Safetensors exposes E4M3 as `uint8`, so treating it as a
 dense tensor reaches `mlx_quantize` and fails by name. `dequantBlockFp8` expands blocks in one
-Metal dispatch to BF16, then the existing load-time affine path packs the requested serving width.
-On M5 Pro, quick llmprobe A-B-B-A: BF16-source mean 55.25 tok/s, FP8-source 56.8 (+2.8%);
-acceptance stayed within run variance. Guard: 129x257 edge-block parity plus real checkpoint load.
+Metal dispatch to BF16, then the existing load-time affine path packs the serving width. M5 Pro
+quick llmprobe A-B-B-A found FP8-source 56.8 vs BF16-source 55.25 tok/s (+2.8%). A second
+A-B-B-A on the FP8 source found 3-bit serving at 59.0 vs 4-bit 55.8 (+5.7%), with equal
+predictable/novel rates and acceptance within run variance; NAX defaults to 3-bit. Guard: 129x257
+edge-block parity plus real checkpoint load.
 
 ## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
 
