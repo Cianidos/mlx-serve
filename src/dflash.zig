@@ -1017,11 +1017,9 @@ fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
     return error.InvalidDflashCodebook;
 }
 
-/// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
-/// ships `<prefix>.scales` is served packed as-is (affine only — its true
-/// params are solved from the packed geometry, never assumed); a dense bf16
-/// weight is quantized to `bits` when the contraction dim allows it and
-/// pre-transposed for a plain matmul otherwise.
+/// Load `<prefix>.weight` as an assistant linear. Affine weights with `.scales`
+/// stay packed; block-FP8 weights with `.weight_scale_inv` dequantize to bf16;
+/// dense weights are load-time quantized when requested, else transposed.
 fn loadLinear(
     w: *const Weights,
     prefix: []const u8,
@@ -1051,15 +1049,92 @@ fn loadLinear(
     var kb: [256]u8 = undefined;
     const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
     defer _ = mlx.mlx_array_free(raw);
+    const block_fp8 = mlx.mlx_array_dtype(raw) == .uint8;
+    const dense = if (block_fp8) blk: {
+        const scale_key = try std.fmt.bufPrint(&kb, "{s}.weight_scale_inv", .{prefix});
+        const scales = w.get(scale_key) orelse return error.UnsupportedDflashQuant;
+        break :blk try dequantBlockFp8(raw, scales, 128, s);
+    } else raw;
+    defer if (block_fp8) {
+        _ = mlx.mlx_array_free(dense);
+    };
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| return quantizeDense(dense, bits, group, s);
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
     const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
+    try mlx.check(mlx.mlx_transpose_axes(&transposed, dense, &perm, 2, s));
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+}
+
+var block_fp8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const BlockFp8Config = struct {
+    rows: c_int,
+    cols: c_int,
+    cfg: mlx.mlx_fast_metal_kernel_config,
+};
+var block_fp8_configs: [16]?BlockFp8Config = @splat(null);
+
+fn dequantBlockFp8(raw: mlx.mlx_array, scales: mlx.mlx_array, block: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const wsh = mlx.getShape(raw);
+    const ssh = mlx.getShape(scales);
+    if (!mlx.streamIsGpu(s) or block != 128 or wsh.len != 2 or ssh.len != 2 or
+        ssh[0] != @divTrunc(wsh[0] + block - 1, block) or
+        ssh[1] != @divTrunc(wsh[1] + block - 1, block)) return error.UnsupportedDflashQuant;
+    const rows = wsh[0];
+    const cols = wsh[1];
+    if (block_fp8_kernel == null) {
+        const input_names = [_][*:0]const u8{ "w", "scales", "cols", "scale_cols" };
+        const output_names = [_][*:0]const u8{"out"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        block_fp8_kernel = mlx.mlx_fast_metal_kernel_new(
+            "msv_dflash_fp8_dequant",
+            in_vec,
+            out_vec,
+            "uint i = thread_position_in_grid.x; if (i < OUT_SIZE) { uint r = i / cols; uint c = i - r * cols; fp8_e4m3 v; v.bits = w[i]; out[i] = static_cast<T>(float(v) * float(scales[(r / 128) * scale_cols + c / 128])); }",
+            "struct fp8_e4m3 { operator float16_t() thread { uint16_t v = (bits & 127) << 7; half converted = as_type<half>(v); converted *= 256.0; return (bits & 128) ? -converted : converted; } operator float() thread { return static_cast<float>(this->operator float16_t()); } uint8_t bits; };",
+            true,
+            false,
+        );
+        if (block_fp8_kernel.?.ctx == null) return error.MetalKernelCompileFailed;
+    }
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    for (&block_fp8_configs) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.rows == rows and entry.cols == cols) {
+                cfg = entry.cfg;
+                break;
+            }
+            continue;
+        }
+        cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, wsh.ptr, wsh.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(mlx.mlx_array_size(raw)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OUT_SIZE", @intCast(mlx.mlx_array_size(raw))));
+        slot.* = .{ .rows = rows, .cols = cols, .cfg = cfg };
+        break;
+    } else return error.TooManyDflashFp8Shapes;
+    const cols_arr = mlx.mlx_array_new_int(cols);
+    defer _ = mlx.mlx_array_free(cols_arr);
+    const scale_cols_arr = mlx.mlx_array_new_int(ssh[1]);
+    defer _ = mlx.mlx_array_free(scale_cols_arr);
+    const inputs = [_]mlx.mlx_array{ raw, scales, cols_arr, scale_cols_arr };
+    const input_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(input_vec);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, block_fp8_kernel.?, input_vec, cfg, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0));
+    return out;
 }
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
@@ -3079,6 +3154,55 @@ pub const TinyFix = struct {
         try put(map, try std.fmt.bufPrint(&buf, "{s}.biases", .{base}), lin.biases);
     }
 
+    pub fn blockFp8Weight(rows: usize, cols: usize, block: usize, seed: usize, s: mlx.mlx_stream) !struct { raw: mlx.mlx_array, scales: mlx.mlx_array, dense: mlx.mlx_array } {
+        const padded_rows = std.mem.alignForward(usize, rows, block);
+        const padded_cols = std.mem.alignForward(usize, cols, block);
+        const source = try bf16Arr(padded_rows, padded_cols, seed, s);
+        defer _ = mlx.mlx_array_free(source);
+        var source_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(source_f32);
+        try mlx.check(mlx.mlx_astype(&source_f32, source, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(source_f32));
+        const source_data = mlx.mlx_array_data_float32(source_f32) orelse return error.MlxArrayDataNull;
+        const nrb = padded_rows / block;
+        const ncb = padded_cols / block;
+        const scale_data = try testing.allocator.alloc(f32, nrb * ncb);
+        defer testing.allocator.free(scale_data);
+        const normalized_data = try testing.allocator.alloc(f32, padded_rows * padded_cols);
+        defer testing.allocator.free(normalized_data);
+        for (0..nrb) |br| for (0..ncb) |bc| {
+            var amax: f32 = 0;
+            for (0..block) |r| for (0..block) |c| {
+                amax = @max(amax, @abs(source_data[(br * block + r) * padded_cols + bc * block + c]));
+            };
+            const scale = @max(amax / 448.0, 1e-8);
+            scale_data[br * ncb + bc] = scale;
+            for (0..block) |r| for (0..block) |c| {
+                const idx = (br * block + r) * padded_cols + bc * block + c;
+                normalized_data[idx] = source_data[idx] / scale;
+            };
+        };
+        const padded_shape = [_]c_int{ @intCast(padded_rows), @intCast(padded_cols) };
+        const normalized = mlx.mlx_array_new_data(normalized_data.ptr, &padded_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(normalized);
+        var raw_padded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw_padded);
+        try mlx.check(mlx.mlx_to_fp8(&raw_padded, normalized, s));
+        var raw = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(raw);
+        try mlx.check(mlx.mlx_slice(&raw, raw_padded, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        const scale_shape = [_]c_int{ @intCast(nrb), @intCast(ncb) };
+        const scales_f32 = mlx.mlx_array_new_data(scale_data.ptr, &scale_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(scales_f32);
+        var scales = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scales);
+        try mlx.check(mlx.mlx_astype(&scales, scales_f32, .bfloat16, s));
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_slice(&dense, source, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        return .{ .raw = raw, .scales = scales, .dense = dense };
+    }
+
     pub fn readF32(arr: mlx.mlx_array, allocator: std.mem.Allocator, s: mlx.mlx_stream) ![]f32 {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
@@ -3316,6 +3440,26 @@ test "dflash: load-time quantization packs every matmul weight and tracks the de
     const p = try paritySlices(a, b);
     try testing.expect(p.cos > 0.99);
     try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+}
+
+test "dflash: block-FP8 weights dequantize by 128x128 scale blocks before affine packing" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const fp8 = try TinyFix.blockFp8Weight(129, 257, 128, 810, s);
+    defer _ = mlx.mlx_array_free(fp8.raw);
+    defer _ = mlx.mlx_array_free(fp8.scales);
+    defer _ = mlx.mlx_array_free(fp8.dense);
+
+    const dequantized = try dequantBlockFp8(fp8.raw, fp8.scales, 128, s);
+    defer _ = mlx.mlx_array_free(dequantized);
+    const want = try TinyFix.readF32(fp8.dense, allocator, s);
+    defer allocator.free(want);
+    const got = try TinyFix.readF32(dequantized, allocator, s);
+    defer allocator.free(got);
+    const p = try paritySlices(got, want);
+    try testing.expect(p.cos > 0.999);
+    try testing.expect(@abs(p.rms_ratio - 1.0) < 0.01);
 }
 
 test "dflash: a sidecar shipping packed weights loads at its own declared width" {

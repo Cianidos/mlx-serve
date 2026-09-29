@@ -1646,6 +1646,14 @@ assertions in the DSV4_MINI load test; and the FULL-ACCEPT seam test
 branch the random mini can never reach — commits the block, bonus token correct, 3 serial
 tail tokens bit-identical after the round.
 
+## A block-FP8 sidecar is a source format, not a serving format
+
+`lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8` stores E4M3 weights with one BF16
+`weight_scale_inv` per 128x128 block. Safetensors exposes E4M3 as `uint8`, so treating it as a
+dense tensor reaches `mlx_quantize` and fails by name. `dequantBlockFp8` expands blocks in one
+Metal dispatch to BF16, then the existing load-time affine path packs the requested serving width.
+Guard: 129x257 edge-block parity plus real checkpoint load.
+
 ## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
 
 DSpark shipped correct but SLOW: 13.5–14.0 tok/s against 22.6 serial on the same box.
