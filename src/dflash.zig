@@ -634,6 +634,11 @@ pub const MarkovHead = struct {
     }
 };
 
+fn draftVocabRows(config: *const model_mod.ModelConfig, has_markov: bool) c_int {
+    if (has_markov) return 0;
+    return config.draftVocab();
+}
+
 pub const DflashLayer = struct {
     layer_type: LayerType,
 
@@ -853,6 +858,7 @@ pub const DflashModel = struct {
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        const draft_vocab = draftVocabRows(&target.config, self.markov != null);
         var out: mlx.mlx_array = undefined;
         if (self.draft_head) |*dh| {
             out = mlx.mlx_array_new();
@@ -869,8 +875,8 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
-        } else if (target.config.draftVocab() > 0) {
-            out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (draft_vocab > 0) {
+            out = try target.lmHeadRowsForDraft(x, draft_vocab);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -1572,7 +1578,6 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
-
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -1800,7 +1805,6 @@ pub fn lattice(
         lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
     }
     return lat;
-
 }
 
 /// A best-first draft tree over the lattice: node values are path sums of
@@ -2389,6 +2393,17 @@ test "dflash: a DSpark config with an unported markov head type is refused by na
     const gated = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"vanilla\"", "\"gated\"");
     defer allocator.free(gated);
     try testing.expectError(error.UnsupportedMarkovHeadType, parseConfigFromJson(allocator, gated));
+}
+
+test "dflash: DSpark Markov correction keeps full-vocab base logits" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.vocab_size = 248320;
+    cfg.row_exact_covered = true;
+    cfg.dflash_bound = true;
+
+    try testing.expectEqual(@as(c_int, 98304), draftVocabRows(&cfg, false));
+    try testing.expectEqual(@as(c_int, 0), draftVocabRows(&cfg, true));
 }
 
 test "dflash: DFlash2 nested dflash_config contract parses with selector + conv fields" {
