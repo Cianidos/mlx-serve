@@ -1214,7 +1214,7 @@ private struct UseDecisionModelButton: View {
         } label: { Text("Use")
             .font(.app(.body)) }
         .controlSize(.small)
-        .help("Open \(name) in Laya Decisions")
+        .help("Open \(name) in Decisions")
     }
 }
 
@@ -1909,7 +1909,7 @@ private struct LocalModelRow: View {
         hasOverrides = o?.hasSettings ?? false
         guard model.isChatPickable, model.quantFile == nil else { return }
         badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
-                                  isMoE: model.numExperts != nil, options: appState.serverOptions)
+                                  options: appState.serverOptions)
     }
 
     private func revealInFinder() {
@@ -2060,7 +2060,7 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
-                } else if model.modelType == "laya" {
+                } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
                 } else if let modality = MediaModality(modelType: model.modelType) {
                     // A media checkpoint is a real, loadable, servable model —

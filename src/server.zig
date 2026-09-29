@@ -27,6 +27,7 @@ const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
@@ -190,6 +191,7 @@ const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
+const model_settings_mod = @import("model_settings.zig");
 const cli_mod = @import("cli.zig");
 const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
@@ -549,12 +551,6 @@ pub const ServerConfig = struct {
     /// 0 = flag not given). Agent clients send nothing, and an omitted budget is the rest of
     /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
     default_max_tokens: u32 = 0,
-    /// `--mtp`: force the native MTP head ON for MoE targets too. The
-    /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
-    /// verify-forward expert-routing caution the drafter shares), which makes
-    /// a MoE MTP checkpoint unreachable from any client that doesn't send
-    /// `enable_mtp:true` in the body. Per-request `enable_mtp` still wins.
-    default_force_mtp: bool = false,
 };
 
 /// Sampling-default resolution chain: request body > CLI launch flag >
@@ -568,40 +564,11 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// The ONE place this policy lives — every HTTP surface calls it, so a new
 /// surface can't silently ship a different default (the drafter-dispatch-hole
 /// lesson: an output-equality test cannot see a spec path that never engaged).
-///
-/// MoE targets default OFF because the verify forward pays the expert-routing
-/// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
-/// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
-///
-/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
-/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
-/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
-/// then requests default ON outright (the qwen MoE-verify caution is about
-/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
-/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
-/// per request.
-///
-/// `native_measured`: same exemption, for an arch whose head ships inside the
-/// checkpoint AND has been measured no-worse-than-serial across the context
-/// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
-/// still needs a head LOADED — the claim is about the head, not the arch.
-/// `--mtp` process-wide, or the model's own `"mtp": true` in `model-settings.json`.
-fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
-    return config.mtp_override == true or server_config.default_force_mtp;
-}
-
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool) bool {
-    if (dsv4_stages) return true;
-    if (!mtp_loaded) return false;
-    return !is_moe or force or native_measured;
-}
-
-/// Does this model's MTP head carry the measured native-MoE exemption above?
-/// Mirrors `dsv4DraftStages` — a NAMED per-arch capability read once here, so
-/// the four call sites can never disagree (the list-of-one class).
-fn nativeMeasuredMoeHead(lm: *LoadedModel) bool {
-    const x = lm.transformer orelse return false;
-    return x.nativeMoeMtpHeadMeasured();
+/// A loaded head drafts, dense or MoE; `--no-mtp`, a model's `"mtp": false` or a
+/// request's `enable_mtp:false` opt out. `dsv4_stages`: DeepSeek-V4's own DSpark
+/// stages, loaded only on opt-in `--dspark`, which carry no qwen head.
+pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
+    return mtp_loaded or dsv4_stages;
 }
 
 /// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
@@ -823,6 +790,42 @@ fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds this endpoint's {d} MB limit", .{
         (got + mb - 1) / mb, cap / mb,
     }) catch "Request body too large";
+}
+
+pub const RequestModel = union(enum) {
+    /// A registered id, or "" / "mlx-serve" (the default), passed through.
+    id: []const u8,
+    /// Not registered: dispatch serves the default so SDK names like "gpt-4" work.
+    unknown_name,
+    /// An absolute path no entry lives at.
+    unknown_path,
+};
+
+/// Model Settings aliases, parsed once and re-read when the file changes.
+var g_model_aliases_path: [std.fs.max_path_bytes]u8 = undefined;
+var g_model_aliases: model_settings_mod.Cache = .{ .path = "" };
+
+/// Which model a request's `model` field names: an id, a path, a Model Settings
+/// alias, then on `/api/` the untagged alias and Ollama's short name. Dispatch,
+/// the LAN gate, load, unload and `/api/show` all read this. The registry is
+/// NOT locked here.
+fn resolveRequestModelId(registry: *ModelRegistry, aliases: *model_settings_mod.Cache, id: []const u8, path: []const u8) RequestModel {
+    if (id.len == 0 or std.mem.eql(u8, id, "mlx-serve")) return .{ .id = id };
+    if (registry.peek(id)) |e| return .{ .id = e.id };
+    // A path is never an SDK marketing name, and a default-model answer to it
+    // would serve a pack that failed to load with another model's weights.
+    if (std.fs.path.isAbsolute(id)) {
+        if (registry.peekByPath(id)) |e| return .{ .id = e.id };
+        return .unknown_path;
+    }
+    const ollama = std.mem.startsWith(u8, path, "/api/");
+    const untagged = if (ollama) id[0 .. std.mem.lastIndexOfScalar(u8, id, ':') orelse id.len] else id;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ id, untagged }) |n| {
+        if (aliases.pathForAlias(registry.io, n, &buf)) |p| if (registry.peekByPath(p)) |e| return .{ .id = e.id };
+    }
+    if (ollama) if (ollamaResolveRegistryId(registry.io, registry, id)) |r| return .{ .id = r };
+    return .unknown_name;
 }
 
 /// The requested model id from a request body of EITHER shape.
@@ -1766,6 +1769,8 @@ pub fn serve(
 
     global_registry = scheduler.registry;
     defer global_registry = null;
+    g_model_aliases.alloc = scheduler.registry.allocator;
+    g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
 
     // Plan 05: the hot prefix cache lives on the LoadedModel
     // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
@@ -1922,9 +1927,6 @@ pub fn serve(
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (server_config.default_force_mtp) {
-        log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
-    }
     if (transformer_mod.Transformer.mtp_head_kv_quant_flag) {
         log.info("MTP head KV: following --kv-quant (--mtp-head-kv-quant)\n", .{});
     }
@@ -1942,7 +1944,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya)\n", .{});
+    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2397,21 +2399,15 @@ fn handleConnection(
         try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
         return;
     }
-    if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
-        if (registry.peek(requested_model_id) == null) {
-            // Ollama clients send tagged/short names ("qwen3.6:latest");
-            // resolve them against registry ids before giving up. Scoped to
-            // /api/ paths so /v1 fallback semantics stay pinned.
-            var resolved: ?[]const u8 = null;
-            if (std.mem.startsWith(u8, path, "/api/")) {
-                resolved = ollamaResolveRegistryId(stream.io, registry, requested_model_id);
-            }
-            // Unknown id — fall back to the default model rather than 404,
-            // so off-the-shelf SDK clients keep working. Multi-model
-            // clients that care about routing precision pass an exact id
-            // we registered (and `peek` will find it).
-            requested_model_id = resolved orelse "";
-        }
+    switch (resolveRequestModelId(registry, &g_model_aliases, requested_model_id, path)) {
+        .id => |id| requested_model_id = id,
+        .unknown_path => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; load it first with POST /v1/load-model", 404);
+            return;
+        },
+        // Unknown name — fall back to the default model rather than 404, so
+        // off-the-shelf SDK clients keep working.
+        .unknown_name => requested_model_id = "",
     }
     // Text-gen route aimed at a KNOWN non-text model: reject before
     // ensureLoaded, or the request cold-loads a multi-GB media model just
@@ -2762,11 +2758,24 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+fn modelEngineName(has_ds4: bool, has_llama: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
+    if (mlx_gguf_served) return "mlx-gguf";
     if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
     return "mlx";
+}
+
+/// Would lib/mlx-serve-gguf claim this unloaded entry? Answered once per
+/// entry: the header read behind `servablePath` is too slow for a poll.
+fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
+    if (entry.mlx_gguf_claim == null) {
+        const allocator = std.heap.page_allocator;
+        const p = mlx_gguf.servablePath(io, allocator, entry.path);
+        defer if (p) |v| allocator.free(v);
+        entry.mlx_gguf_claim = p != null;
+    }
+    return entry.mlx_gguf_claim.?;
 }
 
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
@@ -2864,6 +2873,10 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     if (requested.len == 0) {
         try sendOllamaError(allocator, stream, "400 Bad Request", "model is required");
         return;
+    }
+    switch (resolveRequestModelId(registry, &g_model_aliases, requested, "/api/show")) {
+        .id => |id| requested = id,
+        else => {},
     }
 
     var rendered: ?[]u8 = null;
@@ -4371,7 +4384,8 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     const t = std.testing;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
-    const cfg = qwen4RequestTestConfig();
+    var cfg = qwen4RequestTestConfig();
+    cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
     const active: u64 = 69_827 * MiB;
@@ -4562,7 +4576,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     // `off` alike (dense 29,952 B/tok): `defaultKvBits` asked `global_scheduler`, which `serve`
     // assigns only after `Scheduler.init` performs the load.
     const t = std.testing;
-    const cfg = qwen4RequestTestConfig();
+    var cfg = qwen4RequestTestConfig();
+    cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const MiB: u64 = 1 << 20;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
@@ -5435,10 +5450,14 @@ fn mtpHeadStateBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     return statePerTokenBilled(config) / n;
 }
 
+/// A loaded head drafts by default, so its KV is billed unless the model opts out.
+fn mtpHeadBilled(config: *const model_mod.ModelConfig) bool {
+    return config.mtp_override != false;
+}
+
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    const head: u64 = if (forceMtpFor(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
-    return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
-        statePerTokenBilled(config) +| head;
+    const head: u64 = if (mtpHeadBilled(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
+    return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
 }
 
 fn workingSessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
@@ -5463,7 +5482,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    const mtp_on = warm.mtp_on or forceMtpFor(config);
+    const mtp_on = warm.mtp_on;
     const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
     const head_qsa_ring: u64 = if (mtp_on) mtpHeadQsaRingBytes(config) else 0;
     const head_state_per_tok: u64 = if (mtp_on) mtpHeadStateBytesPerToken(config) else 0;
@@ -6590,7 +6609,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -6713,10 +6732,11 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
-    // Unloaded entries have no engine attached yet — "gguf" (undetermined
+    // Unloaded entries have no engine attached yet — "mlx-gguf" where the
+    // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, entry.path, entry.arch_hint),
+        modelEngineName(false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -6777,6 +6797,9 @@ fn handleModels(
     // Sort: default first, then by last_used_ns desc.
     var ordered = std.ArrayList(*LoadedModel).empty;
     defer ordered.deinit(allocator);
+    var alias_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // Any re-read happens here, not under the registry lock below.
+    g_model_aliases.refreshNow(stream.io);
     {
         registry.mutex.lockUncancelable(stream.io);
         defer registry.mutex.unlock(stream.io);
@@ -6799,7 +6822,7 @@ fn handleModels(
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, stream.io, entry);
             defer allocator.free(json);
-            try entries_buf.appendSlice(allocator, json);
+            try appendAliasedRow(allocator, &entries_buf, json, g_model_aliases.aliasForPath(stream.io, entry.path, &alias_buf));
         }
     }
 
@@ -6813,6 +6836,15 @@ fn handleModels(
     , .{entries_buf.items});
     defer allocator.free(body);
     try sendModelsResponse(stream, body);
+}
+
+/// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
+/// stays the canonical registry id.
+fn appendAliasedRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), row: []const u8, alias: ?[]const u8) !void {
+    const a = alias orelse return out.appendSlice(allocator, row);
+    const esc = try jsonEscape(allocator, a);
+    defer allocator.free(esc);
+    try out.print(allocator, "{{\"alias\":{s},{s}", .{ esc, row[1..] });
 }
 
 /// `/v1/models` responses carry the per-process LAN token
@@ -6935,7 +6967,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             },
             else => return err,
         };
-    }
+    } else if (global_registry) |r| switch (resolveRequestModelId(r, &g_model_aliases, requested_id, "/v1/load-model")) {
+        .id => |id| requested_id = id,
+        else => {},
+    };
     const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -7083,7 +7118,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
-        .weight = @max(1, d.questions.qs.len),
+        .weight = @max(1, d.count()),
         .window_us = lm.decision_engine.?.batch_window_us,
     };
     scheduler.runGeneration(&req) catch |err| switch (err) {
@@ -7167,7 +7202,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         // A discovered entry is keyed `org/name`, so the path is the only exact handle.
         const by_path = if (global_registry) |r| r.peekByPath(trimmed) else null;
         requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
-    }
+    } else if (global_registry) |r| switch (resolveRequestModelId(r, &g_model_aliases, requested_id, "/v1/unload-model")) {
+        .id => |id| requested_id = id,
+        else => {},
+    };
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
     // the load-model no-op (the peer's owner controls its memory).
@@ -7341,7 +7379,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
+        .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
@@ -8820,7 +8858,7 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -9212,7 +9250,7 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
@@ -12141,10 +12179,12 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
         return null;
     }
-    const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
-        mid
-    else
-        registry.default_id;
+    const effective = switch (resolveRequestModelId(registry, &g_model_aliases, mid, path)) {
+        .id => |id| if (id.len > 0 and !std.mem.eql(u8, id, "mlx-serve")) id else registry.default_id,
+        .unknown_name => registry.default_id,
+        // Dispatch answers 404 and runs nothing.
+        .unknown_path => return null,
+    };
     if (!l.sharedAllows(effective)) return "Model not shared on this host";
     return null;
 }
@@ -12364,6 +12404,36 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
 }
 
+test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("org/Qwen3.6-27B-4bit", "/m/q", 1);
+    _ = try reg.registerStub("qwen", "/m/other", 1);
+    _ = try reg.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    var aliases: model_settings_mod.Cache = .{ .path = "", .settings = try model_settings_mod.parse(a,
+        \\{"/m/q/": {"alias": "q"}, "/m/g": {"alias": "qwen"}, "/m/gone": {"alias": "ghost"}}
+    ) };
+    defer aliases.deinit();
+    const chat = "/v1/chat/completions";
+    try std.testing.expectEqualStrings("org/Qwen3.6-27B-4bit", resolveRequestModelId(reg, &aliases, "q", chat).id);
+    try std.testing.expectEqualStrings("qwen", resolveRequestModelId(reg, &aliases, "qwen", chat).id);
+    try std.testing.expectEqualStrings("org/Qwen3.6-27B-4bit", resolveRequestModelId(reg, &aliases, "q:latest", "/api/chat").id);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "q:latest", chat) == .unknown_name);
+    // An alias for a path nothing registered falls back like any unknown name.
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "ghost", chat) == .unknown_name);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "gpt-4", chat) == .unknown_name);
+}
+
+test "appendAliasedRow: the alias rides the row, the id stays canonical" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    try appendAliasedRow(a, &out, "{\"id\":\"org/Q\"}", "q");
+    try appendAliasedRow(a, &out, "{\"id\":\"g\"}", null);
+    try std.testing.expectEqualStrings("{\"alias\":\"q\",\"id\":\"org/Q\"}{\"id\":\"g\"}", out.items);
+}
+
 test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
@@ -12403,6 +12473,8 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     // dispatch will — here the default is shared, so both pass.
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", "application/json", false) == null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
+    // A PATH names its own entry, never the default: the unshared model's dir is denied.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"/m/q\"}", "application/json", false) != null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
@@ -12420,6 +12492,26 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "resolveRequestModelId: a path names its own entry, never the default model" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    const good = try reg.registerStub("org/good", "/m/org/good", 1);
+    reg.default_id = good.id;
+    _ = try reg.registerStub("org/broken", "/m/org/broken", 1);
+    var aliases: model_settings_mod.Cache = .{ .path = "" };
+    defer aliases.deinit();
+
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "/m/org/broken", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "/m/org/broken/", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "org/broken", "/v1/chat/completions").id);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "/m/org/missing", "/v1/chat/completions") == .unknown_path);
+    // Plain unknown names and the alias keep the default-model fallback.
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "gpt-4", "/v1/chat/completions") == .unknown_name);
+    try std.testing.expectEqualStrings("mlx-serve", resolveRequestModelId(reg, &aliases, "mlx-serve", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("", resolveRequestModelId(reg, &aliases, "", "/v1/chat/completions").id);
 }
 
 test "the route-existence 404 is answered BEFORE the model is resolved" {
@@ -15073,7 +15165,7 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -16995,7 +17087,7 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
@@ -22151,31 +22243,12 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
-test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
+test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     const t = std.testing;
-    // No sidecar loaded → never on, whatever the operator asked for.
-    try t.expect(!defaultEnableMtp(false, false, false, false, false));
-    try t.expect(!defaultEnableMtp(false, true, true, false, false));
-    // Dense target with a sidecar → on by default (unchanged behavior).
-    try t.expect(defaultEnableMtp(true, false, false, false, false));
-    try t.expect(defaultEnableMtp(true, false, true, false, false));
-    // MoE target → OFF by default (the verify-forward routing caution) ...
-    try t.expect(!defaultEnableMtp(true, true, false, false, false));
-    // ... but ON when the operator passed --mtp. Without this, a MoE MTP
-    // checkpoint is unreachable from any client that doesn't send
-    // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
-    try t.expect(defaultEnableMtp(true, true, true, false, false));
-    // DSpark: dsv4's own stages default ON outright — MoE-ness and --mtp
-    // never gate the checkpoint's native draft design.
-    try t.expect(defaultEnableMtp(false, true, false, true, false));
-    try t.expect(defaultEnableMtp(false, false, false, true, false));
-    // A MEASURED native MoE head defaults ON despite is_moe — the
-    // caution above is about a bolted-on sidecar paying expert routing it was
-    // never designed around, and this arch was measured no-worse-than-serial
-    // at every context rung on two prompt shapes.
-    try t.expect(defaultEnableMtp(true, true, false, false, true));
-    // The claim is about the HEAD, so it still needs one loaded.
-    try t.expect(!defaultEnableMtp(false, true, false, false, true));
+    try t.expect(!defaultEnableMtp(false, false));
+    try t.expect(defaultEnableMtp(true, false));
+    // DSpark: dsv4's own stages, loaded without a qwen head.
+    try t.expect(defaultEnableMtp(false, true));
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
@@ -22346,15 +22419,18 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
+    // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
+    // reads "gguf" as llama.cpp.
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, true, "/m/qwen.gguf", ""));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
 }
 
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {
@@ -23575,9 +23651,6 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     const t = std.testing;
-    const saved_force = server_config.default_force_mtp;
-    defer server_config.default_force_mtp = saved_force;
-    server_config.default_force_mtp = false;
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = false;
@@ -23585,8 +23658,8 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     defer configured_kv_quant = saved_boot;
     configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
-    cfg.mtp_override = null;
-    try t.expect(!forceMtpFor(&cfg));
+    cfg.mtp_override = false;
+    try t.expect(!mtpHeadBilled(&cfg));
     const seq: u64 = 200_000;
     const chunk: u64 = 4096;
     const max_tokens: u64 = 8192;

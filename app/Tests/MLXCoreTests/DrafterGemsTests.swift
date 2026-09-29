@@ -87,10 +87,9 @@ final class DrafterGemsTests: XCTestCase {
             "/m/dspark/drafter": ["block_size": 7, "markov_rank": 256, "dflash_config": ["mask_token_id": 1, "target_layer_ids": [1]]],
             "/m/gemma/drafter": ["model_type": "gemma4_assistant"],
         ]
-        let opts = ServerOptions()
-        func badge(_ dir: String, _ o: ModelOverride = ModelOverride(), mtpHead: Bool = false, moe: Bool = false,
+        func badge(_ dir: String, _ o: ModelOverride = ModelOverride(), mtpHead: Bool = false,
                    _ options: ServerOptions = ServerOptions()) -> SocketBadge {
-            DrafterGems.badge(o, modelDir: dir, hasMtpHead: mtpHead, isMoE: moe, options: options) { configs[$0] }
+            DrafterGems.badge(o, modelDir: dir, hasMtpHead: mtpHead, options: options) { configs[$0] }
         }
         XCTAssertEqual(badge("/m/dflash").stone, .sapphire)
         XCTAssertEqual(badge("/m/dflash2").stone, .topaz)
@@ -102,9 +101,7 @@ final class DrafterGemsTests: XCTestCase {
         var empty = ModelOverride(); DrafterSocket.empty.write(into: &empty)
         XCTAssertEqual(badge("/m/dflash2", empty, mtpHead: true), SocketBadge(stone: nil, skull: false))
 
-        var noMoe = opts; noMoe.mtpOnMoE = false
-        XCTAssertEqual(badge("/m/none", mtpHead: true, moe: true, noMoe).stone, nil, "the server keeps a MoE head off by default")
-        XCTAssertEqual(badge("/m/none", ModelOverride(mtp: true), mtpHead: true, moe: true, noMoe).stone, .emerald)
+        XCTAssertEqual(badge("/m/none", ModelOverride(mtp: false), mtpHead: true).stone, nil, "a model's mtp:false turns its head off")
 
         let lossy = ModelOverride(mtpAcceptance: .typical)
         XCTAssertEqual(badge("/m/none", lossy, mtpHead: true), SocketBadge(stone: .emerald, skull: true))

@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
         uses: maxim-lobanov/setup-xcode@v1

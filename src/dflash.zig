@@ -1099,6 +1099,16 @@ fn ownWeightEither(w: *const Weights, key: []const u8, alt: []const u8) !mlx.mlx
     return ownWeight(w, alt);
 }
 
+/// The selector gathers codebook rows with a dense take, so a table shipped
+/// quantized (packed uint32 rows) is refused here instead of failing every draft.
+fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
+    const sh = mlx.getShape(arr);
+    if (sh.len == 2 and sh[1] == @as(c_int, @intCast(rank))) return;
+    log.err("[dflash] candidate_selector.{s}_codebook is {any} {s}, expected [vocab, {d}]: " ++
+        "re-export the drafter with its codebooks left unquantized (bf16)\n", .{ which, sh, @tagName(mlx.mlx_array_dtype(arr)), rank });
+    return error.InvalidDflashCodebook;
+}
+
 /// Load `<prefix>.weight` as an assistant linear. Affine weights with `.scales`
 /// stay packed; block-FP8 weights with `.weight_scale_inv` dequantize to bf16;
 /// dense weights are load-time quantized when requested, else transposed.
@@ -1332,6 +1342,8 @@ pub fn loadDflashQuant(
         errdefer _ = mlx.mlx_array_free(pred);
         const succ = try ownWeightEither(&weights, "candidate_selector.successor_codebook", "candidate_selector.successor_codebook.weight");
         errdefer _ = mlx.mlx_array_free(succ);
+        try checkCodebook(pred, "predecessor", cfg.selector_rank);
+        try checkCodebook(succ, "successor", cfg.selector_rank);
         const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, serve_bits, s);
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
@@ -3248,7 +3260,9 @@ pub const TinyFix = struct {
         return bf;
     }
 
-    pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+    /// `packed_codebooks` writes the selector codebooks 4-bit quantized, the
+    /// shape a generic converter produces.
+    pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, packed_codebooks: bool) !void {
         try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT2_CONFIG });
         const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
         defer testing.allocator.free(st_path);
@@ -3259,8 +3273,20 @@ pub const TinyFix = struct {
         try putV1AssistantWeights(map, s, false);
 
         // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
-        try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
-        try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        if (packed_codebooks) {
+            inline for (.{ "predecessor", "successor" }) |which| {
+                const dense = try bf16Arr(VOCAB, 32, 300, s);
+                defer _ = mlx.mlx_array_free(dense);
+                var lin = try quantizeDense(dense, 4, 32, s);
+                defer lin.deinit();
+                try put(map, "candidate_selector." ++ which ++ "_codebook.weight", lin.w);
+                try put(map, "candidate_selector." ++ which ++ "_codebook.scales", lin.scales);
+                try put(map, "candidate_selector." ++ which ++ "_codebook.biases", lin.biases);
+            }
+        } else {
+            try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
+            try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        }
         try putW(map, "candidate_selector.hidden_projection.weight", SEL_RANK, HIDDEN, 302, s);
 
         // Dynamic convs per layer: base [2, ksize, H] + projection
@@ -3680,7 +3706,7 @@ test "dflash2: loader picks up selector + dyn convs; v1 assistant loads with nei
     defer tmp.cleanup();
     var path_buf: [512]u8 = undefined;
     const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s);
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, false);
 
     var m = try loadDflashQuant(io, allocator, s, dir_path, 0);
     defer m.deinit();
@@ -4486,4 +4512,18 @@ test "bestFirstTree: rows are depth-first, the best child's subtree before its s
     // Taken: 10, 11, 20 under 10, 20 under 11 -> depth-first: 10, 20, 11, 20.
     try std.testing.expectEqualSlices(u32, &.{ 10, 20, 11, 20 }, t.tokens);
     try std.testing.expectEqualSlices(i32, &.{ -1, 0, -1, 2 }, t.parents);
+}
+
+test "dflash2: a quantized selector codebook is refused at load, not at the first draft" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, true);
+
+    try testing.expectError(error.InvalidDflashCodebook, loadDflashQuant(io, allocator, s, dir_path, 0));
 }
