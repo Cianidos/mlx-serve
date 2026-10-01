@@ -80,6 +80,11 @@ struct ModelSettingsSheet: View {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
     }
 
+    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
+    private var hasInt8PrefillRoute: Bool {
+        appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
+    }
+
     private var rows: (mtp: Bool, acceptance: Bool) {
         if isGguf { return (false, false) }
         return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp, dflash: bindsDflash)
@@ -106,6 +111,7 @@ struct ModelSettingsSheet: View {
 
     private var formHeight: CGFloat {
         var n = isGguf ? 2 : 3
+        if hasInt8PrefillRoute { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
@@ -208,6 +214,16 @@ struct ModelSettingsSheet: View {
                     Text("Default").tag("").font(.app(.body))
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
+                }
+                if hasInt8PrefillRoute {
+                Picker("Int8 prefill (lossy)", selection: Binding(
+                    get: { override.int8Prefill.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.int8Prefill = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
                 }
                 if !isGguf {
                     Section {

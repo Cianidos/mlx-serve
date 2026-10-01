@@ -2803,6 +2803,18 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     return try out.toOwnedSlice(allocator);
 }
 
+/// Streaming-only: the head of a think block can no longer grow into any
+/// opener the stream strips (`<…` markers, muse `assistant`/`to=` headers), so
+/// a short first token is reasoning now instead of waiting for 7 bytes.
+pub fn cannotOpenThink(buf: []const u8) bool {
+    const rest = std.mem.trimStart(u8, buf, " \n");
+    if (rest.len == 0 or rest[0] == '<') return false;
+    for ([_][]const u8{ "assistant", "to=" }) |w| {
+        if (std.mem.startsWith(u8, w, rest[0..@min(rest.len, w.len)])) return false;
+    }
+    return true;
+}
+
 /// Streaming-only: true when the buffer TAIL is a partial prefix of a think
 /// opener (`<think>` / `<|channel>thought`). The buffered-stream flush must
 /// hold these bytes back until the tag completes or diverges — flushing them
@@ -7988,6 +8000,17 @@ test "looseRepair does not fabricate a tool call from non-JSON prose" {
         allocator.free(cs);
     }
     try testing.expect(calls == null);
+}
+
+test "cannotOpenThink decides a short think head only once no opener can follow" {
+    try testing.expect(cannotOpenThink("The"));
+    try testing.expect(cannotOpenThink("\nOk"));
+    try testing.expect(!cannotOpenThink("<"));
+    try testing.expect(!cannotOpenThink("<thi"));
+    try testing.expect(!cannotOpenThink(" \n"));
+    try testing.expect(!cannotOpenThink("to"));
+    try testing.expect(!cannotOpenThink("assis"));
+    try testing.expect(!cannotOpenThink(""));
 }
 
 test "endsWithPartialThinkOpen holds back partial opener tails (pi GGUF leak repro)" {
@@ -13719,6 +13742,7 @@ test "the streaming handlers route the think gate through a persistent ThinkScan
 }
 
 test "bench: streaming think gate scans BYTES, memoized vs fresh" {
+    if (!@import("build_options").slow_tests) return error.SkipZigTest;
     // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
     // not merely smaller. Wall clock is unavailable in a hermetic test under
     // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes

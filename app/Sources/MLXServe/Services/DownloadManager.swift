@@ -243,8 +243,8 @@ class DownloadManager: ObservableObject {
 
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
-    /// weight files, PLUS the MTP multi-token-prediction sidecar the server
-    /// auto-loads. Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
+    /// weight files, PLUS the speculation sidecars the server auto-loads (the
+    /// pack's `drafter/`, and the MTP head). Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
     /// (mlx-serve native) and `optiq/mtp.safetensors` (oMLX OptiQ). Without them
     /// an MTP model silently loses its speculative-decoding speedup because a
     /// non-recursive listing returns the dir as a bare entry that the
@@ -266,8 +266,8 @@ class DownloadManager: ObservableObject {
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
             // Depth gate. Variant: exactly the named subfolder's own files
             // (`4bit/config.json`), never anything deeper. Chat default:
-            // top-level files + the MTP sidecar (native `mtp/` dir, or OptiQ's
-            // single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // top-level files + the pack's `drafter/` + the MTP sidecar (native
+            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -276,7 +276,8 @@ class DownloadManager: ObservableObject {
                 guard path.hasPrefix(sub + "/") else { return nil }
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
-                guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
+                guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
+                    || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -998,6 +999,12 @@ class DownloadManager: ObservableObject {
         downloads.removeValue(forKey: gem.repo)
     }
 
+    /// The model's own bytes for a gem fit check: `fits` bills the gem, so the
+    /// pack's `drafter/` must not be counted on both sides.
+    nonisolated static func packBytesWithoutDrafter(_ entries: [[String: Any]]) -> Int64 {
+        selectNeededFiles(from: entries, selection: .chatWithoutDrafter).reduce(0) { $0 + $1.1 }
+    }
+
     /// A fresh download fills its socket with the default gem when it fits in
     /// RAM and the user has not chosen one. A pack's own `drafter/` stays
     /// "auto" (the server finds it); a separate repo is written as a path.
@@ -1010,7 +1017,7 @@ class DownloadManager: ObservableObject {
         let files = PackUpdateCheck.sizes(entries)
         packListings[repoId] = files
         let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
-        let modelGB = Double(Self.selectNeededFiles(from: entries).reduce(0) { $0 + $1.1 }) / 1e9
+        let modelGB = Double(Self.packBytesWithoutDrafter(entries)) / 1e9
         guard let gem = DrafterGems.defaultGem(gems),
               DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
         if gemPath(gem, modelDir: modelDir) == nil {
@@ -1108,9 +1115,19 @@ class DownloadManager: ObservableObject {
         activeTasks[repo] = task
     }
 
+    /// `startUpdate` for one listed model, clearing its update badge once the files landed.
+    func applyUpdate(_ check: UpdateCheck, for model: LocalModel, onFinish: @escaping @MainActor () -> Void) {
+        startUpdate(check) { [weak self] in
+            onFinish()
+            guard let self, self.downloads[check.repo]?.status == .completed else { return }
+            self.updateChecks[model.id] = nil
+            self.packUpdates[model.name] = nil
+        }
+    }
+
     private static func fileSelections(_ selection: UpdateSelection) -> [FileSelection] {
         switch selection {
-        case .chat(let drafter): return [.chatDefault] + (drafter ? [.packFolder(DrafterGems.packFolder)] : [])
+        case .chat(let drafter): return [drafter ? .chatDefault : .chatWithoutDrafter]
         case .variant(let sub): return [.mlxVariant(sub)]
         case .media(let sel): return [sel]
         case .gguf: return []
@@ -1837,16 +1854,17 @@ class DownloadManager: ObservableObject {
         )]
     }
 
-    /// A `.partial` beside a moving progress bar is not an interrupted download,
-    /// so a dir that is the destination of a live transfer loses that defect.
-    nonisolated static func clearingInFlightDefects(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
+    /// The destination of a live transfer is DOWNLOADING: not broken (its
+    /// `.partial` and missing shards are progress), and not loadable either —
+    /// between two files it can look whole while its tokenizer has yet to land.
+    nonisolated static func markingInFlight(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
         guard !activeDirs.isEmpty else { return models }
         return models.map { m in
-            guard m.defect == .interruptedDownload,
-                  activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
-            var fixed = m
-            fixed.defect = nil
-            return fixed
+            guard activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
+            var marked = m
+            marked.defect = nil
+            marked.isDownloading = true
+            return marked
         }
     }
 
@@ -2051,7 +2069,7 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.clearingInFlightDefects(out, activeDirs: inputs.inFlightDirs)
+        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.

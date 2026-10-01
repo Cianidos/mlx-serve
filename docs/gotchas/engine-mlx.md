@@ -28,6 +28,12 @@ A 27B 8-bit agent turn on a 64 GB Mac, 46k of 47.7k tokens warm, got `PrefillDoe
 - Same pass: a repeated ONE-token prompt fully matched its own entry and restored it whole, leaving nothing to forward; `Generator.initWithOptions` segfaulted. The lookup now declines it (cold prefill).
 - Guards: `restore by move ON DEMAND` and `a one-token prompt that hits its own entry` unit tests; live `~/claude-tmp/rel-2696-20260923/move/move_repro.py` (red 400 on the old binary, green 200 with byte-equal output vs the share on Qwen3.5-2B, gemma-4-e4b, kv8).
 
+### A disk restore was billed as a cold prompt (PR #621)
+The SSD tier restores into arrays the SLOT owns, but both disk-restore returns in `lookupAndRestoreWithMedia` leave `LookupResult.checked_out` false — that field means a RAM entry moved. `scheduler` took `warm_will_donate` straight from it, so `WarmPrefix.creditedRows` returned 0 and the estimator billed the WHOLE prompt instead of the new tail.
+Live (M5 Pro 48 GB, 27B Q5, 26.9.3, single stream): 78,156 of 78,475 tokens already persisted, billed 4,790 MB, refused by 1,218 MB; a 128k turn restored 121,833/123,689 and was refused by **93 MB**. Every one reported `reclaimable=0 MB` with an EMPTY hot cache, so eviction could not help — the bill was the whole problem, and the refusal had already cost the entries eviction dropped on the way in. 48 refusals in one log, at 40k-128k prompts.
+- Fix: a disk restore sets `slot_owned`; the scheduler credits `checked_out or slot_owned` and skips `checkoutRestored` for a disk restore (there is no RAM entry to take over).
+- Guard: `slot_owned` assertions in the restart-shape and hybrid-disk-restore unit tests, red-on-revert.
+
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 
@@ -4428,6 +4434,8 @@ Six items after batched decode landed; the numbers are one M4 Max, the 4-bit pac
 
 **Row-batched kernels.** The three hc kernels (`mlxserve_hc_read_n/d/u`) take a row axis on the grid (`HC_FUSED_MAX_ROWS` 16): every per-row buffer is offset once at the top of the kernel, weights are read per row, the D/U tiles are unchanged. `wi_in` (hc elements) lands in `constant` address space, so it is indexed, not rebound to a `device` pointer — the first cut compiled for WR=0 and crashed on the pending-write instantiation. `gdnPreworkFused` folds B into its row axis (`row = b*S + r`; conv taps and the next conv state index per batch, q/k/v/g/beta flat) and `gdnNormGateFused` takes `batch*seq` rows. Bars: the 3-row hc read is BIT-identical to three 1-row reads stacked (plain and pending arms); the B=2 prework is bit-identical per batch to the B=1 kernel; `test_batched_equivalence.sh` 4/4 on the pack (forced N=1 byte-identical). Meter after: S=1 16.0 (unchanged), S=2 22.35 (−8.4%), S=4 30.6 (−4.7%). Live, new vs HEAD, serial flat (62.0/61.7/54.8 vs 61.9/61.4/54.4): prose 2 streams 36.8 → 41.3 per stream (aggregate 70.3 → 78.4, 1.14x → 1.28x), 4 streams 27.5 → 29.7 (103.4 → 111.2, 1.69x → 1.81x), 8.5k 2 streams 28.4 → 30.6 per stream. MTP rounds barely move (new vs HEAD, `qwen4_ab.sh mtp`: code 81.8 vs 78.0, prose 61.1 vs 60.7, 8.5k 58.4 vs 58.5 median tok/s) — the hc chain was ~1.5 ms of a 34 ms round. Below the plan's 1.5x/2.3x bar; the remaining gap is the MoE at N rows, and two cheap attempts on it were losses: a per-row `gatherQmv` loop (each row through the in-place gather + fused down-reduce, concatenated) was flat at S=2 (24.6 vs 24.4) and −11% at S=4 (35.8 vs 32.1); the multi-row gather kernel had already measured +38% at S=4. The sort path stays; a grouped expert kernel is the M5 plan's item 2.
 
+**UV up/mix (2026-09-28).** Direct (non-compiled) hc reads at 2..8 rows with 8-bit HC weights take `mlxserve_hc_read_u_v` (lanes over weight rows, 16-byte loads; compiled/prepared graphs trace placeholder weights and keep the per-row kernel), whose re-ordered f32 sums move rare mixed elements by a few bf16 ulps, so the stacked-rows bit-identity above now holds only for 4-bit HC weights or `MLX_SERVE_HC_UV=0`.
+
 **The MTP controller was not the lever.** Yesterday's "auto picks depth 3 where fixed 2 wins" (prose 59.6 vs 67.3) did not reproduce: today, same script, fixed-2 prose 58.5/58.5/61.7 vs auto 60.1/57.8/58.2 vs serial 61, and 8.5k fixed-2 53.8 vs auto 54.4 vs serial 54.5 — auto ≈ fixed-2 within noise, code auto 88.6 vs fixed-2 82.7. `MLX_SERVE_MTP_TRACE=1` shows the plan already at `m_avg=2.00` on prose with round `total≈34 ms` (eval 26.5 + verify 6.3), i.e. a depth-2 round is 2.05 serial forwards (S=1 16.0 vs S=3 ~24 in the meter, plus draft + sync), so break-even needs >1.05 accepted per round and prose sits at 1.0–1.06. A fresh table (`MLX_SERVE_ROUND_COST_PERSIST=0`) changed nothing, so stale persisted cells were not it either — though the persisted `w2` cell (24.97 ms/tok at n=435, never re-sampled across three runs while `w1` grew to 2120) is a real smell: the table key is (chip, model, quant, OS build), not the engine build, and a cell measured before a verify-path change keeps its number until a trial happens to land on it. No controller change; the round cost is the lever, and MTP stays opt-in on this arch.
 
 **Three bugs the bars found.** (1) `--no-mtp` did nothing on qwen4: the in-checkpoint head is loaded with the trunk and `entry.mtp` bound it regardless of `params.mtp_enabled`, so the `--no-mtp` baseline of `test_mtp_equivalence.sh` ran MTP rounds (`MTP_FORCE_ENABLE=1` injects `enable_mtp:true`). Gated on `params.mtp_enabled`; `slotExclusiveDecode` now keys on the ENTRY's head, not the transformer field. The script also needed the head's own load line (`[qwen4] MTP head loaded`) beside `MTP head ready`, and the marker `language_model.mtp.fc_hidden.weight`; 11/11 on the pack. (2) `--no-vision` answered image turns: the parts were parsed, the tower was absent, the image was dropped and the model said "Sky" for a house with a 200 (prompt 24 tokens). `server.mediaRejectReason` refuses media by name on all three surfaces when `lm.vision_encoder == null`; `test_qwen4_exp.sh` [11] reboots `--no-vision` (tower line absent, capabilities drop `vision`, active_bytes 73.48 → 71.11 GB, text answers, image 400 naming the tower). (3) The QSA prefill mask (`[S, kv]` per layer, 4096 × 25k = 410 MB) was in no bill: `server.qsaMaskBytes` (4 B per query-key for one live layer) rides `prefillTransientReserve` at kv = chunk and the admission guard at the prompt length; a qwen4 twin now steps a rung the qwen3_5 twin keeps at the same ceiling.
@@ -5371,3 +5379,55 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Fix: lookup rounds verify with exact acceptance whatever the installed mode
   (`acceptGraphFor` / `acceptPrefixFor`), keeping a copy with probability p. MTP drafts keep typical.
 - Guard: `a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance`.
+
+## A 1- or 2-node draft tree committed an unwritten conv row (2026-09-30)
+
+- Defect: with a DFlash tree drafter bound, a round whose tree has fewer than 3 nodes
+  (`--draft-block-size 2`, the width chooser at width 1, any off-NAX lattice of one node)
+  gave different bytes from the same request with the drafter off.
+- Cause: the tree prework kernel's grid runs one threadgroup per window row (`t < TL`) and
+  copied the conv window's three state rows from those same threadgroups (`if (t < 3)`), so
+  at TL = 1 rows 1 and 2 of the conv input were never written, and the commit read them.
+- Fix: each threadgroup copies the state rows `t, t + TL, ...` below 3, whatever TL is.
+- Guard: `gdn_decode.recurTree: every node of a draft tree equals a chain over its own
+  path` runs the 1-, 2- and 8-node prefixes of the same tree (the conv input is compared
+  whole against `[conv_state; window rows]`).
+
+## The DFlash yield gate sent a winning drafter to plain decode (2026-09-30)
+
+- Defect: 27B 4-bit with its tree drafter at block 16, a sampled prose request at temp 1.0
+  decoded at 48 tok/s, below the 86-123 tok/s the same request gets serial with MTP, while
+  the same prompt at `--draft-block-size 8` ran 108-133.
+- Cause: the runtime gate's bar (2.0 accepted/round, scaled by width) was calibrated when a
+  block-16 round cost about two serial steps; this branch's rounds cost 1.3 (28 ms against a
+  21 ms step), so a request accepting 1.9/round was still emitting tokens at 7.9 ms each
+  (`[spec-stats] table=<2k:w0:21.74,w15:7.93`) when the gate disabled it, and the sticky
+  fallback is the plain decoder, not MTP.
+- Fix: `checkDflashRuntimeGate` asks the round-cost table first (`roundBeatsSerial`): a width
+  measured cheaper per emitted token than the bucket's serial step stays on whatever its
+  acceptance. The constant still decides until both cells have samples, so the first such
+  request on a cold table still falls to plain (which is what measures the plain cell).
+- Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
+  unmeasured is unknown`.
+
+## A kernel config cached by ROW COUNT handed a 16-slot tick a 16-wide verify's shape (2026-10-01)
+
+- Defect: the 27B 4-bit with its drafter served 16 concurrent streams and failed every stream
+  past that: `[concatenate] ... (16,3,10240), (1,16,10240)` in the GDN conv path, then
+  `batched decode aborted ... failing all 16 slots`. Never seen in a single-stream sweep.
+- Cause: `add_norm` keyed its Metal config on `rows = B*S`, and the config carries the output
+  SHAPE. A speculating slot's 16-token verify ran as `[1,16,D]`; the next 16-slot batched tick,
+  `[16,1,D]`, had the same row count, reused the config and got its hidden state back as
+  `[1,16,D]`. The GDN layer's fused step then declined (`qsh[0] != batch`) and the fallback
+  concatenated the merged `[16,3,C]` state with a `[1,16,C]` input. Three new things met:
+  the NAX-wide block of 16, 16 slots batching, and both on one server.
+- Fix: `CfgKey` carries `b` and `s`, the rule every `metal_kernel` config cache already states.
+- Guard: `addNorm returns each call's own [B,S,D] layout at one row count` (hermetic) and
+  `tests/test_batched_past_block_width.sh` (20 streams on a drafter-bound GDN pack).
+
+## Raw BF16 n-gram tables have no quantization groups
+
+Sushi Flash Next packs ship a raw BF16 n-gram table with `bits=16, group_size=0`;
+the group-size range check ran before the BF16 branch and failed the load with
+`NgramTableBits`. It now runs only in the quantized branch. Guard: `ngram table
+raw BF16 rows do not depend on quantization group size`.

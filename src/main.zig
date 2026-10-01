@@ -1350,7 +1350,7 @@ pub fn main(init: std.process.Init) !void {
     {
         var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
         defer settings.deinit(allocator);
-        scheduler_mod.applyModelSettings(config, chat_config, &settings);
+        scheduler_mod.applyModelSettings(config, chat_config, &settings, enable_mtp);
     }
     config.applyTokenizer(tok, chat_config.eos_token);
 

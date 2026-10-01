@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const gguf_meta = @import("gguf_meta.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
@@ -370,6 +371,8 @@ const GgufScan = struct {
     pick: ?[]u8 = null,
     pick_bytes: u64 = 0,
     saw_mmproj: bool = false,
+    /// An embedding GGUF (`gguf_meta.declaresPooling`) was passed over.
+    saw_embedding: bool = false,
 };
 
 /// Scan an iterable dir for LLM `.gguf` entries. Symlinked files count
@@ -389,6 +392,10 @@ fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !Gguf
         }
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file) continue;
+        if (gguf_meta.fileDeclaresPooling(io, dir.*, entry.name)) {
+            scan.saw_embedding = true;
+            continue;
+        }
         if (scan.pick == null or std.mem.lessThan(u8, entry.name, scan.pick.?)) {
             if (scan.pick) |p| allocator.free(p);
             scan.pick = try allocator.dupe(u8, entry.name);
@@ -434,6 +441,7 @@ pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
 /// a file, return a dup. Errors:
 ///   error.NoGgufFile         — no .gguf files at all
 ///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
+///   error.EmbeddingGgufFile  — only embedding GGUFs (or the path is one)
 ///
 /// Does NOT log on error — the caller decides whether the error is "fatal
 /// user load" (then call `logResolveGgufError`) or "silent probe".
@@ -442,6 +450,7 @@ pub fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u
         if (isMmprojGgufBasename(std.fs.path.basename(path))) {
             return error.OnlyMmprojGgufFile;
         }
+        if (gguf_meta.fileDeclaresPooling(io, std.Io.Dir.cwd(), path)) return error.EmbeddingGgufFile;
         return allocator.dupe(u8, path);
     }
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
@@ -451,6 +460,7 @@ pub fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u
         defer allocator.free(p);
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(path), p });
     }
+    if (scan.saw_embedding) return error.EmbeddingGgufFile;
     if (scan.saw_mmproj) return error.OnlyMmprojGgufFile;
     return error.NoGgufFile;
 }
@@ -470,6 +480,7 @@ pub fn logResolveGgufError(path: []const u8, err: anyerror) void {
                 log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
             }
         },
+        error.EmbeddingGgufFile => log.err("'{s}' is an embedding GGUF (it declares a pooling type): the GGUF engines here generate text and do not serve embeddings. Use an MLX embedding model for /v1/embeddings.\n", .{path}),
         error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
         else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
     }
@@ -2240,4 +2251,40 @@ test "a Kev pack is a decision model even though its root config.json is its qwe
     try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
     try testing.expectEqualStrings("qwen3_5", result.models[1].model_type);
     try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
+}
+
+test "resolveGgufFile: an embedding GGUF is never the chat model, and says so by name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const emb = try gguf_meta.buildHeader(allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "gemma-embedding" } },
+        .{ .key = "gemma-embedding.pooling_type", .value = .{ .u32_v = 1 } },
+    });
+    defer allocator.free(emb);
+    try tmp.dir.createDirPath(io, "emb-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "emb-only/embeddinggemma-Q4_0.gguf", .data = emb });
+    try tmp.dir.createDirPath(io, "mixed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mixed/a-embed.gguf", .data = emb });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mixed/b-chat.gguf", .data = "x" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const only = try std.fmt.allocPrint(allocator, "{s}/emb-only", .{root});
+    defer allocator.free(only);
+    try testing.expectError(error.EmbeddingGgufFile, resolveGgufFile(io, allocator, only));
+    const direct = try std.fmt.allocPrint(allocator, "{s}/emb-only/embeddinggemma-Q4_0.gguf", .{root});
+    defer allocator.free(direct);
+    try testing.expectError(error.EmbeddingGgufFile, resolveGgufFile(io, allocator, direct));
+    const mixed = try std.fmt.allocPrint(allocator, "{s}/mixed", .{root});
+    defer allocator.free(mixed);
+    const picked = try resolveGgufFile(io, allocator, mixed);
+    defer allocator.free(picked);
+    try testing.expect(std.mem.endsWith(u8, picked, "/mixed/b-chat.gguf"));
+
+    var res = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 1), res.models.len);
+    try testing.expectEqualStrings("mixed", res.models[0].id);
 }
