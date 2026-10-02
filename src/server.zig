@@ -13091,8 +13091,8 @@ fn formatChatUsage(
 
 fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
     return try std.fmt.allocPrint(allocator,
-        \\{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}
-    , .{ prompt_tokens, completion_tokens, cached_tokens });
+        \\{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
+    , .{ prompt_tokens - cached_tokens, completion_tokens, cached_tokens });
 }
 
 fn formatTimingsObject(
@@ -16469,10 +16469,8 @@ fn handleAnthropicStreaming(
             try sendAnthropicEvent(stream, "content_block_stop", sd2);
         }
 
-        // message_delta. Scheduler accounts for any prompt-cache hits in `ts.prompt_tokens`.
-        // cache_read_input_tokens rides here (not message_start) because the
-        // prefix-cache hit count is only known after prefill; clients merge
-        // message_delta usage into the final message per Anthropic semantics.
+        // Cache hits are known after prefill. Cumulative usage replaces the
+        // provisional message_start counts with disjoint input buckets.
         {
             const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens);
             defer allocator.free(md);
@@ -16495,10 +16493,11 @@ fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name
 }
 
 fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
-    _ = prompt_tokens;
+    const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens);
+    defer allocator.free(usage);
     return try std.fmt.allocPrint(allocator,
-        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-    , .{ stop_reason, stop_seq_json, completion_tokens, cached_tokens });
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
+    , .{ stop_reason, stop_seq_json, usage });
 }
 
 /// Emit a text_delta event for Anthropic streaming.
