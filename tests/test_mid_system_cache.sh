@@ -85,7 +85,7 @@ for round_index in range(1 if mode == "restart" else 4):
                                     "tools": tools, "max_tokens": 8, "temperature": 0, "stream": mode == "restart" or round_index % 2 == 1,
                                     "thinking": {"type": "enabled", "budget_tokens": 1024}})
     usage = answer["usage"]
-    total, cached = usage["input_tokens"], usage.get("cache_read_input_tokens", 0)
+    total, cached = sum(usage.get(key, 0) for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")), usage.get("cache_read_input_tokens", 0)
     if mode == "restart" or round_index > 0:
         assert cached >= total * 0.85, f"prefix lost: cached={cached}, total={total}"
     print(f"PASS {mode} round {round_index + 1}: cached={cached}/{total}")
