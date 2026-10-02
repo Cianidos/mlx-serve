@@ -170,15 +170,23 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     return c;
 }
 
-/// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
-/// not one, ships packed already (`quantization` in its config) or loads dense.
+/// The affine load width for a dense DFlash sidecar; 0 bills source bytes
+/// for non-DFlash, packed or block-FP8 checkpoints, and dense serving.
 pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u32 {
     const content = readConfigFile(io, allocator, dir) catch return 0;
     defer allocator.free(content);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
     defer parsed.deinit();
     if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
-    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
+    if (parsed.value.object.get("quantization") != null) return 0;
+    if (parsed.value.object.get("quantization_config")) |q| {
+        if (q == .object) if (q.object.get("quant_method")) |method| {
+            if (method == .string and std.mem.eql(u8, method.string, "fp8")) return 0;
+        };
+    }
+    var cfg = parseConfigFromJson(allocator, content) catch return 0;
+    defer cfg.deinit(allocator);
+    return resolveQuantBits(quantBitsFromEnv(), transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark());
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -499,7 +507,7 @@ pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, w
 
 /// GDN targets cap at the fused recurrence's widest supported verify width.
 pub fn targetBlockCap(config: *const ModelConfig) u32 {
-    return if (config.supportsBatchedGdnDecode()) @intCast(gdn_decode.MAX_SEQ) else std.math.maxInt(u32);
+    return if (config.supportsBatchedGdnDecode()) @intCast(gdn_decode.FOLD_MAX_SEQ) else std.math.maxInt(u32);
 }
 
 /// True when this machine has a verify lane for widths past the split-K
@@ -544,16 +552,29 @@ pub fn quantBitsFromEnv() u32 {
     };
 }
 
-/// NAX serves DSpark's 3-bit rows efficiently; older GPUs and DFlash families keep 8-bit.
+/// NAX uses 3-bit DSpark or 4-bit DFlash; older GPUs keep 8-bit.
 pub fn autoQuantBits(nax: bool, dspark: bool) u32 {
-    return if (nax and dspark) 3 else DEFAULT_QUANT_BITS;
+    if (!nax) return DEFAULT_QUANT_BITS;
+    return if (dspark) 3 else 4;
 }
 
-test "autoQuantBits: DSpark uses 3-bit on NAX; other pairings use 8-bit" {
+fn resolveQuantBits(bits: u32, nax: bool, dspark: bool) u32 {
+    return if (bits == AUTO_QUANT_BITS) autoQuantBits(nax, dspark) else bits;
+}
+
+test "autoQuantBits: DSpark uses 3-bit on NAX; other defaults stay unchanged" {
     try testing.expectEqual(@as(u32, 3), autoQuantBits(true, true));
-    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(true, false));
+    try testing.expectEqual(@as(u32, 4), autoQuantBits(true, false));
     try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, true));
     try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, false));
+}
+
+test "sidecar quant width resolves automatic before memory billing" {
+    try testing.expectEqual(@as(u32, 3), resolveQuantBits(AUTO_QUANT_BITS, true, true));
+    try testing.expectEqual(@as(u32, 4), resolveQuantBits(AUTO_QUANT_BITS, true, false));
+    try testing.expectEqual(@as(u32, 8), resolveQuantBits(AUTO_QUANT_BITS, false, true));
+    try testing.expectEqual(@as(u32, 0), resolveQuantBits(0, true, true));
+    try testing.expectEqual(@as(u32, 6), resolveQuantBits(6, true, true));
 }
 
 /// Widest supported group that divides the contraction dim, or null when the
@@ -1335,10 +1356,7 @@ pub fn loadDflashQuant(
 ) !DflashModel {
     var cfg = try parseConfig(io, allocator, model_dir);
     errdefer cfg.deinit(allocator);
-    const serve_bits = if (bits == AUTO_QUANT_BITS)
-        autoQuantBits(transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark())
-    else
-        bits;
+    const serve_bits = resolveQuantBits(bits, transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark());
 
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
@@ -1617,6 +1635,19 @@ fn projectHeads(
         s,
     ));
     return roped;
+}
+
+fn contextSkip(layer_type: LayerType, base_pos: usize, ctx_len: usize, anchor_pos: usize, window: u32, fixed_anchor: bool) usize {
+    if (layer_type != .sliding_attention) return 0;
+    const visible = if (fixed_anchor) window else window - 1;
+    return @min(ctx_len, (anchor_pos -| visible) -| base_pos);
+}
+
+test "dflash: trimmed context keeps the Speculators fixed-window boundary" {
+    try testing.expectEqual(@as(usize, 2), contextSkip(.sliding_attention, 0, 10, 10, 8, true));
+    try testing.expectEqual(@as(usize, 3), contextSkip(.sliding_attention, 0, 10, 10, 8, false));
+    try testing.expectEqual(@as(usize, 0), contextSkip(.sliding_attention, 4, 6, 10, 8, true));
+    try testing.expectEqual(@as(usize, 0), contextSkip(.full_attention, 0, 10, 10, 8, true));
 }
 
 /// Additive attention bias `[1, 1, q_len, kv_len]` for one assistant layer,
@@ -2667,10 +2698,7 @@ pub fn forwardBlock(
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
         // A sliding layer never sees context before the first query's window:
         // attend over the rest, so the cost stops growing with the context.
-        const skip: usize = if (lw.layer_type == .sliding_attention)
-            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
-        else
-            0;
+        const skip = contextSkip(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, cfg.sliding_window, cfg.sliding_window_fixed_anchor);
         var kv_k = view.k;
         var kv_v = view.v;
         var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
@@ -2883,6 +2911,19 @@ const REDHAT_QWEN38_DSPARK_CONFIG_JSON =
 
 // Speculators exports auxiliary hidden-state indices, where hidden state 4 is
 // the output of decoder layer 3. The runtime capture seam names decoder layers.
+test "dflash: block-FP8 sidecar memory billing keeps its source bytes" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const json = try std.mem.replaceOwned(u8, allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON, "\"markov_rank\": 256,", "\"markov_rank\": 256, \"quantization_config\": {\"quant_method\": \"fp8\"},");
+    defer allocator.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    try testing.expectEqual(@as(u32, 0), sidecarQuantBits(io, allocator, dir));
+}
+
 test "dflash: Speculators DSpark config normalizes nested geometry and auxiliary layer ids" {
     const allocator = testing.allocator;
 
@@ -3142,12 +3183,12 @@ test "dflash: block size resolves from config and target verify width" {
     try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
 }
 
-test "dflash: GDN targets cap at the fused recurrence width" {
+test "dflash: GDN targets cap at the fused recurrence fold width" {
     var cfg = ModelConfig{};
     try testing.expectEqual(std.math.maxInt(u32), targetBlockCap(&cfg));
     cfg.model_type = "qwen3_5_moe";
     cfg.full_attention_interval = 4;
-    try testing.expectEqual(@as(u32, @intCast(gdn_decode.MAX_SEQ)), targetBlockCap(&cfg));
+    try testing.expectEqual(@as(u32, @intCast(gdn_decode.FOLD_MAX_SEQ)), targetBlockCap(&cfg));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
