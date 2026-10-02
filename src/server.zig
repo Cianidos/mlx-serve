@@ -13092,7 +13092,7 @@ fn formatChatUsage(
 fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
     return try std.fmt.allocPrint(allocator,
         \\{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
-    , .{ prompt_tokens - cached_tokens, completion_tokens, cached_tokens });
+    , .{ prompt_tokens -| cached_tokens, completion_tokens, @min(cached_tokens, prompt_tokens) });
 }
 
 fn formatTimingsObject(
@@ -22304,6 +22304,7 @@ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
         .{ .prompt = 100, .cached = 40, .input = 60 },
         .{ .prompt = 92934, .cached = 91863, .input = 1071 },
         .{ .prompt = 100, .cached = 100, .input = 0 },
+        .{ .prompt = 100, .cached = 101, .input = 0 },
     }) |case| {
         const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached);
         defer a.free(json);
@@ -22316,7 +22317,7 @@ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
         try testing.expectEqual(@as(i64, case.prompt), input + created + cached);
         try testing.expectEqual(@as(i64, case.input), input);
         try testing.expectEqual(@as(i64, 0), created);
-        try testing.expectEqual(@as(i64, case.cached), cached);
+        try testing.expectEqual(@as(i64, @min(case.cached, case.prompt)), cached);
         try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
 
         const openai = try formatChatUsage(a, case.prompt, 126, case.cached, "");
@@ -22331,7 +22332,7 @@ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
 }
 
 test "Anthropic usage: message_delta overwrites provisional message_start counts" {
-    for ([_]u32{ 0, 40000, 91863, 92934 }) |cached_tokens| {
+    for ([_]u32{ 0, 40000, 91863, 92934, 92935 }) |cached_tokens| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -22349,9 +22350,9 @@ test "Anthropic usage: message_delta overwrites provisional message_start counts
         const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
         const cached = usage.get("cache_read_input_tokens").?.integer;
         try testing.expectEqual(@as(i64, 92934), input + created + cached);
-        try testing.expectEqual(@as(i64, 92934 - cached_tokens), input);
+        try testing.expectEqual(@as(i64, 92934 -| cached_tokens), input);
         try testing.expectEqual(@as(i64, 0), created);
-        try testing.expectEqual(@as(i64, cached_tokens), cached);
+        try testing.expectEqual(@as(i64, @min(cached_tokens, 92934)), cached);
         try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
     }
 }
