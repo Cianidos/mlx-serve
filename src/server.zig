@@ -13089,6 +13089,12 @@ fn formatChatUsage(
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
+fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}
+    , .{ prompt_tokens, completion_tokens, cached_tokens });
+}
+
 fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
@@ -15639,17 +15645,17 @@ fn handleAnthropicNonStreaming(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    defer allocator.free(usage);
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
         stop_seq_json,
-        prompt_token_count,
-        result.completion_tokens,
-        result.cached_tokens,
+        usage,
         timings_field,
     });
     defer allocator.free(response);
@@ -15758,9 +15764,7 @@ fn handleAnthropicStreaming(
 
     // message_start
     {
-        const data = try std.fmt.allocPrint(allocator,
-            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ nowMs(stream.io), model_name, prompt_token_count });
+        const data = try formatAnthropicMessageStart(allocator, nowMs(stream.io), model_name, prompt_token_count);
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -16470,9 +16474,7 @@ fn handleAnthropicStreaming(
         // prefix-cache hit count is only known after prefill; clients merge
         // message_delta usage into the final message per Anthropic semantics.
         {
-            const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
+            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens);
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -16484,6 +16486,19 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+}
+
+fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name: []const u8, prompt_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
+    , .{ id, model_name, prompt_tokens });
+}
+
+fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    _ = prompt_tokens;
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
+    , .{ stop_reason, stop_seq_json, completion_tokens, cached_tokens });
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -22281,6 +22296,65 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
+    const a = testing.allocator;
+    for ([_]struct { prompt: u32, cached: u32, input: u32 }{
+        .{ .prompt = 100, .cached = 0, .input = 100 },
+        .{ .prompt = 100, .cached = 40, .input = 60 },
+        .{ .prompt = 92934, .cached = 91863, .input = 1071 },
+        .{ .prompt = 100, .cached = 100, .input = 0 },
+    }) |case| {
+        const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object;
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, case.prompt), input + created + cached);
+        try testing.expectEqual(@as(i64, case.input), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, case.cached), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+
+        const openai = try formatChatUsage(a, case.prompt, 126, case.cached, "");
+        defer a.free(openai);
+        const chat_usage = try std.json.parseFromSlice(std.json.Value, a, openai, .{});
+        defer chat_usage.deinit();
+        const obj = chat_usage.value.object;
+        try testing.expectEqual(@as(i64, case.prompt), obj.get("prompt_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.prompt) + 126, obj.get("total_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.cached), obj.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "Anthropic usage: message_delta overwrites provisional message_start counts" {
+    for ([_]u32{ 0, 40000, 91863, 92934 }) |cached_tokens| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const start = try formatAnthropicMessageStart(a, 1, "mlx-serve", 92934);
+        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens);
+        const start_event = try std.json.parseFromSliceLeaky(std.json.Value, a, start, .{});
+        const delta_event = try std.json.parseFromSliceLeaky(std.json.Value, a, delta, .{});
+        try testing.expectEqualStrings("message_start", start_event.object.get("type").?.string);
+        try testing.expectEqualStrings("message_delta", delta_event.object.get("type").?.string);
+        var usage = start_event.object.get("message").?.object.get("usage").?.object;
+        try testing.expectEqual(@as(i64, 92934), usage.get("input_tokens").?.integer);
+        var fields = delta_event.object.get("usage").?.object.iterator();
+        while (fields.next()) |field| try usage.put(a, field.key_ptr.*, field.value_ptr.*);
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, 92934), input + created + cached);
+        try testing.expectEqual(@as(i64, 92934 - cached_tokens), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, cached_tokens), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+    }
 }
 
 test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
