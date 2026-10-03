@@ -5,6 +5,7 @@ const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const generation_settings = @import("generation_settings.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const drafter_mod = @import("drafter.zig");
@@ -2106,6 +2107,12 @@ pub fn serve(
     }
 
     deinitGlobalResponseStore();
+    if (active_conn_threads.load(.acquire) == 0) {
+        global_generation_settings.deinit();
+        model_generation_settings.deinit();
+        global_generation_settings = .{};
+        model_generation_settings = .{};
+    }
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -2521,13 +2528,16 @@ fn handleConnection(
     // tray polls every 3s). Nothing resident means nothing to report — the same
     // body the `NoDefaultModel` arm below already sends.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        var model_path: ?[]const u8 = null;
         const resident = if (registry.resolveEntry(requested_model_id)) |e| blk: {
             registry.mutex.lockUncancelable(stream.io);
             defer registry.mutex.unlock(stream.io);
+            model_path = try allocator.dupe(u8, e.path);
             break :blk e.state == .ready;
         } else |_| false;
+        defer if (model_path) |p| allocator.free(p);
         if (!resident) {
-            try handlePropsNoModel(allocator, stream);
+            try handlePropsUnloaded(allocator, stream, model_path);
             return;
         }
     }
@@ -7630,7 +7640,10 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const generation_json = generationSettingsProps(policy_arena.allocator(), stream.io, lm.path) catch ",\"generation_defaults\":{\"error\":\"invalid_generation_settings\"}";
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, generation_json });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -7655,14 +7668,21 @@ fn residentWeightsBytes(io: std.Io) u64 {
 /// `MemoryInfo.parse` client-side reads only that key — with the model
 /// fields omitted (there is no model config to describe).
 fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
+    return handlePropsUnloaded(allocator, stream, null);
+}
+
+fn handlePropsUnloaded(allocator: std.mem.Allocator, stream: *Conn, model_path: ?[]const u8) !void {
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const generation_json = generationSettingsProps(policy_arena.allocator(), stream.io, model_path) catch ",\"generation_defaults\":{\"error\":\"invalid_generation_settings\"}";
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, generation_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -8479,7 +8499,10 @@ fn handleChatCompletions(
     // gate below reads `config.has_hybrid_layers` (valid for every model incl. the
     // GGUF stub), so the transformer is never needed at this level.
     const tok = lm.tokenizer.?;
-    const chat_config = lm.chat_config.?;
+    var resolved_chat_config = lm.chat_config.?.*;
+    resolved_chat_config.default_enable_thinking = null;
+    resolved_chat_config.default_reasoning_effort = null;
+    const chat_config = &resolved_chat_config;
     const config = lm.config.?;
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
@@ -8497,7 +8520,18 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
         return;
     }
-    const root = parsed.value.object;
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .chat) catch |err| {
+        log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
+        if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
+        } else {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "generation_settings_error", "Generation settings are invalid; correct generation-settings.json or the model's generation_defaults", 503);
+        }
+        return;
+    };
+    const root = policy.root;
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
@@ -9206,8 +9240,22 @@ fn handleChatCompletions(
     // whole (closed) thought instead of trimming it.
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
+    generation_settings.validateThinkingFallback(policy, enable_thinking) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "Structured output cannot honor the locked thinking policy on this model", 400);
+        return;
+    };
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
-    if (think_bound) |*tb| sampling.think_bound = tb;
+    if (enable_thinking and policy.locked(.reasoning_budget) and reasoning_budget >= 0 and
+        (think_bound == null or std.mem.eql(u8, config.model_type, "diffusion_gemma"))) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This model cannot enforce a locked thinking budget at decode; unlock the budget or use a supported reasoning protocol", 400);
+        return;
+    }
+    if (think_bound) |*tb| {
+        tb.enforced = policy.locked(.reasoning_budget);
+        sampling.think_bound = tb;
+    }
+
+    try logGenerationSettings(policy, allocator, lm, sampling, effective_max_tokens, enable_thinking, reasoning_budget);
 
     var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
     defer if (tool_force) |tf| allocator.free(tf.forced);
@@ -9259,7 +9307,18 @@ fn handleCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
         return;
     }
-    const root = parsed.value.object;
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .completions) catch |err| {
+        log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
+        if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
+        } else {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "generation_settings_error", "Generation settings are invalid; correct generation-settings.json or the model's generation_defaults", 503);
+        }
+        return;
+    };
+    const root = policy.root;
     const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
@@ -9428,6 +9487,8 @@ fn handleCompletions(
         .presence_penalty = presence_penalty_c,
         .seed = seed,
     };
+
+    try logGenerationSettings(policy, allocator, lm, sampling, effective_max_tokens, null, null);
 
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
@@ -10064,6 +10125,90 @@ fn nonStreamingViaScheduler(
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
     };
+}
+
+fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
+    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (repeat > 0) return repeat;
+    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    return if (frequency > 0) 1.0 + frequency else 1.0;
+}
+
+var global_generation_settings = generation_settings.FileCache{};
+var model_generation_settings = generation_settings.FileCache{};
+
+fn setGenerationCli(profile: *generation_settings.Profile, field: generation_settings.Field, value: generation_settings.Value) void {
+    const index = @intFromEnum(field);
+    const lock = if (profile.rules[index]) |rule| rule.ignore_client else false;
+    profile.set(field, value, lock);
+    profile.rules[index].?.source = .cli;
+}
+
+fn generationProfiles(a: std.mem.Allocator, io: std.Io, model_path: ?[]const u8) !struct { global: generation_settings.Profile, model: generation_settings.Profile } {
+    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    const global_path = try std.fmt.allocPrint(a, "{s}/.mlx-serve/generation-settings.json", .{home});
+    const model_file = try std.fmt.allocPrint(a, "{s}/.mlx-serve/model-settings.json", .{home});
+    var global = try global_generation_settings.get(io, global_path, null);
+    if (server_config.default_temperature) |v| setGenerationCli(&global, .temperature, .{ .number = v });
+    if (server_config.default_top_p) |v| setGenerationCli(&global, .top_p, .{ .number = v });
+    if (server_config.default_top_k) |v| setGenerationCli(&global, .top_k, .{ .integer = v });
+    if (server_config.default_max_tokens > 0) setGenerationCli(&global, .max_tokens, .{ .integer = server_config.default_max_tokens });
+    if (generation_settings.cli_reasoning_budget) |v| {
+        setGenerationCli(&global, .reasoning_budget, .{ .integer = v });
+    } else if (server_config.default_reasoning_budget >= 0) setGenerationCli(&global, .reasoning_budget, .{ .integer = server_config.default_reasoning_budget });
+    return .{ .global = global, .model = if (model_path) |p| try model_generation_settings.get(io, model_file, p) else .{} };
+}
+
+fn generationRequest(a: std.mem.Allocator, io: std.Io, root: std.json.ObjectMap, lm: *LoadedModel, surface: generation_settings.Surface) !generation_settings.Resolved {
+    const profiles = try generationProfiles(a, io, lm.path);
+    var result = try generation_settings.apply(a, root, surface, profiles.global, profiles.model);
+    try generation_settings.validateEnginePolicy(result, lm.ds4_engine != null or lm.llama_engine != null);
+    if (lm.config) |config| {
+        for ([_]generation_settings.Field{ .temperature, .top_p, .top_k }) |field| {
+            const index = @intFromEnum(field);
+            if (result.values[index] != null) continue;
+            result.sources[index] = .checkpoint;
+            result.values[index] = switch (field) {
+                .temperature => if (config.gen_temperature) |v| .{ .float = v } else null,
+                .top_p => if (config.gen_top_p) |v| .{ .float = v } else null,
+                .top_k => if (config.gen_top_k) |v| .{ .integer = v } else null,
+                else => unreachable,
+            };
+            if (result.values[index] == null) {
+                result.sources[index] = .fallback;
+                result.values[index] = if (field == .top_k) .{ .integer = 0 } else .{ .float = 1 };
+            }
+        }
+    }
+    return result;
+}
+
+fn logGenerationSettings(policy: generation_settings.Resolved, a: std.mem.Allocator, lm: *LoadedModel, sampling: generate_mod.SamplingParams, max_tokens: u32, thinking: ?bool, budget: ?i32) !void {
+    var resolved = policy;
+    for ([_]generation_settings.Field{ .repeat_penalty, .presence_penalty }) |field| {
+        const index = @intFromEnum(field);
+        if (resolved.values[index] == null) resolved.sources[index] = .fallback;
+    }
+    resolved.values[@intFromEnum(generation_settings.Field.temperature)] = .{ .float = sampling.temperature };
+    resolved.values[@intFromEnum(generation_settings.Field.top_p)] = .{ .float = sampling.top_p };
+    resolved.values[@intFromEnum(generation_settings.Field.top_k)] = .{ .integer = sampling.top_k };
+    if (resolved.values[@intFromEnum(generation_settings.Field.frequency_penalty)] == null) {
+        resolved.values[@intFromEnum(generation_settings.Field.repeat_penalty)] = .{ .float = sampling.repeat_penalty };
+    }
+    resolved.values[@intFromEnum(generation_settings.Field.presence_penalty)] = .{ .float = sampling.presence_penalty };
+    resolved.values[@intFromEnum(generation_settings.Field.max_tokens)] = .{ .integer = max_tokens };
+    if (thinking) |value| resolved.values[@intFromEnum(generation_settings.Field.enable_thinking)] = .{ .bool = value };
+    if (budget) |value| resolved.values[@intFromEnum(generation_settings.Field.reasoning_budget)] = .{ .integer = value };
+    const json = try resolved.json(a);
+    defer a.free(json);
+    log.info("[generation-settings] model={s} {s}\n", .{ lm.id, json });
+}
+
+fn generationSettingsProps(a: std.mem.Allocator, io: std.Io, model_path: ?[]const u8) ![]u8 {
+    const profiles = try generationProfiles(a, io, model_path);
+    const global = try generation_settings.profileJson(a, profiles.global);
+    const model = try generation_settings.profileJson(a, profiles.model);
+    return std.fmt.allocPrint(a, ",\"generation_defaults\":{{\"global\":{s},\"model\":{s}}}", .{ global, model });
 }
 
 /// Generation is authoritative for constrained responses: when the generator
@@ -15103,7 +15248,10 @@ fn handleAnthropicMessages(
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gate below uses `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
-    const chat_config = lm.chat_config.?;
+    var resolved_chat_config = lm.chat_config.?.*;
+    resolved_chat_config.default_enable_thinking = null;
+    resolved_chat_config.default_reasoning_effort = null;
+    const chat_config = &resolved_chat_config;
     const config = lm.config.?;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
@@ -15116,12 +15264,27 @@ fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
         return;
     }
-    const root = parsed.value.object;
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .messages) catch |err| {
+        log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
+        if (err == error.UnsupportedEngineGenerationPolicy) {
+            try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "This engine cannot honor the configured generation policy", 400);
+        } else {
+            try sendAnthropicError(allocator, stream, "generation_settings_error", "Generation settings are invalid; correct generation-settings.json or the model's generation_defaults", 503);
+        }
+        return;
+    };
+    const root = policy.root;
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
     const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
-    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
+    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else
+        if (root.get("max_tokens") != null and policy.sources[@intFromEnum(generation_settings.Field.max_tokens)] != .client)
+            omittedMaxTokensDefault(getEffectiveContextLength(config))
+        else
+            launchMaxTokensDefault();
     // For the request log line only. This surface 400s on a missing budget, so
     // the origin here is never `.auto`.
     const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
@@ -15473,6 +15636,9 @@ fn handleAnthropicMessages(
         effort_word = cfg.effort;
         if (!budget_explicit) reasoning_budget = cfg.budget;
     } else if (!budget_explicit) reasoning_budget = implicitEffortBudgetFor(allocator, lm, tok);
+    if (root.get("reasoning_budget_tokens")) |v| if (v == .integer) {
+        reasoning_budget = clampJsonI32(v.integer);
+    };
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -15673,8 +15839,8 @@ fn handleAnthropicMessages(
         .top_p = top_p,
         .top_k = top_k,
         .min_p = min_p,
-        .repeat_penalty = 1.0,
-        .presence_penalty = 0.0,
+        .repeat_penalty = requestRepeatPenalty(root),
+        .presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0),
         .seed = seed,
     };
 
@@ -15710,8 +15876,22 @@ fn handleAnthropicMessages(
 
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
+    generation_settings.validateThinkingFallback(policy, enable_thinking) catch {
+        try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "Structured output cannot honor the locked thinking policy on this model", 400);
+        return;
+    };
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
-    if (think_bound) |*tb| sampling.think_bound = tb;
+    if (enable_thinking and policy.locked(.reasoning_budget) and reasoning_budget >= 0 and
+        (think_bound == null or std.mem.eql(u8, config.model_type, "diffusion_gemma"))) {
+        try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "This model cannot enforce a locked thinking budget at decode; unlock the budget or use a supported reasoning protocol", 400);
+        return;
+    }
+    if (think_bound) |*tb| {
+        tb.enforced = policy.locked(.reasoning_budget);
+        sampling.think_bound = tb;
+    }
+
+    try logGenerationSettings(policy, allocator, lm, sampling, effective_max_tokens, enable_thinking, reasoning_budget);
 
     var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
     defer if (tool_force) |tf| allocator.free(tf.forced);
@@ -17108,7 +17288,10 @@ fn handleResponsesInner(
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
-    const chat_config = lm.chat_config.?;
+    var resolved_chat_config = lm.chat_config.?.*;
+    resolved_chat_config.default_enable_thinking = null;
+    resolved_chat_config.default_reasoning_effort = null;
+    const chat_config = &resolved_chat_config;
     const config = lm.config.?;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         log.warn("POST /v1/responses -> 400 (invalid JSON)\n", .{});
@@ -17121,7 +17304,18 @@ fn handleResponsesInner(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
         return;
     }
-    const root = parsed.value.object;
+    var policy_arena = std.heap.ArenaAllocator.init(allocator);
+    defer policy_arena.deinit();
+    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .responses) catch |err| {
+        log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
+        if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
+        } else {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "generation_settings_error", "Generation settings are invalid; correct generation-settings.json or the model's generation_defaults", 503);
+        }
+        return;
+    };
+    const root = policy.root;
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -17195,7 +17389,7 @@ fn handleResponsesInner(
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
+    const repeat_penalty = requestRepeatPenalty(root);
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
@@ -17497,9 +17691,23 @@ fn handleResponsesInner(
 
     // The budget is enforced at decode: the server closes the thought, so this
     // surface parses a closed block like any other.
+    generation_settings.validateThinkingFallback(policy, enable_thinking) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "Structured output cannot honor the locked thinking policy on this model", 400);
+        return;
+    };
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
-    if (think_bound) |*tb| sampling.think_bound = tb;
+    if (enable_thinking and policy.locked(.reasoning_budget) and reasoning_budget >= 0 and
+        (think_bound == null or std.mem.eql(u8, config.model_type, "diffusion_gemma"))) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This model cannot enforce a locked thinking budget at decode; unlock the budget or use a supported reasoning protocol", 400);
+        return;
+    }
+    if (think_bound) |*tb| {
+        tb.enforced = policy.locked(.reasoning_budget);
+        sampling.think_bound = tb;
+    }
+
+    try logGenerationSettings(policy, allocator, lm, sampling, effective_max_tokens, enable_thinking, reasoning_budget);
     var tool_force = armToolForce(allocator, lm, tok, prompt_ids, if (active_has_tools) tool_choice.forced else null);
     defer if (tool_force) |tf| allocator.free(tf.forced);
     if (tool_force) |*tf| sampling.tool_force = tf;

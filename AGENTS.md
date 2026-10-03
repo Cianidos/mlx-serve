@@ -83,7 +83,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`; 0.16 no longer builds); mlx + mlx
 
 CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
-Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
+Generation defaults: client > model `generation_defaults` > global `generation-settings.json` (explicit CLI values replace global values) > checkpoint > built-in. Per-field `ignore_client` forces the rule; generation-only edits apply to the next request. Detail: `docs/reference.md`.
 
 ## Building
 

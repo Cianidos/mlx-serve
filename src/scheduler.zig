@@ -2398,7 +2398,7 @@ pub const Scheduler = struct {
         if (!slotTicksRegular(slot)) return .spec_active;
         // A slot whose module-head release is armed but not landed still holds the head.
         if (slotReleasePending(slot)) return .head_release_pending;
-        if (slot.sampling.constraint != null) return .grammar;
+        if (slot.sampling.constraint != null or enforcedThinkBoundActive(slot.sampling)) return .grammar;
         if (slot.logprobs_n > 0) return .logprobs;
         if (slot.sampling.penalized()) return .penalty;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -7791,6 +7791,10 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     tb.fired = true;
     if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
+        if (tb.enforced) {
+            finishSlot(sch, slot, "length");
+            return true;
+        }
         return false;
     }
     if (try commitForcedTick(sch, slot, gen, tb.forced, .think_bound)) {
@@ -7833,6 +7837,23 @@ fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []con
     gen.spec_disabled_runtime = true;
     gen.spec_disable_reason = reason;
     return true;
+}
+
+fn enforcedThinkBoundActive(sampling: generate_mod.SamplingParams) bool {
+    const bound = sampling.think_bound orelse return false;
+    return bound.enforced;
+}
+
+test "locked thinking budgets stay serial across the enforced boundary" {
+    const t = std.testing;
+    var bound = generate_mod.ThinkBound{ .budget = 16, .opener_id = null, .closer_id = 1, .forced = &.{1}, .in_think = true, .enforced = true };
+    const sampling = generate_mod.SamplingParams{ .think_bound = &bound };
+    try t.expect(enforcedThinkBoundActive(sampling));
+    bound.fired = true;
+    try t.expect(enforcedThinkBoundActive(sampling));
+    bound.fired = false;
+    bound.enforced = false;
+    try t.expect(!enforcedThinkBoundActive(sampling));
 }
 
 fn thinkBoundFired(gen: *const Generator) bool {
