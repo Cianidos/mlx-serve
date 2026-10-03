@@ -575,8 +575,8 @@ pub const ServerConfig = struct {
     /// values so external clients like Claude Code — which send no sampling
     /// params at all — inherit them). null = flag not given; resolution falls
     /// through to the model's generation_config.json recommendation, then the
-    /// hardcoded fallback. Explicit request body fields always win. See
-    /// `resolveSamplingDefault`.
+    /// hardcoded fallback. Profile locks outrank client fields
+    /// (`generation_settings.Resolved`).
     default_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
@@ -585,13 +585,6 @@ pub const ServerConfig = struct {
     /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
     default_max_tokens: u32 = 0,
 };
-
-/// Sampling-default resolution chain: request body > CLI launch flag >
-/// model generation_config.json > hardcoded fallback. An explicit request
-/// value of 0 (greedy / disabled) is a value, not an omission.
-fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T, fallback: T) T {
-    return request orelse cli orelse gen_config orelse fallback;
-}
 
 /// The per-request `enable_mtp` default, for a request that omitted the field.
 /// The ONE place this policy lives — every HTTP surface calls it, so a new
@@ -640,7 +633,7 @@ fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8, min: f32, max: f
         .integer => |i| @floatFromInt(i),
         else => return null,
     };
-    return std.math.clamp(raw, min, max);
+    return if (std.math.isFinite(raw)) std.math.clamp(raw, min, max) else null;
 }
 
 /// Optional top_k body-field parse (positive integer, capped at 1000).
@@ -1477,6 +1470,15 @@ pub fn launchMaxTokensDefault() u32 {
     return server_config.default_max_tokens;
 }
 
+fn generationMaxTokens(policy: *generation_settings.Resolved, value: ?std.json.Value, fallback: u32) u32 {
+    const client: ?u32 = if (value) |v| switch (v) {
+        .integer => resolveRequestMaxTokens(v, fallback),
+        else => null,
+    } else null;
+    const cap = policy.resolve(u32, .max_tokens, client, fallback, .fallback);
+    return if (cap == 0) fallback else cap;
+}
+
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
 /// Absent OR `<= 0` means **auto**: peg generation to the remaining context
 /// window via `auto_default` (the `omittedMaxTokensDefault` sentinel, which
@@ -1835,6 +1837,9 @@ pub fn serve(
     defer global_registry = null;
     g_model_aliases.alloc = scheduler.registry.allocator;
     g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
+    global_generation_settings.alloc = scheduler.registry.allocator;
+    const generation_home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    global_generation_settings.path = try std.fmt.bufPrint(&global_generation_path, "{s}/.mlx-serve/generation-settings.json", .{generation_home});
 
     // Prefix cache lives on LoadedModel and may retain idle prefixes in RAM, SSD, or both.
     if (scheduler.hot_prefix_cache != null) {
@@ -2109,9 +2114,7 @@ pub fn serve(
     deinitGlobalResponseStore();
     if (active_conn_threads.load(.acquire) == 0) {
         global_generation_settings.deinit();
-        model_generation_settings.deinit();
-        global_generation_settings = .{};
-        model_generation_settings = .{};
+        global_generation_settings = .{ .path = "" };
     }
 
     log.info("\nShutting down gracefully...\n", .{});
@@ -8285,46 +8288,47 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
     return out;
 }
 
-/// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
-/// the vendor `enable_thinking` bool, or an OpenAI `reasoning_effort` string
-/// ("none" being an explicit OFF). Only a request that names NEITHER falls
-/// through to the arch default (`ModelConfig.defaultEnableThinking`).
-///
-/// The two knobs stay OR'd when both are present, as they always were.
-fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
-    const et: ?bool = if (requestField(root, "enable_thinking")) |v|
-        (if (v == .bool) v.bool else null)
-    else
-        null;
-    return thinkingFrom(et, effort_cfg, arch_default);
-}
-
 fn thinkingFrom(enable: ?bool, effort: ?ReasoningEffort, fallback: bool) bool {
     if (enable == null and effort == null) return fallback;
     return (enable orelse false) or (if (effort) |e| e.enable else false);
 }
 
-/// The model's `chat_template_kwargs` `reasoning_effort`, read like a request's.
-fn modelEffort(cc: *const chat_mod.ChatConfig, default_budget: i32, word_only: bool) ?ReasoningEffort {
-    const word = cc.default_reasoning_effort orelse return null;
-    return reasoningEffortFromWord(word, default_budget, word_only);
-}
-
-/// The model's effort word fills in only when thinking ended up on and the request named none.
-fn modelEffortIfThinking(model: ?ReasoningEffort, thinking: bool) ?ReasoningEffort {
-    const m = model orelse return null;
-    return if (thinking and m.enable) m else null;
-}
-
 const ChatThinking = struct { enable: bool, effort: ?ReasoningEffort };
 
-/// Request first; the model's `chat_template_kwargs` thinking keys act as a
-/// default request, consulted only when the request names neither; then the arch.
-fn resolveChatThinking(root: std.json.ObjectMap, cc: *const chat_mod.ChatConfig, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
-    const model = modelEffort(cc, default_budget, word_only);
-    const request = parseReasoningEffort(root, default_budget, word_only);
-    const enable = resolveEnableThinking(root, request, thinkingFrom(cc.default_enable_thinking, model, arch_default));
-    return .{ .enable = enable, .effort = request orelse modelEffortIfThinking(model, enable) };
+fn resolveThinking(policy: *generation_settings.Resolved, client_enable: ?bool, client_effort: ?[]const u8, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+    const request_effort = if (client_effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
+    const client: ?bool = if (client_enable != null or request_effort != null) thinkingFrom(client_enable, request_effort, false) else null;
+    var effort = policy.resolveOptional([]const u8, .reasoning_effort, client_effort, null, .fallback);
+    if (client == false and client_effort == null and !policy.locked(.reasoning_effort)) {
+        effort = null;
+        policy.values[@backingInt(generation_settings.Field.reasoning_effort)] = null;
+    }
+    var enable = policy.resolve(bool, .enable_thinking, client, if (effort) |word| !std.mem.eql(u8, word, "none") else arch_default, .fallback);
+    if (policy.locked(.enable_thinking)) {
+        if (!enable) {
+            effort = "none";
+            policy.values[@backingInt(generation_settings.Field.reasoning_effort)] = .{ .string = "none" };
+            policy.sources[@backingInt(generation_settings.Field.reasoning_effort)] = policy.sources[@backingInt(generation_settings.Field.enable_thinking)];
+        } else if (effort != null and std.mem.eql(u8, effort.?, "none")) {
+            effort = null;
+            policy.values[@backingInt(generation_settings.Field.reasoning_effort)] = null;
+        }
+    } else if (policy.locked(.reasoning_effort) or (client == null and effort != null and !std.mem.eql(u8, effort.?, "none"))) {
+        enable = !std.mem.eql(u8, effort.?, "none");
+        policy.values[@backingInt(generation_settings.Field.enable_thinking)] = .{ .bool = enable };
+        policy.sources[@backingInt(generation_settings.Field.enable_thinking)] = policy.sources[@backingInt(generation_settings.Field.reasoning_effort)];
+    }
+    if (!enable and client_effort == null and !policy.locked(.reasoning_effort)) {
+        effort = null;
+        policy.values[@backingInt(generation_settings.Field.reasoning_effort)] = null;
+    }
+    return .{ .enable = enable, .effort = if (effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null };
+}
+
+fn resolveChatThinking(root: std.json.ObjectMap, policy: *generation_settings.Resolved, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+    const enable = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
+    const effort = parseReasoningEffort(root, default_budget, word_only);
+    return resolveThinking(policy, enable, if (effort) |e| e.effort else null, arch_default, default_budget, word_only);
 }
 
 const SchemaThinkingPolicy = enum {
@@ -8499,10 +8503,8 @@ fn handleChatCompletions(
     // gate below reads `config.has_hybrid_layers` (valid for every model incl. the
     // GGUF stub), so the transformer is never needed at this level.
     const tok = lm.tokenizer.?;
-    var resolved_chat_config = lm.chat_config.?.*;
-    resolved_chat_config.default_enable_thinking = null;
-    resolved_chat_config.default_reasoning_effort = null;
-    const chat_config = &resolved_chat_config;
+    var request_chat_config = lm.chat_config.?.*;
+    const chat_config = &request_chat_config;
     const config = lm.config.?;
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
@@ -8522,7 +8524,7 @@ fn handleChatCompletions(
     }
     var policy_arena = std.heap.ArenaAllocator.init(allocator);
     defer policy_arena.deinit();
-    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .chat) catch |err| {
+    var policy = generationRequest(policy_arena.allocator(), stream.io, lm, .chat, chat_config) catch |err| {
         log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
         if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
@@ -8531,7 +8533,7 @@ fn handleChatCompletions(
         }
         return;
     };
-    const root = policy.root;
+    const root = parsed.value.object;
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
@@ -8720,8 +8722,9 @@ fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
-    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
-    const max_tokens: u32 = resolveRequestMaxTokens(
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens") orelse root.get("max_output_tokens");
+    const max_tokens: u32 = generationMaxTokens(
+        &policy,
         requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
@@ -8730,14 +8733,18 @@ fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
+    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
+    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
-    const repeat_penalty = requestRepeatPenalty(root);
+    const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
 
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
+        return;
+    };
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -8915,17 +8922,16 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const thinking = resolveChatThinking(root, chat_config, config.defaultEnableThinking(tools_json != null), server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
+    const thinking = resolveChatThinking(root, &policy, config.defaultEnableThinking(tools_json != null), server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
     const effort_cfg = thinking.effort;
     var enable_thinking = thinking.enable;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
     const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget;
+    const budget_value = root.get("reasoning_budget_tokens") orelse root.get("reasoning_budget");
+    const client_budget: ?i32 = if (budget_value) |v| (if (v == .integer) clampJsonI32(v.integer) else null) else null;
+    const reasoning_budget = policy.resolve(i32, .reasoning_budget, client_budget, effort_budget, .fallback);
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -9309,7 +9315,7 @@ fn handleCompletions(
     }
     var policy_arena = std.heap.ArenaAllocator.init(allocator);
     defer policy_arena.deinit();
-    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .completions) catch |err| {
+    var policy = generationRequest(policy_arena.allocator(), stream.io, lm, .completions, null) catch |err| {
         log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
         if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
@@ -9318,7 +9324,7 @@ fn handleCompletions(
         }
         return;
     };
-    const root = policy.root;
+    const root = parsed.value.object;
     const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
@@ -9349,8 +9355,9 @@ fn handleCompletions(
         return;
     }
 
-    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
-    const max_tokens: u32 = resolveRequestMaxTokens(
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens") orelse root.get("max_output_tokens");
+    const max_tokens: u32 = generationMaxTokens(
+        &policy,
         requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
@@ -9359,13 +9366,17 @@ fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
+    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
+    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
-    const repeat_penalty = requestRepeatPenalty(root);
-    const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
+    const presence_penalty_c = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
+        return;
+    };
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -10127,28 +10138,37 @@ fn nonStreamingViaScheduler(
     };
 }
 
-fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
-    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-    if (repeat > 0) return repeat;
-    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    return if (frequency > 0) 1.0 + frequency else 1.0;
+fn resolveRepeatPenalty(root: std.json.ObjectMap, model_default: ?f32, policy: *generation_settings.Resolved) f32 {
+    const client_repeat = parseJsonFloatOpt(root, "repeat_penalty", 0, 10) orelse parseJsonFloatOpt(root, "repetition_penalty", 0, 10);
+    const client_frequency = parseJsonFloatOpt(root, "frequency_penalty", 0, 2);
+    const repeat = policy.resolveOptional(f32, .repeat_penalty, if (client_repeat != null and client_repeat.? > 0) client_repeat else null, model_default, if (model_default != null) .checkpoint else .fallback);
+    const frequency = policy.resolveOptional(f32, .frequency_penalty, client_frequency, null, .fallback);
+    const repeat_wins = policy.locked(.repeat_penalty) or (!policy.locked(.frequency_penalty) and repeat != null and
+        (policy.sources[@backingInt(generation_settings.Field.repeat_penalty)] == .client or
+            (client_frequency == null and repeat.? != 1)));
+    if (repeat_wins) {
+        policy.values[@backingInt(generation_settings.Field.frequency_penalty)] = null;
+        return repeat.?;
+    }
+    if (frequency) |value| {
+        policy.values[@backingInt(generation_settings.Field.repeat_penalty)] = null;
+        return 1 + value;
+    }
+    return repeat orelse 1;
 }
 
-var global_generation_settings = generation_settings.FileCache{};
-var model_generation_settings = generation_settings.FileCache{};
+var global_generation_path: [std.fs.max_path_bytes]u8 = undefined;
+var global_generation_settings: model_settings_mod.Cache = .{ .path = "" };
 
 fn setGenerationCli(profile: *generation_settings.Profile, field: generation_settings.Field, value: generation_settings.Value) void {
-    const index = @intFromEnum(field);
+    const index = @backingInt(field);
     const lock = if (profile.rules[index]) |rule| rule.ignore_client else false;
     profile.set(field, value, lock);
     profile.rules[index].?.source = .cli;
 }
 
-fn generationProfiles(a: std.mem.Allocator, io: std.Io, model_path: ?[]const u8) !struct { global: generation_settings.Profile, model: generation_settings.Profile } {
-    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
-    const global_path = try std.fmt.allocPrint(a, "{s}/.mlx-serve/generation-settings.json", .{home});
-    const model_file = try std.fmt.allocPrint(a, "{s}/.mlx-serve/model-settings.json", .{home});
-    var global = try global_generation_settings.get(io, global_path, null);
+fn generationProfiles(io: std.Io, model_path: ?[]const u8) !struct { global: generation_settings.Profile, model: generation_settings.Profile } {
+    var global = try global_generation_settings.generationDefaults(io, null);
     if (server_config.default_temperature) |v| setGenerationCli(&global, .temperature, .{ .number = v });
     if (server_config.default_top_p) |v| setGenerationCli(&global, .top_p, .{ .number = v });
     if (server_config.default_top_k) |v| setGenerationCli(&global, .top_k, .{ .integer = v });
@@ -10156,28 +10176,22 @@ fn generationProfiles(a: std.mem.Allocator, io: std.Io, model_path: ?[]const u8)
     if (generation_settings.cli_reasoning_budget) |v| {
         setGenerationCli(&global, .reasoning_budget, .{ .integer = v });
     } else if (server_config.default_reasoning_budget >= 0) setGenerationCli(&global, .reasoning_budget, .{ .integer = server_config.default_reasoning_budget });
-    return .{ .global = global, .model = if (model_path) |p| try model_generation_settings.get(io, model_file, p) else .{} };
+    return .{ .global = global, .model = if (model_path) |p| try g_model_aliases.generationDefaults(io, p) else .{} };
 }
 
-fn generationRequest(a: std.mem.Allocator, io: std.Io, root: std.json.ObjectMap, lm: *LoadedModel, surface: generation_settings.Surface) !generation_settings.Resolved {
-    const profiles = try generationProfiles(a, io, lm.path);
-    var result = try generation_settings.apply(a, root, surface, profiles.global, profiles.model);
-    try generation_settings.validateEnginePolicy(result, lm.ds4_engine != null or lm.llama_engine != null);
-    if (lm.config) |config| {
-        for ([_]generation_settings.Field{ .temperature, .top_p, .top_k }) |field| {
-            const index = @intFromEnum(field);
-            if (result.values[index] != null) continue;
-            result.sources[index] = .checkpoint;
-            result.values[index] = switch (field) {
-                .temperature => if (config.gen_temperature) |v| .{ .float = v } else null,
-                .top_p => if (config.gen_top_p) |v| .{ .float = v } else null,
-                .top_k => if (config.gen_top_k) |v| .{ .integer = v } else null,
-                else => unreachable,
-            };
-            if (result.values[index] == null) {
-                result.sources[index] = .fallback;
-                result.values[index] = if (field == .top_k) .{ .integer = 0 } else .{ .float = 1 };
-            }
+fn generationRequest(a: std.mem.Allocator, io: std.Io, lm: *LoadedModel, surface: generation_settings.Surface, chat_config: ?*chat_mod.ChatConfig) !generation_settings.Resolved {
+    const profiles = try generationProfiles(io, null);
+    var settings = try g_model_aliases.requestOverride(a, io, lm.path);
+    defer settings.deinit(a);
+    if (chat_config) |cc| {
+        cc.chat_template_kwargs = settings.chat_template_kwargs;
+        settings.chat_template_kwargs = null;
+        cc.generation_defaults = settings.generation_defaults;
+    }
+    const result = generation_settings.Resolved.init(profiles.global, if (chat_config) |cc| cc.generation_defaults else settings.generation_defaults);
+    if (surface == .completions) {
+        for ([_]generation_settings.Field{ .enable_thinking, .reasoning_effort, .reasoning_budget }) |field| {
+            if (result.locked(field)) return error.UnsupportedCompletionThinkingPolicy;
         }
     }
     return result;
@@ -10186,26 +10200,26 @@ fn generationRequest(a: std.mem.Allocator, io: std.Io, root: std.json.ObjectMap,
 fn logGenerationSettings(policy: generation_settings.Resolved, a: std.mem.Allocator, lm: *LoadedModel, sampling: generate_mod.SamplingParams, max_tokens: u32, thinking: ?bool, budget: ?i32) !void {
     var resolved = policy;
     for ([_]generation_settings.Field{ .repeat_penalty, .presence_penalty }) |field| {
-        const index = @intFromEnum(field);
+        const index = @backingInt(field);
         if (resolved.values[index] == null) resolved.sources[index] = .fallback;
     }
-    resolved.values[@intFromEnum(generation_settings.Field.temperature)] = .{ .float = sampling.temperature };
-    resolved.values[@intFromEnum(generation_settings.Field.top_p)] = .{ .float = sampling.top_p };
-    resolved.values[@intFromEnum(generation_settings.Field.top_k)] = .{ .integer = sampling.top_k };
-    if (resolved.values[@intFromEnum(generation_settings.Field.frequency_penalty)] == null) {
-        resolved.values[@intFromEnum(generation_settings.Field.repeat_penalty)] = .{ .float = sampling.repeat_penalty };
+    resolved.values[@backingInt(generation_settings.Field.temperature)] = .{ .float = sampling.temperature };
+    resolved.values[@backingInt(generation_settings.Field.top_p)] = .{ .float = sampling.top_p };
+    resolved.values[@backingInt(generation_settings.Field.top_k)] = .{ .integer = sampling.top_k };
+    if (resolved.values[@backingInt(generation_settings.Field.frequency_penalty)] == null) {
+        resolved.values[@backingInt(generation_settings.Field.repeat_penalty)] = .{ .float = sampling.repeat_penalty };
     }
-    resolved.values[@intFromEnum(generation_settings.Field.presence_penalty)] = .{ .float = sampling.presence_penalty };
-    resolved.values[@intFromEnum(generation_settings.Field.max_tokens)] = .{ .integer = max_tokens };
-    if (thinking) |value| resolved.values[@intFromEnum(generation_settings.Field.enable_thinking)] = .{ .bool = value };
-    if (budget) |value| resolved.values[@intFromEnum(generation_settings.Field.reasoning_budget)] = .{ .integer = value };
+    resolved.values[@backingInt(generation_settings.Field.presence_penalty)] = .{ .float = sampling.presence_penalty };
+    resolved.values[@backingInt(generation_settings.Field.max_tokens)] = .{ .integer = max_tokens };
+    if (thinking) |value| resolved.values[@backingInt(generation_settings.Field.enable_thinking)] = .{ .bool = value };
+    if (budget) |value| resolved.values[@backingInt(generation_settings.Field.reasoning_budget)] = .{ .integer = value };
     const json = try resolved.json(a);
     defer a.free(json);
     log.info("[generation-settings] model={s} {s}\n", .{ lm.id, json });
 }
 
 fn generationSettingsProps(a: std.mem.Allocator, io: std.Io, model_path: ?[]const u8) ![]u8 {
-    const profiles = try generationProfiles(a, io, model_path);
+    const profiles = try generationProfiles(io, model_path);
     const global = try generation_settings.profileJson(a, profiles.global);
     const model = try generation_settings.profileJson(a, profiles.model);
     return std.fmt.allocPrint(a, ",\"generation_defaults\":{{\"global\":{s},\"model\":{s}}}", .{ global, model });
@@ -15248,10 +15262,8 @@ fn handleAnthropicMessages(
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gate below uses `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
-    var resolved_chat_config = lm.chat_config.?.*;
-    resolved_chat_config.default_enable_thinking = null;
-    resolved_chat_config.default_reasoning_effort = null;
-    const chat_config = &resolved_chat_config;
+    var request_chat_config = lm.chat_config.?.*;
+    const chat_config = &request_chat_config;
     const config = lm.config.?;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
@@ -15266,7 +15278,7 @@ fn handleAnthropicMessages(
     }
     var policy_arena = std.heap.ArenaAllocator.init(allocator);
     defer policy_arena.deinit();
-    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .messages) catch |err| {
+    var policy = generationRequest(policy_arena.allocator(), stream.io, lm, .messages, chat_config) catch |err| {
         log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
         if (err == error.UnsupportedEngineGenerationPolicy) {
             try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "This engine cannot honor the configured generation policy", 400);
@@ -15275,16 +15287,13 @@ fn handleAnthropicMessages(
         }
         return;
     };
-    const root = policy.root;
+    const root = parsed.value.object;
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
-    const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
-    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else
-        if (root.get("max_tokens") != null and policy.sources[@intFromEnum(generation_settings.Field.max_tokens)] != .client)
-            omittedMaxTokensDefault(getEffectiveContextLength(config))
-        else
-            launchMaxTokensDefault();
+    const max_value = root.get("max_tokens") orelse root.get("max_completion_tokens") orelse root.get("max_output_tokens");
+    const has_default = policy.profile.rules[@backingInt(generation_settings.Field.max_tokens)] != null;
+    const max_tokens = generationMaxTokens(&policy, max_value, if (has_default) omittedMaxTokensDefault(getEffectiveContextLength(config)) else launchMaxTokensDefault());
     // For the request log line only. This surface 400s on a missing budget, so
     // the origin here is never `.auto`.
     const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
@@ -15526,10 +15535,16 @@ fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
+    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
+    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
+    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
+        try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
+        return;
+    };
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15593,24 +15608,14 @@ fn handleAnthropicMessages(
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
     const word_only = effortWordOnly(allocator, lm, tok);
-    const model_effort = modelEffort(chat_config, server_config.default_reasoning_budget, word_only);
-    var enable_thinking = if (root.get("thinking") == null)
-        thinkingFrom(chat_config.default_enable_thinking, model_effort, config.defaultEnableThinking(root.get("tools") != null))
-    else
-        false;
-    var reasoning_budget: i32 = server_config.default_reasoning_budget;
-    var budget_explicit = false;
+    var client_enable: ?bool = null;
+    var client_budget: ?i32 = null;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
             const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
-                enable_thinking = true;
-            }
+            client_enable = std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive");
             if (think_val.object.get("budget_tokens")) |bt| {
-                if (bt == .integer) {
-                    reasoning_budget = clampJsonI32(bt.integer);
-                    budget_explicit = true;
-                }
+                if (bt == .integer) client_budget = clampJsonI32(bt.integer);
             }
         }
     }
@@ -15626,19 +15631,23 @@ fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return;
     }
-    var effort_word: ?[]const u8 = null;
-    if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, word_only);
-        effort_word = cfg.effort;
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
-    } else if (modelEffortIfThinking(model_effort, enable_thinking)) |cfg| {
-        effort_word = cfg.effort;
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-    } else if (!budget_explicit) reasoning_budget = implicitEffortBudgetFor(allocator, lm, tok);
-    if (root.get("reasoning_budget_tokens")) |v| if (v == .integer) {
-        reasoning_budget = clampJsonI32(v.integer);
-    };
+    const flat_effort = if (requestField(root, "reasoning_effort")) |v| (if (v == .string) v.string else null) else null;
+    if (client_enable == null) {
+        if (requestField(root, "enable_thinking")) |v| if (v == .bool) {
+            client_enable = v.bool;
+        };
+    }
+    const thinking = resolveThinking(&policy, client_enable, output_cfg.effort orelse flat_effort, config.defaultEnableThinking(root.get("tools") != null), server_config.default_reasoning_budget, word_only);
+    var enable_thinking = thinking.enable;
+    const effort_word = if (thinking.effort) |e| e.effort else null;
+    const effort_budget = if (thinking.effort) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
+    const flat_budget = root.get("reasoning_budget_tokens") orelse root.get("reasoning_budget");
+    if (client_budget == null) {
+        if (flat_budget) |v| if (v == .integer) {
+            client_budget = clampJsonI32(v.integer);
+        };
+    }
+    const reasoning_budget = policy.resolve(i32, .reasoning_budget, client_budget, effort_budget, .fallback);
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -15839,8 +15848,8 @@ fn handleAnthropicMessages(
         .top_p = top_p,
         .top_k = top_k,
         .min_p = min_p,
-        .repeat_penalty = requestRepeatPenalty(root),
-        .presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0),
+        .repeat_penalty = repeat_penalty,
+        .presence_penalty = presence_penalty,
         .seed = seed,
     };
 
@@ -17288,10 +17297,8 @@ fn handleResponsesInner(
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
-    var resolved_chat_config = lm.chat_config.?.*;
-    resolved_chat_config.default_enable_thinking = null;
-    resolved_chat_config.default_reasoning_effort = null;
-    const chat_config = &resolved_chat_config;
+    var request_chat_config = lm.chat_config.?.*;
+    const chat_config = &request_chat_config;
     const config = lm.config.?;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         log.warn("POST /v1/responses -> 400 (invalid JSON)\n", .{});
@@ -17306,7 +17313,7 @@ fn handleResponsesInner(
     }
     var policy_arena = std.heap.ArenaAllocator.init(allocator);
     defer policy_arena.deinit();
-    const policy = generationRequest(policy_arena.allocator(), stream.io, parsed.value.object, lm, .responses) catch |err| {
+    var policy = generationRequest(policy_arena.allocator(), stream.io, lm, .responses, chat_config) catch |err| {
         log.warn("[generation-settings] invalid policy: {s}\n", .{@errorName(err)});
         if (err == error.UnsupportedEngineGenerationPolicy or err == error.UnsupportedCompletionThinkingPolicy) {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine or raw-completion route cannot honor the configured generation policy", 400);
@@ -17315,7 +17322,7 @@ fn handleResponsesInner(
         }
         return;
     };
-    const root = policy.root;
+    const root = parsed.value.object;
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -17382,15 +17389,19 @@ fn handleResponsesInner(
         const r = resolveRequestMaxTokens(v, 0);
         break :blk if (r > 0) r else null;
     };
-    const max_tokens: u32 = req_max_output_tokens orelse
-        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const max_tokens = generationMaxTokens(&policy, root.get("max_output_tokens") orelse root.get("max_tokens") orelse root.get("max_completion_tokens"), if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
+    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
+    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
+    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    const repeat_penalty = requestRepeatPenalty(root);
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
+    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
+        return;
+    };
+
+    const effective_frequency: f32 = if (policy.values[@intFromEnum(generation_settings.Field.frequency_penalty)]) |v| @floatCast(v.float) else 0;
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
@@ -17451,16 +17462,17 @@ fn handleResponsesInner(
     // Budget precedence as on chat: explicit reasoning_budget_tokens > the
     // effort word's budget (`reasoningEffortFromWord`) > --reasoning-budget,
     // with the Qwen3.8 implicit-low budget when thinking names no effort.
-    const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    var enable_thinking = reasoning_cfg.enable;
-    const effort_budget: i32 = if (reasoning_cfg.effort) |word|
-        reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok)).budget
-    else
-        implicitEffortBudgetFor(allocator, lm, tok);
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget;
+    const client_reasoning = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
+    const flat_enable = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
+    const flat_effort = if (requestField(root, "reasoning_effort")) |v| (if (v == .string) v.string else null) else null;
+    const client_enable = flat_enable orelse if (root.get("reasoning")) |v| (if (v == .object) client_reasoning.enable else null) else null;
+    const thinking = resolveThinking(&policy, client_enable, client_reasoning.effort orelse flat_effort, false, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
+    const effort_word = if (thinking.effort) |e| e.effort else null;
+    var enable_thinking = thinking.enable;
+    const effort_budget = if (thinking.effort) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
+    const budget_value = root.get("reasoning_budget_tokens") orelse root.get("reasoning_budget");
+    const client_budget: ?i32 = if (budget_value) |v| (if (v == .integer) clampJsonI32(v.integer) else null) else null;
+    const reasoning_budget = policy.resolve(i32, .reasoning_budget, client_budget, effort_budget, .fallback);
 
     // ── tools ──
     var tools_json: ?[]const u8 = null;
@@ -17577,7 +17589,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, effort_word, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -17595,7 +17607,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, effort_word, false);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -17747,7 +17759,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .presence_penalty = presence_penalty,
-        .frequency_penalty = frequency_penalty,
+        .frequency_penalty = effective_frequency,
         .top_logprobs = top_logprobs_echo,
         .parallel_tool_calls = parallel_tool_calls_echo,
         .background = background_echo,
@@ -21780,14 +21792,78 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const effort = parseReasoningEffort(parsed.value.object, -1, false);
-        try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
+        var policy = generation_settings.Resolved.init(.{}, .{});
+        const thinking = resolveChatThinking(parsed.value.object, &policy, case.arch, -1, false);
+        try std.testing.expectEqual(case.want, thinking.enable);
     }
+}
+
+test "generation settings: parsed null and invalid fields retain saved defaults without changing the request" {
+    const a = std.testing.allocator;
+    var profile = generation_settings.Profile{};
+    profile.set(.temperature, .{ .number = 0.25 }, false);
+    profile.set(.max_tokens, .{ .integer = 12 }, true);
+    for ([_][]const u8{ "{\"temperature\":null,\"max_completion_tokens\":100}", "{\"temperature\":\"invalid\",\"max_completion_tokens\":100}" }) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        var policy = generation_settings.Resolved.init(profile, .{});
+        try std.testing.expectEqual(@as(f32, 0.25), policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0, 2), 1, .fallback));
+        try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(&policy, root.get("max_completion_tokens"), 200));
+        try std.testing.expect(root.get("temperature").? != .float);
+        try std.testing.expectEqual(@as(i64, 100), root.get("max_completion_tokens").?.integer);
+    }
+}
+
+test "generation settings: one penalty resolver preserves neutral overrides and dominant locks" {
+    const a = std.testing.allocator;
+    const request = try std.json.parseFromSlice(std.json.Value, a, "{\"frequency_penalty\":0}", .{});
+    defer request.deinit();
+    var profile = generation_settings.Profile{};
+    profile.set(.repeat_penalty, .{ .number = 1.5 }, false);
+    var policy = generation_settings.Resolved.init(profile, .{});
+    try std.testing.expectEqual(@as(f32, 1), resolveRepeatPenalty(request.value.object, 1.2, &policy));
+    profile.set(.repeat_penalty, .{ .number = 1.5 }, true);
+    policy = generation_settings.Resolved.init(profile, .{});
+    try std.testing.expectEqual(@as(f32, 1.5), resolveRepeatPenalty(request.value.object, 1.2, &policy));
+    profile.set(.repeat_penalty, .{ .number = 1 }, false);
+    profile.set(.frequency_penalty, .{ .number = 0.5 }, false);
+    policy = generation_settings.Resolved.init(profile, .{});
+    try std.testing.expectEqual(@as(f32, 1.5), resolveRepeatPenalty(.empty, null, &policy));
+    const repeat = try std.json.parseFromSlice(std.json.Value, a, "{\"repeat_penalty\":1}", .{});
+    defer repeat.deinit();
+    policy = generation_settings.Resolved.init(profile, .{});
+    try std.testing.expectEqual(@as(f32, 1), resolveRepeatPenalty(repeat.value.object, 1.2, &policy));
+    profile.set(.frequency_penalty, .{ .number = 0.5 }, true);
+    policy = generation_settings.Resolved.init(profile, .{});
+    try std.testing.expectEqual(@as(f32, 1.5), resolveRepeatPenalty(repeat.value.object, null, &policy));
+}
+
+test "generation settings: thinking locks dominate client switches and effort while budget stays independent" {
+    var profile = generation_settings.Profile{};
+    profile.set(.enable_thinking, .{ .boolean = true }, true);
+    profile.set(.reasoning_budget, .{ .integer = 16 }, true);
+    var policy = generation_settings.Resolved.init(profile, .{});
+    var thinking = resolveThinking(&policy, false, "none", false, -1, false);
+    try std.testing.expect(thinking.enable);
+    try std.testing.expect(thinking.effort == null);
+    try std.testing.expectEqual(@as(i32, 16), policy.resolve(i32, .reasoning_budget, 32000, -1, .fallback));
+    profile.set(.enable_thinking, .{ .boolean = false }, true);
+    profile.set(.reasoning_effort, .{ .effort = .xhigh }, true);
+    policy = generation_settings.Resolved.init(profile, .{});
+    thinking = resolveThinking(&policy, true, "xhigh", true, -1, false);
+    try std.testing.expect(!thinking.enable);
+    try std.testing.expectEqualStrings("none", thinking.effort.?.effort.?);
+    try generation_settings.validateThinkingFallback(policy, false);
+    profile.rules[@backingInt(generation_settings.Field.enable_thinking)] = null;
+    policy = generation_settings.Resolved.init(profile, .{});
+    thinking = resolveThinking(&policy, false, null, false, -1, false);
+    try std.testing.expect(thinking.enable);
+    try std.testing.expectEqualStrings("xhigh", thinking.effort.?.effort.?);
 }
 
 test "resolveChatThinking: the request decides, the model's chat_template_kwargs fill its silence, then the arch" {
     const allocator = std.testing.allocator;
-    var cc = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
     const Case = struct { body: []const u8, model_on: ?bool = null, model_effort: ?[]const u8 = null, arch: bool = false, want: bool, effort: ?[]const u8 = null };
     const cases = [_]Case{
         .{ .body = "{}", .arch = true, .want = true },
@@ -21795,6 +21871,7 @@ test "resolveChatThinking: the request decides, the model's chat_template_kwargs
         .{ .body = "{}", .model_on = false, .arch = true, .want = false },
         .{ .body = "{}", .model_effort = "high", .want = true, .effort = "high" },
         .{ .body = "{}", .model_effort = "none", .arch = true, .want = false },
+        .{ .body = "{}", .model_on = false, .model_effort = "high", .want = true, .effort = "high" },
         .{ .body = "{\"enable_thinking\":false}", .model_effort = "high", .want = false },
         .{ .body = "{\"enable_thinking\":true}", .model_effort = "high", .want = true, .effort = "high" },
         .{ .body = "{\"reasoning_effort\":\"low\"}", .model_effort = "high", .want = true, .effort = "low" },
@@ -21806,9 +21883,11 @@ test "resolveChatThinking: the request decides, the model's chat_template_kwargs
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        cc.default_enable_thinking = case.model_on;
-        cc.default_reasoning_effort = case.model_effort;
-        const got = resolveChatThinking(parsed.value.object, &cc, case.arch, -1, false);
+        var model = generation_settings.Profile{};
+        if (case.model_on) |on| model.set(.enable_thinking, .{ .boolean = on }, false);
+        if (case.model_effort) |word| model.set(.reasoning_effort, .{ .effort = std.meta.stringToEnum(generation_settings.Effort, word).? }, false);
+        var policy = generation_settings.Resolved.init(.{}, model);
+        const got = resolveChatThinking(parsed.value.object, &policy, case.arch, -1, false);
         try std.testing.expectEqual(case.want, got.enable);
         if (case.effort) |w| try std.testing.expectEqualStrings(w, got.effort.?.effort.?) else try std.testing.expect(got.effort == null);
     }
@@ -21847,17 +21926,18 @@ test "every JSON grammar mask site consults the fallback or deferral policy" {
     try std.testing.expectEqual(masks, calls);
 }
 
-test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
-    // Request value always wins.
-    try std.testing.expectEqual(@as(f32, 0.2), resolveSamplingDefault(f32, 0.2, 0.7, 1.0, 1.0));
-    // Omitted in request -> CLI launch flag (the app passes Settings here).
-    try std.testing.expectEqual(@as(f32, 0.7), resolveSamplingDefault(f32, null, 0.7, 1.0, 1.0));
-    // No CLI flag -> the model's generation_config.json recommendation.
-    try std.testing.expectEqual(@as(u32, 20), resolveSamplingDefault(u32, null, null, 20, 0));
-    // Nothing anywhere -> hardcoded fallback (pre-existing behavior).
-    try std.testing.expectEqual(@as(f32, 1.0), resolveSamplingDefault(f32, null, null, null, 1.0));
-    // Explicit request 0 (greedy) must not be treated as omitted.
-    try std.testing.expectEqual(@as(f32, 0.0), resolveSamplingDefault(f32, 0.0, 0.7, 1.0, 1.0));
+test "generation settings: request > CLI > generation_config > fallback" {
+    var global = generation_settings.Profile{};
+    setGenerationCli(&global, .temperature, .{ .number = 0.7 });
+    var policy = generation_settings.Resolved.init(global, .{});
+    try std.testing.expectEqual(@as(f32, 0.2), policy.resolve(f32, .temperature, 0.2, 1.0, .checkpoint));
+    try std.testing.expectEqual(@as(f32, 0.7), policy.resolve(f32, .temperature, null, 1.0, .checkpoint));
+    try std.testing.expectEqual(generation_settings.Source.cli, policy.sources[@intFromEnum(generation_settings.Field.temperature)]);
+    policy = generation_settings.Resolved.init(.{}, .{});
+    try std.testing.expectEqual(@as(u32, 20), policy.resolve(u32, .top_k, null, 20, .checkpoint));
+    try std.testing.expectEqual(@as(f32, 1.0), policy.resolve(f32, .temperature, null, 1.0, .fallback));
+    policy = generation_settings.Resolved.init(global, .{});
+    try std.testing.expectEqual(@as(f32, 0.0), policy.resolve(f32, .temperature, 0.0, 1.0, .checkpoint));
 }
 
 test "detokenizeResponseJson escapes arbitrary token bytes (control-byte class)" {

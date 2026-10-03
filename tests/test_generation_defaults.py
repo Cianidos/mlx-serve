@@ -124,6 +124,26 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                   '/props reads model generation policy without loading model')
             write(model_file, {})
             write(global_file, {
+                'temperature': {'value': 0.25},
+                'max_tokens': {'value': 2, 'ignore_client': True},
+            })
+            for route, body, _ in cases:
+                post(route, {**body, 'temperature': None})
+            post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.', 'temperature': None})
+            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
+                       if '[generation-settings] model=' in line]
+            check(all(record['temperature']['value'] == 0.25 and record['temperature']['source'] == 'global'
+                      for record in records[-4:]), 'null client fields retain global defaults on every text API')
+            write(model_file, {str(model): {'generation_defaults': {'top_k': {'value': -1, 'ignore_client': True}}}})
+            try:
+                post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message})
+            except urllib.error.HTTPError as error:
+                check(error.code == 503 and 'generation_settings_error' in error.read().decode(),
+                      'malformed model policy refuses without reloading the model')
+            else:
+                raise AssertionError('malformed model policy accepted')
+            write(model_file, {})
+            write(global_file, {
                 'temperature': {'value': 0},
                 'reasoning_budget': {'value': 16, 'ignore_client': True},
             })
