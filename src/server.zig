@@ -8733,14 +8733,15 @@ fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
-    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
-    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
+    const resolved_sampling = resolveSampling(&policy, root, config);
+    const temperature = resolved_sampling.temperature;
+    const top_p = resolved_sampling.top_p;
+    const top_k = resolved_sampling.top_k;
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
 
-    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    const presence_penalty = resolved_sampling.presence_penalty;
     generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
         return;
@@ -9366,13 +9367,14 @@ fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
-    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
-    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
+    const resolved_sampling = resolveSampling(&policy, root, config);
+    const temperature = resolved_sampling.temperature;
+    const top_p = resolved_sampling.top_p;
+    const top_k = resolved_sampling.top_k;
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
-    const presence_penalty_c = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    const presence_penalty_c = resolved_sampling.presence_penalty;
     generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
         return;
@@ -10135,6 +10137,15 @@ fn nonStreamingViaScheduler(
         .logprobs = logprobs_slice,
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
+    };
+}
+
+fn resolveSampling(policy: *generation_settings.Resolved, root: std.json.ObjectMap, config: *const model_mod.ModelConfig) generate_mod.SamplingParams {
+    return .{
+        .temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback),
+        .top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback),
+        .top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback),
+        .presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback),
     };
 }
 
@@ -15535,12 +15546,13 @@ fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
-    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
-    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
+    const resolved_sampling = resolveSampling(&policy, root, config);
+    const temperature = resolved_sampling.temperature;
+    const top_p = resolved_sampling.top_p;
+    const top_k = resolved_sampling.top_k;
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
-    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    const presence_penalty = resolved_sampling.presence_penalty;
     generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
         try sendAnthropicError(allocator, stream, "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
         return;
@@ -17390,12 +17402,13 @@ fn handleResponsesInner(
         break :blk if (r > 0) r else null;
     };
     const max_tokens = generationMaxTokens(&policy, root.get("max_output_tokens") orelse root.get("max_tokens") orelse root.get("max_completion_tokens"), if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
-    const temperature = policy.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), config.gen_temperature orelse 1.0, if (config.gen_temperature != null) .checkpoint else .fallback);
-    const top_p = policy.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), config.gen_top_p orelse 1.0, if (config.gen_top_p != null) .checkpoint else .fallback);
-    const top_k = policy.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), config.gen_top_k orelse 0, if (config.gen_top_k != null) .checkpoint else .fallback);
+    const resolved_sampling = resolveSampling(&policy, root, config);
+    const temperature = resolved_sampling.temperature;
+    const top_p = resolved_sampling.top_p;
+    const top_k = resolved_sampling.top_k;
     const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const repeat_penalty = resolveRepeatPenalty(root, null, &policy);
-    const presence_penalty = policy.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0, .fallback);
+    const presence_penalty = resolved_sampling.presence_penalty;
     generation_settings.validateEnginePolicy(policy, lm.ds4_engine != null or lm.llama_engine != null) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "unsupported_generation_policy", "This engine cannot honor the configured penalty policy", 400);
         return;
@@ -21796,6 +21809,42 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         const thinking = resolveChatThinking(parsed.value.object, &policy, case.arch, -1, false);
         try std.testing.expectEqual(case.want, thinking.enable);
     }
+}
+
+test "generation settings: sampling resolution preserves fallback sources client values and locks" {
+    const a = std.testing.allocator;
+    const request = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"temperature":null,"top_p":0,"top_k":0,"presence_penalty":0}
+    , .{});
+    defer request.deinit();
+    const config = model_mod.ModelConfig{ .gen_temperature = 0.8, .gen_top_p = 0.95, .gen_top_k = 40 };
+    var policy = generation_settings.Resolved.init(.{}, .{});
+    var resolved = resolveSampling(&policy, request.value.object, &config);
+    try std.testing.expectEqual(@as(f32, 0.8), resolved.temperature);
+    try std.testing.expectEqual(@as(f32, 0), resolved.top_p);
+    try std.testing.expectEqual(@as(u32, 0), resolved.top_k);
+    try std.testing.expectEqual(@as(f32, 0), resolved.presence_penalty);
+    try std.testing.expectEqual(generation_settings.Source.checkpoint, policy.sources[@intFromEnum(generation_settings.Field.temperature)]);
+    try std.testing.expectEqual(generation_settings.Source.client, policy.sources[@intFromEnum(generation_settings.Field.top_k)]);
+
+    var global = generation_settings.Profile{};
+    global.set(.temperature, .{ .number = 0.25 }, false);
+    global.set(.presence_penalty, .{ .number = 0.5 }, true);
+    var model = generation_settings.Profile{};
+    model.set(.top_k, .{ .integer = 20 }, true);
+    policy = generation_settings.Resolved.init(global, model);
+    resolved = resolveSampling(&policy, request.value.object, &config);
+    try std.testing.expectEqual(@as(f32, 0.25), resolved.temperature);
+    try std.testing.expectEqual(@as(u32, 20), resolved.top_k);
+    try std.testing.expectEqual(@as(f32, 0.5), resolved.presence_penalty);
+    try std.testing.expectEqual(generation_settings.Source.global, policy.sources[@intFromEnum(generation_settings.Field.temperature)]);
+    try std.testing.expectEqual(generation_settings.Source.model, policy.sources[@intFromEnum(generation_settings.Field.top_k)]);
+    policy = generation_settings.Resolved.init(.{}, .{});
+    resolved = resolveSampling(&policy, .empty, &.{});
+    try std.testing.expectEqual(@as(f32, 1), resolved.temperature);
+    try std.testing.expectEqual(@as(f32, 1), resolved.top_p);
+    try std.testing.expectEqual(@as(u32, 0), resolved.top_k);
+    try std.testing.expectEqual(generation_settings.Source.fallback, policy.sources[@intFromEnum(generation_settings.Field.temperature)]);
 }
 
 test "generation settings: parsed null and invalid fields retain saved defaults without changing the request" {
