@@ -4568,6 +4568,7 @@ fn sendBytesJson(conn: *Conn, allocator: std.mem.Allocator, json: []const u8) !v
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(json);
 }
 
@@ -4582,6 +4583,7 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(payload);
 }
 
@@ -4600,6 +4602,7 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
+    conn.length_framed = true;
     try conn.writeAll(body);
 }
 
