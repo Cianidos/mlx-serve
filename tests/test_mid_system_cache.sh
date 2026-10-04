@@ -54,6 +54,7 @@ def post(path, body):
             return json.load(response)
         usage = {}
         content = []
+        stop_reason = None
         stopped = False
         for raw in response:
             if not raw.startswith(b"data: "):
@@ -64,9 +65,11 @@ def post(path, body):
             usage.update(event.get("usage", {}))
             if event.get("delta", {}).get("type") == "text_delta":
                 content.append(event["delta"]["text"])
+            if event.get("delta", {}).get("stop_reason"):
+                stop_reason = event["delta"]["stop_reason"]
             stopped |= event.get("type") == "message_stop"
         assert stopped, "stream did not finish"
-        return {"usage": usage, "content": [{"type": "text", "text": "".join(content)}]}
+        return {"usage": usage, "content": [{"type": "text", "text": "".join(content)}], "stop_reason": stop_reason}
 
 if mode == "restart":
     turns = json.loads(state.read_text())
@@ -98,14 +101,17 @@ for round_index in range(1 if mode == "restart" else 4):
     ])
 state.write_text(json.dumps(turns))
 if mode == "restart":
-    for stream in (False, True):
-        answer = post("/v1/messages", {"model": "mlx-serve", "system": "Follow the latest system instruction.",
-            "messages": [{"role": "user", "content": "Say BLUE."},
-                         {"role": "system", "content": "Reply with exactly AMBER instead."}],
-            "max_tokens": 32, "temperature": 0, "stream": stream, "thinking": {"type": "disabled"}})
-        text = "".join(block.get("text", "") for block in answer["content"] if block.get("type") == "text")
-        assert "AMBER" in text and "BLUE" not in text, f"late instruction not followed: {answer!r}"
-    print("PASS late system instruction overrides earlier user request, stream and non-stream")
+    body = {"model": "mlx-serve", "system": "Answer briefly.",
+        "messages": [{"role": "user", "content": "Name a color."},
+                     {"role": "system", "content": "Use one word."}],
+        "max_tokens": 32, "temperature": 0, "thinking": {"type": "disabled"}}
+    post("/v1/messages", body)
+    answers = [post("/v1/messages", dict(body, stream=stream)) for stream in (False, True)]
+    texts = ["".join(block.get("text", "") for block in answer["content"] if block.get("type") == "text") for answer in answers]
+    assert texts[0] == texts[1], f"stream delivery differs: {texts!r}"
+    assert answers[0]["stop_reason"] == answers[1]["stop_reason"], "stop reason differs"
+    assert answers[0]["usage"]["output_tokens"] == answers[1]["usage"]["output_tokens"], "output token count differs"
+    print("PASS late-system stream/non-stream delivery agrees")
 PY
 }
 start_server

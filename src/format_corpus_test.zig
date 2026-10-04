@@ -42,15 +42,16 @@ const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
 test "format corpus: late system notes never vanish or rewrite supported history" {
-    const templates = [_][]const u8{
-        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
-        @embedFile("fixtures/qwen38_chat_template.jinja"),
-        @embedFile("fixtures/inkling_chat_template.jinja"),
-        @embedFile("fixtures/muse_chat_template.jinja"),
-        @embedFile("fixtures/dsv4_chat_template.jinja"),
+    const templates = [_]struct { source: []const u8, in_place: bool }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/inkling_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/muse_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/dsv4_chat_template.jinja"), .in_place = true },
+        .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
     };
-    for (templates) |tpl| {
-        const config = chat.ChatConfig{ .chat_template = tpl, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+    for (templates) |template| {
+        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
         const messages = [_]chat.Message{
             .{ .role = "system", .content = "stable instructions" },
             .{ .role = "user", .content = "corpus question marker" },
@@ -67,8 +68,8 @@ test "format corpus: late system notes never vanish or rewrite supported history
         const n = std.mem.indexOf(u8, first, "corpus runtime note marker").?;
         try testing.expect(std.mem.indexOf(u8, next, "corpus runtime note marker") != null);
         try testing.expect(std.mem.indexOf(u8, next, "corpus newer note marker") != null);
-        if (std.mem.indexOf(u8, tpl, "preserve_thinking") != null) try testing.expect(n > q);
-        if (n > q) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
+        try testing.expectEqual(template.in_place, n > q);
+        if (template.in_place) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
     }
 }
 
