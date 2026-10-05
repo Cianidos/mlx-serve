@@ -6,7 +6,6 @@ pub const Effort = enum { none, minimal, low, medium, high, xhigh, max };
 pub const Value = union(enum) { number: f64, integer: i64, boolean: bool, effort: Effort };
 pub const Source = enum { client, model, global, cli, checkpoint, fallback };
 pub const Rule = struct { value: Value, ignore_client: bool = false, source: Source = .global };
-pub var cli_reasoning_budget: ?i32 = null;
 
 pub const Profile = struct {
     rules: [std.enums.values(Field).len]?Rule = @splat(null),

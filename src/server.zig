@@ -554,9 +554,9 @@ pub const ServerConfig = struct {
     max_context_size: u32 = 0,
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.
     request_timeout_sec: u32 = 300,
-    /// Default reasoning budget in tokens (-1 = unlimited).
-    /// `--reasoning-budget N`. Per-request body fields override.
-    default_reasoning_budget: i32 = -1,
+    /// `--reasoning-budget N`: null = omitted, -1 = explicit unlimited.
+    /// Client fields override unless the effective profile locks the budget.
+    default_reasoning_budget: ?i32 = null,
     /// Default PLD enabled state. Per-request `enable_pld` JSON overrides.
     default_enable_pld: bool = false,
     /// Maximum draft tokens proposed per PLD step.
@@ -1982,8 +1982,8 @@ pub fn serve(
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
-    if (server_config.default_reasoning_budget >= 0) {
-        log.info("Reasoning budget: {d} tokens\n", .{server_config.default_reasoning_budget});
+    if ((server_config.default_reasoning_budget orelse -1) >= 0) {
+        log.info("Reasoning budget: {d} tokens\n", .{server_config.default_reasoning_budget.?});
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
     }
@@ -8210,8 +8210,9 @@ fn implicitEffortBudget(template: []const u8, markers_atomic: bool, default_budg
 }
 
 fn implicitEffortBudgetFor(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) i32 {
-    const cc = lm.chat_config orelse return server_config.default_reasoning_budget;
-    return implicitEffortBudget(cc.chat_template, thinkMarkersAtomic(allocator, lm, tok), server_config.default_reasoning_budget);
+    const default_budget = server_config.default_reasoning_budget orelse -1;
+    const cc = lm.chat_config orelse return default_budget;
+    return implicitEffortBudget(cc.chat_template, thinkMarkersAtomic(allocator, lm, tok), default_budget);
 }
 
 test "implicitEffortBudget: silence on the Qwen3.8 family gets low's budget" {
@@ -8923,7 +8924,7 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const thinking = resolveChatThinking(root, &policy, config.defaultEnableThinking(tools_json != null), server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
+    const thinking = resolveChatThinking(root, &policy, config.defaultEnableThinking(tools_json != null), server_config.default_reasoning_budget orelse -1, effortWordOnly(allocator, lm, tok));
     const effort_cfg = thinking.effort;
     var enable_thinking = thinking.enable;
 
@@ -10186,9 +10187,7 @@ fn generationProfiles(io: std.Io, model_path: ?[]const u8) !struct { global: gen
     if (server_config.default_top_p) |v| setGenerationCli(&global, .top_p, .{ .number = v });
     if (server_config.default_top_k) |v| setGenerationCli(&global, .top_k, .{ .integer = v });
     if (server_config.default_max_tokens > 0) setGenerationCli(&global, .max_tokens, .{ .integer = server_config.default_max_tokens });
-    if (generation_settings.cli_reasoning_budget) |v| {
-        setGenerationCli(&global, .reasoning_budget, .{ .integer = v });
-    } else if (server_config.default_reasoning_budget >= 0) setGenerationCli(&global, .reasoning_budget, .{ .integer = server_config.default_reasoning_budget });
+    if (server_config.default_reasoning_budget) |v| setGenerationCli(&global, .reasoning_budget, .{ .integer = v });
     return .{ .global = global, .model = if (model_path) |p| try g_model_aliases.generationDefaults(io, p) else .{} };
 }
 
@@ -15642,7 +15641,7 @@ fn handleAnthropicMessages(
             client_enable = v.bool;
         };
     }
-    const thinking = resolveThinking(&policy, client_enable, output_cfg.effort orelse flat_effort, config.defaultEnableThinking(root.get("tools") != null), server_config.default_reasoning_budget, word_only);
+    const thinking = resolveThinking(&policy, client_enable, output_cfg.effort orelse flat_effort, config.defaultEnableThinking(root.get("tools") != null), server_config.default_reasoning_budget orelse -1, word_only);
     var enable_thinking = thinking.enable;
     const effort_word = if (thinking.effort) |e| e.effort else null;
     const effort_budget = if (thinking.effort) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
@@ -17469,11 +17468,11 @@ fn handleResponsesInner(
     // Budget precedence as on chat: explicit reasoning_budget_tokens > the
     // effort word's budget (`reasoningEffortFromWord`) > --reasoning-budget,
     // with the Qwen3.8 implicit-low budget when thinking names no effort.
-    const client_reasoning = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
+    const client_reasoning = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget orelse -1);
     const flat_enable = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
     const flat_effort = if (requestField(root, "reasoning_effort")) |v| (if (v == .string) v.string else null) else null;
     const client_enable = flat_enable orelse if (root.get("reasoning")) |v| (if (v == .object) client_reasoning.enable else null) else null;
-    const thinking = resolveThinking(&policy, client_enable, client_reasoning.effort orelse flat_effort, false, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
+    const thinking = resolveThinking(&policy, client_enable, client_reasoning.effort orelse flat_effort, false, server_config.default_reasoning_budget orelse -1, effortWordOnly(allocator, lm, tok));
     const effort_word = if (thinking.effort) |e| e.effort else null;
     var enable_thinking = thinking.enable;
     const effort_budget = if (thinking.effort) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
@@ -21985,6 +21984,45 @@ test "every JSON grammar mask site consults the fallback or deferral policy" {
     const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
     try std.testing.expect(masks >= 3);
     try std.testing.expectEqual(masks, calls);
+}
+
+test "generation settings: server config carries explicit CLI reasoning budgets and preserves locks" {
+    const saved_config = server_config;
+    defer server_config = saved_config;
+    const saved_cache = global_generation_settings;
+    defer global_generation_settings = saved_cache;
+    global_generation_settings = .{
+        .path = "",
+        .settings = try model_settings_mod.parse(std.testing.allocator,
+            \\{"reasoning_budget":{"value":1024,"ignore_client":true}}
+        ),
+    };
+    defer global_generation_settings.deinit();
+
+    server_config = .{};
+    const inherited = try generationProfiles(std.testing.io, null);
+    var inherited_policy = generation_settings.Resolved.init(inherited.global, .{});
+    try std.testing.expectEqual(@as(i32, 1024), inherited_policy.resolve(i32, .reasoning_budget, 4096, -1, .fallback));
+    try std.testing.expectEqual(generation_settings.Source.global, inherited_policy.sources[@backingInt(generation_settings.Field.reasoning_budget)]);
+
+    for ([_]i32{ -1, 0, 32 }) |budget| {
+        server_config = .{ .default_reasoning_budget = budget };
+        const profiles = try generationProfiles(std.testing.io, null);
+        var policy = generation_settings.Resolved.init(profiles.global, .{});
+        try std.testing.expectEqual(budget, policy.resolve(i32, .reasoning_budget, 4096, -1, .fallback));
+        try std.testing.expectEqual(generation_settings.Source.cli, policy.sources[@backingInt(generation_settings.Field.reasoning_budget)]);
+        try std.testing.expect(policy.locked(.reasoning_budget));
+
+        var unlocked_global = profiles.global;
+        unlocked_global.rules[@backingInt(generation_settings.Field.reasoning_budget)].?.ignore_client = false;
+        policy = generation_settings.Resolved.init(unlocked_global, .{});
+        try std.testing.expectEqual(@as(i32, 64), policy.resolve(i32, .reasoning_budget, 64, -1, .fallback));
+        var model = generation_settings.Profile{};
+        model.set(.reasoning_budget, .{ .integer = 16 }, true);
+        policy = generation_settings.Resolved.init(profiles.global, model);
+        try std.testing.expectEqual(@as(i32, 16), policy.resolve(i32, .reasoning_budget, 64, -1, .fallback));
+        try std.testing.expectEqual(generation_settings.Source.model, policy.sources[@backingInt(generation_settings.Field.reasoning_budget)]);
+    }
 }
 
 test "generation settings: request > CLI > generation_config > fallback" {
