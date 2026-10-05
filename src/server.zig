@@ -22025,6 +22025,27 @@ test "generation settings: server config carries explicit CLI reasoning budgets 
     }
 }
 
+test "generation settings: iOS inherits unlocked global reasoning budgets" {
+    const saved_config = server_config;
+    defer server_config = saved_config;
+    const saved_cache = global_generation_settings;
+    defer global_generation_settings = saved_cache;
+    global_generation_settings = .{
+        .path = "",
+        .settings = try model_settings_mod.parse(std.testing.allocator,
+            \\{"reasoning_budget":{"value":1024}}
+        ),
+    };
+    defer global_generation_settings.deinit();
+
+    server_config = @import("ios_lib.zig").serverConfig(8192);
+    const profiles = try generationProfiles(std.testing.io, null);
+    var policy = generation_settings.Resolved.init(profiles.global, .{});
+    try std.testing.expectEqual(@as(i32, 1024), policy.resolve(i32, .reasoning_budget, null, -1, .fallback));
+    try std.testing.expectEqual(generation_settings.Source.global, policy.sources[@backingInt(generation_settings.Field.reasoning_budget)]);
+    try std.testing.expectEqual(@as(i32, 64), policy.resolve(i32, .reasoning_budget, 64, -1, .fallback));
+}
+
 test "generation settings: request > CLI > generation_config > fallback" {
     var global = generation_settings.Profile{};
     setGenerationCli(&global, .temperature, .{ .number = 0.7 });
