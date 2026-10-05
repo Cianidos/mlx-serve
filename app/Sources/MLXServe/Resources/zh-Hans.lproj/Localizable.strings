@@ -3,12 +3,8 @@
    falls back to English. */
 
 "All: %@" = "全部：%@";
-"Chat generation settings" = "聊天生成设置";
-"Sampling and output limits for this chat only. Server locks still win." = "仅用于此聊天的采样与输出限制。服务器锁定仍优先。";
-"Saved only for this chat. Explicit values override agent and server defaults; server locks still win. Changes apply to the next turn." = "仅保存于此聊天。明确指定的值覆盖 Agent 与服务器默认值；服务器锁定仍优先。更改在下一轮生效。";
-"Thinking and reasoning effort use the brain control in the composer." = "思考与推理努力级别使用输入区的脑形控件。";
-"Default inherits agent or server settings. Explicit values apply only to this chat." = "默认继承 Agent 或服务器设置。明确指定的值仅用于此聊天。";
-"-1 is unlimited; 0 closes thinking immediately. Server limits still apply." = "-1 表示无限制；0 立即结束思考。服务器限制仍然适用。";
+"Min-p" = "最低相对概率（Min-p）";
+"Minimum probability relative to the most likely token. 0 disables min-p." = "相对于最可能 token 的最低概率。0 禁用 min-p。";
 "Generation Defaults" = "生成默认值";
 "Generation defaults" = "生成默认值";
 "Ignore client override" = "忽略客户端覆盖";
@@ -28,7 +24,7 @@
 "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1 禁用重复惩罚。非中性惩罚可能禁用投机解码和批量解码。";
 "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "使用此引擎现有的频率惩罚映射。重复惩罚和频率惩罚共用一个采样器控制项。";
 "0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
-"-1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement." = "-1 表示无限制；0 立即结束思考。锁定的有限预算需要在解码时强制执行。";
+"API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement." = "API：reasoning_budget_tokens。-1 表示无限制；0 立即结束思考。锁定的有限预算需要在解码时强制执行。";
 "Explicit client thinking or effort wins unless locked." = "未锁定时，以客户端明确指定的思考或努力级别为准。";
 "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control." = "映射到模型模板的词汇。数值思考预算是独立控制项。";
 "Client values win unless Ignore client override is checked." = "未勾选“忽略客户端覆盖”时，以客户端值为准。";

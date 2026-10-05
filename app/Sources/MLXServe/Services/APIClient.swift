@@ -572,7 +572,6 @@ class APIClient {
         var inheritGeneration = false
         var temperatureOverride: Double? = nil
         var maxTokensOverride: Int? = nil
-        var generationParams = GenerationDefaults()
 
         func applyGeneration(to body: inout [String: Any], maxTokens: Int, temperature: Double,
                              enableThinking: Bool, effort: String?) {
@@ -592,12 +591,6 @@ class APIClient {
             body["presence_penalty"] = presencePenalty
             body["reasoning_budget_tokens"] = reasoningBudget
             body["reasoning_budget"] = nil
-            if generationParams.rules["repeat_penalty"] == nil && generationParams.rules["frequency_penalty"] != nil {
-                body["repeat_penalty"] = nil
-            }
-            for (key, rule) in generationParams.rules {
-                body[key == "reasoning_budget" ? "reasoning_budget_tokens" : key] = rule.value.json
-            }
         }
 
         static let none = RequestDefaults()

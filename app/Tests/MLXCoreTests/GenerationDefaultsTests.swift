@@ -2,6 +2,61 @@ import XCTest
 @testable import MLXCore
 
 final class GenerationDefaultsTests: XCTestCase {
+    func testDescriptionsNameCanonicalParameters() {
+        for field in GenerationField.allCases {
+            XCTAssertTrue(field.help.contains(field.rawValue), field.rawValue)
+        }
+        XCTAssertTrue(GenerationField.budget.help.contains("reasoning_budget_tokens"))
+    }
+
+    func testRetiredSessionParametersAreIgnoredAndNotPersisted() throws {
+        let existing = try JSONEncoder().encode(ChatSession())
+        var stored = try XCTUnwrap(JSONSerialization.jsonObject(with: existing) as? [String: Any])
+        stored["generationParams"] = ["temperature": ["value": 0.1], "top_k": ["value": 0]]
+        let session = try JSONDecoder().decode(ChatSession.self, from: JSONSerialization.data(withJSONObject: stored))
+        let encoded = try JSONEncoder().encode(session)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(object["generationParams"])
+    }
+
+    func testMinPProfileRoundTripsAndRejectsOutOfRangeValues() throws {
+        let data = Data("{\"min_p\":{\"value\":0.05,\"ignore_client\":true}}".utf8)
+        let profile = try JSONDecoder().decode(GenerationDefaults.self, from: data)
+        XCTAssertEqual(profile.rules["min_p"]?.value, .number(0.05))
+        XCTAssertTrue(profile.rules["min_p"]!.ignoreClient)
+        XCTAssertEqual(try JSONDecoder().decode(GenerationDefaults.self, from: JSONEncoder().encode(profile)), profile)
+        XCTAssertThrowsError(try JSONDecoder().decode(GenerationDefaults.self,
+            from: Data("{\"min_p\":{\"value\":1.1}}".utf8)))
+    }
+
+    func testAgentSamplingOverridesReachPlainAndToolRequests() throws {
+        var agent = Agent(name: "Sampling", systemPrompt: "Answer briefly.")
+        agent.temperature = 0
+        agent.maxTokens = 0
+        agent.topP = 0.8
+        agent.topK = 0
+        agent.repeatPenalty = 1
+        agent.presencePenalty = 0
+        agent.reasoningBudget = -1
+        let resolved = AgentResolution.resolve(agent: agent, defaults: .init())
+        let turn = ChatTurnEngine.TurnConfig.from(resolved)
+        let tools = "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"parameters\":{\"type\":\"object\"}}}]"
+        for toolsJSON in [nil, tools] {
+            let data = try APIClient.chatRequestBody(messages: [], maxTokens: 64, temperature: 0.8,
+                enableThinking: false, toolsJSON: toolsJSON,
+                defaults: turn.requestDefaults(from: ServerOptions(), inheritGeneration: true))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(body["temperature"] as? Double, 0)
+            XCTAssertEqual(body["max_tokens"] as? Int, 0)
+            XCTAssertEqual(body["top_p"] as? Double, 0.8)
+            XCTAssertEqual(body["top_k"] as? Int, 0)
+            XCTAssertEqual(body["repeat_penalty"] as? Double, 1)
+            XCTAssertEqual(body["presence_penalty"] as? Double, 0)
+            XCTAssertEqual(body["reasoning_budget_tokens"] as? Int, -1)
+            XCTAssertEqual(body["tools"] != nil, toolsJSON != nil)
+        }
+    }
+
     func testLocalExplicitThinkingOffDoesNotResendLegacyGlobalThinking() {
         var options = ServerOptions()
         options.defaultEnableThinking = true

@@ -173,19 +173,19 @@ enum GenerationDefaultsFile {
 }
 
 enum GenerationField: String, CaseIterable, Identifiable {
-    case temperature, topP = "top_p", topK = "top_k", repeatPenalty = "repeat_penalty"
+    case temperature, topP = "top_p", topK = "top_k", minP = "min_p", repeatPenalty = "repeat_penalty"
     case presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty"
     case maxTokens = "max_tokens", thinking = "enable_thinking", effort = "reasoning_effort"
     case budget = "reasoning_budget"
 
-    static let clientFields = allCases.filter { $0 != .thinking && $0 != .effort }
     var id: String { rawValue }
-    var showsSlider: Bool { [.temperature, .topP, .repeatPenalty, .presencePenalty, .frequencyPenalty].contains(self) }
+    var showsSlider: Bool { [.temperature, .topP, .minP, .repeatPenalty, .presencePenalty, .frequencyPenalty].contains(self) }
     var title: String {
         switch self {
         case .temperature: "Temperature"
         case .topP: "Top-p"
         case .topK: "Top-k"
+        case .minP: "Min-p"
         case .repeatPenalty: "Repetition penalty"
         case .presencePenalty: "Presence penalty"
         case .frequencyPenalty: "Frequency penalty"
@@ -199,7 +199,7 @@ enum GenerationField: String, CaseIterable, Identifiable {
         switch self {
         case .temperature: .number(0.8)
         case .topP: .number(0.95)
-        case .topK: .number(0)
+        case .topK, .minP: .number(0)
         case .repeatPenalty: .number(1)
         case .presencePenalty, .frequencyPenalty: .number(0)
         case .maxTokens: .number(16384)
@@ -210,7 +210,7 @@ enum GenerationField: String, CaseIterable, Identifiable {
     }
     var range: ClosedRange<Double> {
         switch self {
-        case .topP: 0...1
+        case .topP, .minP: 0...1
         case .topK: 0...1000
         case .repeatPenalty: 0.01...10
         case .maxTokens: 0...Double(Int32.max)
@@ -218,23 +218,19 @@ enum GenerationField: String, CaseIterable, Identifiable {
         default: 0...2
         }
     }
-    var clientHelp: String {
-        switch self {
-        case .temperature, .topP, .presencePenalty: "Default inherits agent or server settings. Explicit values apply only to this chat."
-        case .budget: "-1 is unlimited; 0 closes thinking immediately. Server limits still apply."
-        default: help
-        }
-    }
     var help: String {
+        let description: String
         switch self {
-        case .topK: "0 disables top-k. Inherit uses the next configured default."
-        case .repeatPenalty: "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding."
-        case .frequencyPenalty: "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control."
-        case .maxTokens: "0 uses remaining context. Context and memory limits still apply."
-        case .budget: "-1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement."
-        case .thinking: "Explicit client thinking or effort wins unless locked."
-        case .effort: "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control."
-        default: "Client values win unless Ignore client override is checked."
+        case .topK: description = "0 disables top-k. Inherit uses the next configured default."
+        case .minP: description = "Minimum probability relative to the most likely token. 0 disables min-p."
+        case .repeatPenalty: description = "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding."
+        case .frequencyPenalty: description = "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control."
+        case .maxTokens: description = "0 uses remaining context. Context and memory limits still apply."
+        case .budget: description = "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement."
+        case .thinking: description = "Explicit client thinking or effort wins unless locked."
+        case .effort: description = "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control."
+        default: description = "Client values win unless Ignore client override is checked."
         }
+        return "\(rawValue) — \(L10n.text(description))"
     }
 }

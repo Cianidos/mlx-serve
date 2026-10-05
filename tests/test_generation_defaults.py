@@ -134,6 +134,28 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                        if '[generation-settings] model=' in line]
             check(all(record['temperature']['value'] == 0.25 and record['temperature']['source'] == 'global'
                       for record in records[-4:]), 'null client fields retain global defaults on every text API')
+            write(global_file, {
+                'temperature': {'value': 0},
+                'max_tokens': {'value': 2, 'ignore_client': True},
+                'min_p': {'value': 0.05, 'ignore_client': True},
+            })
+            for route, body, _ in cases:
+                for stream in (False, True):
+                    post(route, {**body, 'min_p': 0, 'stream': stream})
+            for stream in (False, True):
+                post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.',
+                                       'min_p': 0, 'stream': stream,
+                                       'stream_options': {'include_usage': True}})
+            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
+                       if '[generation-settings] model=' in line]
+            check(all(abs(record['min_p']['value'] - 0.05) < 1e-6 and record['min_p']['source'] == 'global'
+                      for record in records[-8:]), 'min_p lock applies across every text API and transport')
+            write(model_file, {str(model): {'generation_defaults': {'min_p': {'value': 0.1}}}})
+            post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'min_p': 0})
+            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
+                       if '[generation-settings] model=' in line]
+            check(records[-1]['min_p']['value'] == 0 and records[-1]['min_p']['source'] == 'client',
+                  'model unlocked min_p permits explicit client zero without reload')
             write(model_file, {str(model): {'generation_defaults': {'top_k': {'value': -1, 'ignore_client': True}}}})
             try:
                 post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message})

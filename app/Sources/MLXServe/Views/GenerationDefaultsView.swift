@@ -3,25 +3,21 @@ import SwiftUI
 struct GenerationDefaultsRows: View {
     @Binding var profile: GenerationDefaults
     var inheritance = "Inherit"
-    var fields = GenerationField.allCases
-    var showsClientLocks = true
 
     var body: some View {
         HStack {
-            MixedCheckbox(title: L10n.format("All: %@", L10n.text(inheritance)), value: profile.inheritanceState(fields: fields)) {
-                profile.setAllInherited($0, fields: fields)
+            MixedCheckbox(title: L10n.format("All: %@", L10n.text(inheritance)), value: profile.inheritanceState()) {
+                profile.setAllInherited($0)
             }
             Spacer()
-            if showsClientLocks {
-                MixedCheckbox(title: L10n.format("All: %@", L10n.text("Ignore client override")), value: profile.clientLockState(fields: fields)) {
-                    profile.setAllClientLocks($0, fields: fields)
-                }
-                .disabled(fields.allSatisfy { profile.rules[$0.rawValue] == nil })
+            MixedCheckbox(title: L10n.format("All: %@", L10n.text("Ignore client override")), value: profile.clientLockState()) {
+                profile.setAllClientLocks($0)
             }
+            .disabled(profile.rules.isEmpty)
         }
         Divider()
-        ForEach(fields) { field in
-            SearchableRow(searchText: [field.title, showsClientLocks ? field.help : field.clientHelp, inheritance] + (showsClientLocks ? ["Ignore client override"] : [])) {
+        ForEach(GenerationField.allCases) { field in
+            SearchableRow(searchText: [field.title, field.help, inheritance, "Ignore client override"]) {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(L10n.text(field.title)).font(.app(.body))
@@ -39,13 +35,11 @@ struct GenerationDefaultsRows: View {
                             .disabled(profile.rules[field.rawValue] == nil)
                     }
                     HStack {
-                        Text(showsClientLocks ? L10n.text(field.help) : L10n.text(field.clientHelp)).font(.app(.caption2)).foregroundStyle(.secondary)
+                        Text(verbatim: field.help).font(.app(.caption2)).foregroundStyle(.secondary)
                         Spacer(minLength: 8)
-                        if showsClientLocks {
-                            Toggle("Ignore client override", isOn: lockBinding(field))
-                                .toggleStyle(.checkbox).font(.app(.caption2))
-                                .disabled(profile.rules[field.rawValue] == nil)
-                        }
+                        Toggle("Ignore client override", isOn: lockBinding(field))
+                            .toggleStyle(.checkbox).font(.app(.caption2))
+                            .disabled(profile.rules[field.rawValue] == nil)
                     }
                 }
                 .padding(.vertical, 5)
