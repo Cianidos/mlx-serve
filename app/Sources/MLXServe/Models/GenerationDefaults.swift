@@ -96,31 +96,29 @@ struct GenerationDefaults: Codable, Equatable {
         rules.mapValues { ["value": $0.value.json, "ignore_client": $0.ignoreClient] }
     }
 
-    func inheritanceState(fields: [GenerationField] = GenerationField.allCases) -> Bool? {
-        let values = fields.map { rules[$0.rawValue] == nil }
-        return Self.aggregate(values)
+    enum Mode: Int {
+        case inherited, enabled, forced
     }
 
-    func clientLockState(fields: [GenerationField] = GenerationField.allCases) -> Bool? {
-        Self.aggregate(fields.compactMap { rules[$0.rawValue]?.ignoreClient })
+    func mode(_ field: GenerationField) -> Mode {
+        guard let rule = rules[field.rawValue] else { return .inherited }
+        return rule.ignoreClient ? .forced : .enabled
     }
 
-    private static func aggregate(_ values: [Bool]) -> Bool? {
-        guard let first = values.first else { return false }
-        return values.allSatisfy { $0 == first } ? first : nil
+    func mode(fields: [GenerationField]) -> Mode? {
+        guard let first = fields.first.map(mode) else { return .inherited }
+        return fields.allSatisfy { mode($0) == first } ? first : nil
     }
 
-    mutating func setInherited(_ inherited: Bool, field: GenerationField) {
-        if inherited { rules[field.rawValue] = nil }
-        else if rules[field.rawValue] == nil { rules[field.rawValue] = .init(value: field.defaultValue) }
+    mutating func setMode(_ mode: Mode, field: GenerationField, inherited: Value? = nil) {
+        guard mode != .inherited else { rules[field.rawValue] = nil; return }
+        var rule = rules[field.rawValue] ?? .init(value: inherited ?? field.defaultValue)
+        rule.ignoreClient = mode == .forced
+        rules[field.rawValue] = rule
     }
 
-    mutating func setAllInherited(_ inherited: Bool, fields: [GenerationField] = GenerationField.allCases) {
-        for field in fields { setInherited(inherited, field: field) }
-    }
-
-    mutating func setAllClientLocks(_ locked: Bool, fields: [GenerationField] = GenerationField.allCases) {
-        for field in fields where rules[field.rawValue] != nil { rules[field.rawValue]?.ignoreClient = locked }
+    mutating func setMode(_ mode: Mode, fields: [GenerationField], inherited: GenerationDefaults = .init()) {
+        for field in fields { setMode(mode, field: field, inherited: inherited.rules[field.rawValue]?.value) }
     }
 
     func number(_ field: GenerationField) -> Double? {
@@ -141,6 +139,38 @@ struct GenerationDefaults: Codable, Equatable {
         }
         if options.defaultEnableThinking { p.rules["enable_thinking"] = .init(value: .boolean(true)) }
         return p
+    }
+}
+
+extension GenerationDefaults {
+    private static let agentNumbers: [(GenerationField, WritableKeyPath<Agent, Double?>)] = [
+        (.temperature, \.temperature), (.topP, \.topP), (.repeatPenalty, \.repeatPenalty), (.presencePenalty, \.presencePenalty),
+    ]
+    private static let agentIntegers: [(GenerationField, WritableKeyPath<Agent, Int?>)] = [
+        (.topK, \.topK), (.maxTokens, \.maxTokens), (.budget, \.reasoningBudget),
+    ]
+
+    init(agent: Agent) {
+        self.init()
+        for (field, key) in Self.agentNumbers {
+            if let value = agent[keyPath: key] { rules[field.rawValue] = .init(value: .number(value)) }
+        }
+        for (field, key) in Self.agentIntegers {
+            if let value = agent[keyPath: key] { rules[field.rawValue] = .init(value: .number(Double(value))) }
+        }
+    }
+
+    func apply(to agent: inout Agent) {
+        for (field, key) in Self.agentNumbers { agent[keyPath: key] = number(field) }
+        for (field, key) in Self.agentIntegers { agent[keyPath: key] = number(field).map(Int.init) }
+    }
+
+    static func inherited(modelPath: String?) -> GenerationDefaults {
+        var profile = (try? GenerationDefaultsFile.load()) ?? .init()
+        if let modelPath, let model = ModelSettingsFile.load().override(for: modelPath) {
+            profile.rules.merge(model.generationDefaults.rules) { _, model in model }
+        }
+        return profile
     }
 }
 
@@ -178,8 +208,49 @@ enum GenerationField: String, CaseIterable, Identifiable {
     case maxTokens = "max_tokens", thinking = "enable_thinking", effort = "reasoning_effort"
     case budget = "reasoning_budget"
 
+    static let agentFields: [GenerationField] = [.temperature, .topP, .topK, .repeatPenalty, .presencePenalty, .maxTokens, .budget]
     var id: String { rawValue }
-    var showsSlider: Bool { [.temperature, .topP, .minP, .repeatPenalty, .presencePenalty, .frequencyPenalty].contains(self) }
+    var parameterName: String { rawValue }
+    var isInteger: Bool { [.topK, .maxTokens, .budget].contains(self) }
+    var showsSlider: Bool { self != .thinking && self != .effort }
+    var presets: [Double]? {
+        switch self {
+        case .topK: [0, 5, 10, 20, 40, 64, 100, 200, 500, 1000]
+        case .maxTokens: [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+        case .budget: [-1, 0, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+        default: nil
+        }
+    }
+    var guidance: (low: String, high: String)? {
+        switch self {
+        case .temperature: ("Focused", "Creative")
+        case .topP: ("Focused", "Varied")
+        case .topK: ("Off", "Wide")
+        case .minP: ("Off", "Selective")
+        case .repeatPenalty, .presencePenalty, .frequencyPenalty: ("Off", "Strong")
+        case .maxTokens: ("Auto", "Long")
+        case .budget: ("Unlimited", "Long")
+        default: nil
+        }
+    }
+    var sliderRange: ClosedRange<Double> { self == .repeatPenalty ? 1...2 : range }
+
+    func numberValue(_ number: Double) -> GenerationDefaults.Value? {
+        guard number.isFinite, range.contains(number) else { return nil }
+        return .number(isInteger ? number.rounded() : number)
+    }
+
+    func sliderPosition(_ number: Double) -> Double {
+        if let presets {
+            return Double(presets.indices.min { abs(presets[$0] - number) < abs(presets[$1] - number) } ?? 0)
+        }
+        return min(max(number, sliderRange.lowerBound), sliderRange.upperBound)
+    }
+
+    func sliderNumber(_ position: Double) -> Double {
+        guard let presets else { return position }
+        return presets[max(0, min(Int(position.rounded()), presets.count - 1))]
+    }
     var title: String {
         switch self {
         case .temperature: "Temperature"
@@ -229,8 +300,10 @@ enum GenerationField: String, CaseIterable, Identifiable {
         case .budget: description = "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement."
         case .thinking: description = "Explicit client thinking or effort wins unless locked."
         case .effort: description = "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control."
-        default: description = "Client values win unless Ignore client override is checked."
+        case .temperature: description = "Lower values favor predictable replies; higher values add variety. 0 is greedy."
+        case .topP: description = "Keep the smallest token pool covering this probability. 1 keeps all tokens."
+        case .presencePenalty: description = "Discourage tokens already used, regardless of how often they appeared. 0 disables the penalty."
         }
-        return "\(rawValue) — \(L10n.text(description))"
+        return L10n.text(description)
     }
 }

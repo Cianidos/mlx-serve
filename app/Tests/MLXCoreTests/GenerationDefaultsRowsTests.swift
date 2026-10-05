@@ -1,52 +1,110 @@
 import XCTest
-import AppKit
+import SwiftUI
 @testable import MLXCore
 
 final class GenerationDefaultsRowsTests: XCTestCase {
-    func testInheritanceUmbrellaTracksOffOnMixedAndPreservesExistingValues() {
-        var profile = GenerationDefaults()
-        XCTAssertEqual(profile.inheritanceState(), true)
-        profile.setInherited(false, field: .temperature)
-        XCTAssertNil(profile.inheritanceState())
-        profile.rules["temperature"] = .init(value: .number(0.25), ignoreClient: true)
-        profile.setAllInherited(false)
-        XCTAssertEqual(profile.inheritanceState(), false)
-        XCTAssertEqual(profile.rules["temperature"]?.value, .number(0.25))
-        XCTAssertTrue(profile.rules["temperature"]!.ignoreClient)
-        profile.setAllInherited(true)
-        XCTAssertEqual(profile.inheritanceState(), true)
-        XCTAssertTrue(profile.rules.isEmpty)
-    }
-
     @MainActor
-    func testNativeUmbrellasRenderMixedStateAndClickSelectsAll() {
-        var clicked: Bool?
-        let button = MixedCheckboxButton(title: "Default", value: nil) { clicked = $0 }
-        XCTAssertEqual(button.state, .mixed)
-        XCTAssertTrue(button.allowsMixedState)
-        button.performClick(nil)
-        XCTAssertEqual(clicked, true)
-        button.setValue(true)
-        XCTAssertEqual(button.state, .on)
-        button.performClick(nil)
-        XCTAssertEqual(clicked, false)
-        button.setValue(false)
-        XCTAssertEqual(button.state, .off)
+    func testSharedRowsRenderAtModelSheetWidth() throws {
+        var profile = GenerationDefaults()
+        profile.setMode(.enabled, field: .temperature)
+        profile.setMode(.forced, field: .topP)
+        let view = GenerationDefaultsRows(profile: .constant(profile), inheritance: "Model default")
+            .padding(20).frame(width: 620).background(Color(nsColor: .windowBackgroundColor))
+            .environment(\.colorScheme, .dark)
+        let hosting = NSHostingView(rootView: view)
+        hosting.appearance = NSAppearance(named: .darkAqua)
+        let size = hosting.fittingSize
+        XCTAssertGreaterThan(size.height, 500)
+        XCTAssertEqual(size.width, 620)
+        hosting.frame = NSRect(origin: .zero, size: size)
+        hosting.layoutSubtreeIfNeeded()
+        if let path = ProcessInfo.processInfo.environment["GENERATION_UI_SNAPSHOT"] {
+            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            try png.write(to: URL(fileURLWithPath: path))
+        }
     }
 
-    func testLockUmbrellaTouchesOnlyConfiguredRowsAndTracksMixedState() {
+    func testSelectorStatesCreateRulesPreserveValuesAndClearInheritance() {
         var profile = GenerationDefaults()
-        XCTAssertEqual(profile.clientLockState(), false)
-        profile.rules["temperature"] = .init(value: .number(0.5), ignoreClient: true)
-        profile.rules["top_k"] = .init(value: .number(0))
-        XCTAssertNil(profile.clientLockState())
-        profile.setAllClientLocks(true)
-        XCTAssertEqual(profile.clientLockState(), true)
-        XCTAssertEqual(profile.rules.count, 2)
-        XCTAssertEqual(profile.rules["top_k"]?.value, .number(0))
-        profile.setAllClientLocks(false)
-        XCTAssertEqual(profile.clientLockState(), false)
-        XCTAssertNil(profile.rules["reasoning_budget"])
+        XCTAssertEqual(profile.mode(.temperature), .inherited)
+        profile.setMode(.forced, field: .temperature, inherited: .number(0.6))
+        XCTAssertEqual(profile.rules["temperature"]?.value, .number(0.6))
+        XCTAssertEqual(profile.mode(.temperature), .forced)
+        profile.rules["temperature"]?.value = .number(0.25)
+        profile.setMode(.enabled, field: .temperature)
+        XCTAssertEqual(profile.rules["temperature"]?.value, .number(0.25))
+        XCTAssertEqual(profile.mode(.temperature), .enabled)
+        profile.setMode(.inherited, field: .temperature)
+        XCTAssertNil(profile.rules["temperature"])
+    }
+
+    func testBulkSelectorReportsMixedStatesAndOnlyEditsVisibleFields() {
+        var profile = GenerationDefaults()
+        profile.setMode(.enabled, field: .temperature)
+        profile.setMode(.forced, field: .topP)
+        XCTAssertNil(profile.mode(fields: [.temperature, .topP]))
+        profile.setMode(.forced, fields: [.temperature, .topK])
+        XCTAssertEqual(profile.mode(fields: [.temperature, .topP, .topK]), .forced)
+        profile.setMode(.inherited, fields: [.temperature, .topK])
+        XCTAssertEqual(profile.mode(.topP), .forced)
+        XCTAssertEqual(profile.mode(fields: [.temperature, .topK]), .inherited)
+    }
+
+    func testAgentAdapterPreservesNeutralOverridesAndUnrelatedSettings() {
+        var agent = Agent(name: "Sampling", systemPrompt: "Keep this prompt.")
+        agent.enableThinking = true
+        agent.topK = 0
+        agent.reasoningBudget = -1
+        var profile = GenerationDefaults(agent: agent)
+        XCTAssertEqual(profile.mode(.topK), .enabled)
+        XCTAssertEqual(profile.number(.topK), 0)
+        profile.setMode(.enabled, field: .temperature, inherited: .number(0.6))
+        profile.rules["repeat_penalty"] = .init(value: .number(1))
+        profile.apply(to: &agent)
+        XCTAssertEqual(agent.temperature, 0.6)
+        XCTAssertEqual(agent.topK, 0)
+        XCTAssertEqual(agent.repeatPenalty, 1)
+        XCTAssertEqual(agent.reasoningBudget, -1)
+        XCTAssertEqual(agent.enableThinking, true)
+        XCTAssertEqual(agent.systemPrompt, "Keep this prompt.")
+        profile.setMode(.inherited, fields: GenerationField.agentFields)
+        profile.apply(to: &agent)
+        XCTAssertNil(agent.temperature)
+        XCTAssertNil(agent.topK)
+        XCTAssertNil(agent.reasoningBudget)
+        XCTAssertEqual(agent.enableThinking, true)
+    }
+
+    func testInheritedProfileMergesModelValuesAndSeedsWithoutCopyingLocks() {
+        let inherited = GenerationDefaults(rules: [
+            "temperature": .init(value: .number(0.6), ignoreClient: true),
+            "top_k": .init(value: .number(20)),
+        ])
+        var profile = GenerationDefaults()
+        profile.setMode(.enabled, fields: [.temperature, .topK], inherited: inherited)
+        XCTAssertEqual(profile.number(.temperature), 0.6)
+        XCTAssertEqual(profile.number(.topK), 20)
+        XCTAssertEqual(profile.mode(.temperature), .enabled)
+        XCTAssertFalse(profile.rules["temperature"]!.ignoreClient)
+    }
+
+    func testSharedGuidanceAndPresetsPreserveExactTypedValues() {
+        XCTAssertEqual(GenerationField.temperature.guidance?.low, "Focused")
+        XCTAssertEqual(GenerationField.temperature.guidance?.high, "Creative")
+        XCTAssertEqual(GenerationField.repeatPenalty.guidance?.low, "Off")
+        XCTAssertEqual(GenerationField.topK.guidance?.low, "Off")
+        XCTAssertEqual(GenerationField.maxTokens.guidance?.low, "Auto")
+        for field in GenerationField.allCases where field.showsSlider {
+            XCTAssertNotNil(field.guidance, field.rawValue)
+        }
+        XCTAssertEqual(GenerationField.maxTokens.numberValue(12345), .number(12345))
+        XCTAssertEqual(GenerationField.topK.numberValue(20.6), .number(21))
+        XCTAssertNil(GenerationField.temperature.numberValue(.nan))
+        XCTAssertNil(GenerationField.topP.numberValue(1.1))
+        XCTAssertEqual(GenerationField.budget.presets?.first, -1)
+        XCTAssertTrue(GenerationField.maxTokens.presets!.contains(16384))
     }
 
     func testInheritedClientBodyDoesNotPinSamplingAndRemoteBodyKeepsExistingDefaults() throws {

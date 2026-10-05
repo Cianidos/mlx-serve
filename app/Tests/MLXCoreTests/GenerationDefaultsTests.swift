@@ -2,9 +2,10 @@ import XCTest
 @testable import MLXCore
 
 final class GenerationDefaultsTests: XCTestCase {
-    func testDescriptionsNameCanonicalParameters() {
+    func testCanonicalParametersLiveInLabelsNotDescriptions() {
         for field in GenerationField.allCases {
-            XCTAssertTrue(field.help.contains(field.rawValue), field.rawValue)
+            XCTAssertEqual(field.parameterName, field.rawValue)
+            XCTAssertFalse(field.help.hasPrefix(field.rawValue + " —"), field.rawValue)
         }
         XCTAssertTrue(GenerationField.budget.help.contains("reasoning_budget_tokens"))
     }
@@ -70,8 +71,10 @@ final class GenerationDefaultsTests: XCTestCase {
         XCTAssertTrue(GenerationField.topP.showsSlider)
         XCTAssertTrue(GenerationField.repeatPenalty.showsSlider)
         XCTAssertTrue(GenerationField.presencePenalty.showsSlider)
-        XCTAssertFalse(GenerationField.maxTokens.showsSlider)
-        XCTAssertFalse(GenerationField.budget.showsSlider)
+        XCTAssertTrue(GenerationField.maxTokens.showsSlider)
+        XCTAssertTrue(GenerationField.budget.showsSlider)
+        XCTAssertFalse(GenerationField.thinking.showsSlider)
+        XCTAssertFalse(GenerationField.effort.showsSlider)
     }
 
     func testResetExplainsNextRequestGenerationScope() {

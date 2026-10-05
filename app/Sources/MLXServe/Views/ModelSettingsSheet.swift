@@ -36,6 +36,7 @@ struct ModelSettingsSheet: View {
     @State private var override = ModelOverride()
     @State private var initialOverride = ModelOverride()
     @State private var settingsFile = ModelSettingsFile()
+    @State private var inheritedGeneration = GenerationDefaults()
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
@@ -240,7 +241,8 @@ struct ModelSettingsSheet: View {
                         Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
                             .font(.app(.caption)).foregroundStyle(.orange)
                     }
-                    GenerationDefaultsRows(profile: $override.generationDefaults, inheritance: "Global")
+                    GenerationDefaultsRows(profile: $override.generationDefaults, inheritance: "Global",
+                                           inherited: inheritedGeneration)
                         .disabled(override.extra["generation_defaults"] != nil)
                     Text("Applies to the next request without reloading. Model rules replace global values and their client-override policy.")
                         .font(.app(.caption)).foregroundStyle(.secondary)
@@ -324,6 +326,7 @@ struct ModelSettingsSheet: View {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
+            inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
                                                  listing: downloads.packListings[repoId])
             socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }
