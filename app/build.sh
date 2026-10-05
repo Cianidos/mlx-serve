@@ -202,8 +202,7 @@ fi
 # slower half instead of both. Output goes to a log, shown after Swift finishes.
 ZIG_LOG="$SCRIPT_DIR/.build/zig-build.log"
 mkdir -p "$SCRIPT_DIR/.build"
-# Pinned Zig nightly (homebrew's `zig` formula still ships 0.16.0, which no
-# longer builds — see build.zig's version-gate comptime block).
+# Pinned Zig release, staged by scripts/fetch-zig.sh (see build.zig's version gate).
 ZIG="$PROJECT_ROOT/.zig-toolchain/zig"
 # The zig link resolves the SDK via xcrun. Prefer the CommandLineTools SDK
 # (historical default), but a macOS upgrade can remove the CLT entirely —

@@ -916,6 +916,8 @@ pub const ToolChoice = struct {
     include_tools: bool,
     /// Owned by the caller (free with allocator) when non-null.
     instruction: ?[]const u8,
+    /// A call the reply must make; a name borrows from the request JSON.
+    forced: ?chat_mod.ForcedTool = null,
 };
 
 pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value) !ToolChoice {
@@ -924,8 +926,7 @@ pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value
         .string => |s| {
             if (std.mem.eql(u8, s, "none")) return .{ .include_tools = false, .instruction = null };
             if (std.mem.eql(u8, s, "required")) {
-                const ins = try allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text.");
-                return .{ .include_tools = true, .instruction = ins };
+                return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, .any), .forced = .any };
             }
             return .{ .include_tools = true, .instruction = null }; // "auto" default
         },
@@ -934,8 +935,8 @@ pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value
             if (!std.mem.eql(u8, t, "function")) return .{ .include_tools = true, .instruction = null };
             const name = if (obj.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
             if (name.len == 0) return .{ .include_tools = true, .instruction = null };
-            const ins = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name});
-            return .{ .include_tools = true, .instruction = ins };
+            const forced: chat_mod.ForcedTool = .{ .name = name };
+            return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, forced), .forced = forced };
         },
         else => return .{ .include_tools = true, .instruction = null },
     }

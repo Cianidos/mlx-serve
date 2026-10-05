@@ -76,4 +76,4 @@ Nowhere off your machines. Everything runs locally — no analytics, no telemetr
 
 ## How do I update?
 
-The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-core` or `brew upgrade mlx-serve`.
+The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-serve` or `brew upgrade mlx-serve`.

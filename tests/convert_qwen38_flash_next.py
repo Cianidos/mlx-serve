@@ -52,6 +52,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -234,6 +235,17 @@ def width_for(name, shape, nonexpert_bits=8, embed_bits=4):
     if name.endswith("embed_tokens.weight"):
         return embed_bits, 64
     return nonexpert_bits, 64
+
+
+def oq4e_mix_width(name, shape):
+    """`--oq4e-mix` (tiny oracle packs only): an oMLX oQ4e-style per-module mix. Every 2-D
+    projection but the router quantizes, the small inject/shared-gate rows included; widths
+    cycle 4/5/6/8 by name, group 128 wherever the row allows it."""
+    if len(shape) != 2 or shape[1] % 64 != 0 or name.endswith(".mlp.gate.weight"):
+        return None
+    if name.endswith("embed_tokens.weight"):
+        return 4, 64
+    return (4, 5, 6, 8)[zlib.crc32(name.encode()) % 4], 128 if shape[1] % 128 == 0 else 64
 
 
 def read_header(path):
@@ -441,6 +453,9 @@ def main():
     ap.add_argument("--embed-bits", type=int, default=4, help="width for embed_tokens (a gather-read table; 8 keeps the input exact-ish)")
     ap.add_argument("--ahead", type=int, default=2)
     ap.add_argument("--add-vision", action="store_true", help="append the bf16 vision tower to the pack at --dst (no re-stream)")
+    ap.add_argument("--oq4e-mix", action="store_true", help="tiny oracle packs: oMLX-style per-module widths (oq4e_mix_width), recorded in config.json")
+    ap.add_argument("--embedded-ngram", type=float, default=None, metavar="WEIGHT_SCALE",
+                    help="tiny oracle packs: ship the n-gram table as oMLX's embedded 4-bit shards stored divided by this global weight_scale")
     args = ap.parse_args()
     args.gate_up_bits = args.gate_up_bits or args.bits
     args.down_bits = args.down_bits or args.bits
@@ -513,6 +528,7 @@ def main():
         out_bytes += len(triple[2])
 
     imatrix, pool, stats = None, None, {"weighted": 0, "plain": 0}
+    overrides = {}  # mlx-lm per-module quantization entries
     if args.imatrix:
         from concurrent.futures import ProcessPoolExecutor
         from safetensors.numpy import load_file
@@ -540,6 +556,15 @@ def main():
             meta = header[name]
             if name.startswith("model.visual."):
                 continue
+            if NGRAM_MARK in name and args.embedded_ngram is not None:
+                shard_idx = int(name.rsplit("_", 1)[1].split(".")[0])
+                base = rename(name).split(".ple.")[0] + ".ple.ple_embedding.ngram_embedding."
+                arr = f32_to_bf16_u16(bf16_to_f32(read_raw(path, data_off, meta)) / args.embedded_ngram)
+                emit_q(f"{base}shards.{shard_idx}.weight", arr, 4, 32)
+                overrides[f"{base}shards.{shard_idx}"] = {"bits": 4, "group_size": 32, "mode": "affine"}
+                if shard_idx == 0:
+                    emit(base + "weight_scale", ("BF16", (1,), f32_to_bf16_u16(np.array([args.embedded_ngram], np.float32)).tobytes()))
+                continue
             if NGRAM_MARK in name:
                 if args.ngram_link:
                     continue
@@ -564,9 +589,13 @@ def main():
                 emit_q(nk[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight", arr,
                        *expert_width(nk, "down", args, n_layers), name)
                 continue
-            w = width_for(nk, arr.shape, args.nonexpert_bits, args.embed_bits) if meta["dtype"] == "BF16" else None
+            w = None
+            if meta["dtype"] == "BF16":
+                w = oq4e_mix_width(nk, arr.shape) if args.oq4e_mix else width_for(nk, arr.shape, args.nonexpert_bits, args.embed_bits)
             if w:
                 emit_q(nk, arr, *w, src_name=name)
+                if args.oq4e_mix:
+                    overrides[nk[:-len(".weight")]] = {"bits": w[0], "group_size": w[1], "mode": "affine"}
                 continue
             if nk.endswith("conv1d.weight") and arr.ndim == 3:
                 arr = np.ascontiguousarray(np.swapaxes(arr, 1, 2))
@@ -592,22 +621,24 @@ def main():
     cfg = json.loads((stage / "config.json").read_text())
     cfg.pop("vision_config", None)
     cfg["language_model_only"] = True
-    cfg["quantization"] = {"group_size": 64, "bits": args.bits, "mode": "affine"}
+    cfg["quantization"] = {"group_size": 64, "bits": args.bits, "mode": "affine", **overrides}
     cfg["quantization_config"] = cfg["quantization"]
-    cfg["ngram_table"] = {"file": "ngram_table.bin", "bits": args.ngram_bits, "group_size": 32}
+    if args.embedded_ngram is None:
+        cfg["ngram_table"] = {"file": "ngram_table.bin", "bits": args.ngram_bits, "group_size": 32}
     if imatrix is not None:
         cfg["quantization"]["calibration"] = "imatrix-weighted affine (iQ-MLX)"
         pool.shutdown()
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
+    ngram_bytes = os.path.getsize(dst / "ngram_table.bin") if (dst / "ngram_table.bin").exists() else 0
     (dst / "README.md").write_text(README.format(
-        repo_name=dst.name, ngram_gb=os.path.getsize(dst / "ngram_table.bin") / 1e9, nonexpert_bits=args.nonexpert_bits,
+        repo_name=dst.name, ngram_gb=ngram_bytes / 1e9, nonexpert_bits=args.nonexpert_bits,
         resident_gb=state["total"] / 1e9, expert_widths=expert_widths_note(args, n_layers),
         mtp_widths=f"experts {args.bits}-bit group 64, projections {args.nonexpert_bits}-bit group 64",
         tier_note=(" (a 64 GB Mac with the wired limit raised, 64k context)" if state["total"] < 56e9
                    else " (128 GB Macs)")))
     state_path.unlink()
     print(f"done: {state['total']/1e9:.1f} GB trunk + ngram_table.bin "
-          f"{os.path.getsize(dst / 'ngram_table.bin')/1e9:.1f} GB in {(time.time()-t0)/60:.0f} min")
+          f"{ngram_bytes/1e9:.1f} GB in {(time.time()-t0)/60:.0f} min")
 
 
 if __name__ == "__main__":

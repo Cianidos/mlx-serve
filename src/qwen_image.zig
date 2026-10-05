@@ -1948,6 +1948,8 @@ pub const EditOpts = struct {
     /// `output_resolution` knob. Lower = fewer joint tokens per ref (speed)
     /// at conditioning-fidelity cost; 1024 is the trained regime.
     ref_resolution: u32 = EDIT_REF_RESOLUTION,
+    /// Keep the VAE's native alpha channel in the output (RGBA edit, e.g. background removal).
+    transparent: bool = false,
 };
 
 /// diffusers calculate_dimensions: source aspect at output_resolution², round() each side.
@@ -2188,7 +2190,7 @@ pub const Engine = struct {
             var neg_cache: ?PrefixCache = if (use_prefix_cache and neg_geo != null) try PrefixCache.init(allocator, self.dit.blocks.len, &neg_geo.?, s) else null;
             defer if (neg_cache) |*c| c.deinit();
             for (start..n_steps) |i| {
-                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                if (progress) |p| if (p.boundary()) return error.Cancelled;
                 var v = try self.dit.forwardCached(img, cond.pos, sigmas[i], &geo, if (pos_cache) |*c| c else null);
                 defer free(v);
                 if (cond.neg) |neg| {
@@ -2413,7 +2415,7 @@ pub const Engine = struct {
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
         //    target]; only the target rows step.
         for (0..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
+            if (progress) |p| if (p.boundary()) return error.Cancelled;
             const model_input = try concat(&.{ ref_latents, target }, 1, s);
             defer free(model_input);
             var v = try self.dit.forwardEdit(model_input, cond.hidden, mask_pos, sigmas[i], &geo);
@@ -2446,7 +2448,7 @@ pub const Engine = struct {
         defer free(grid);
         const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
         defer free(latent);
-        const decoded = try self.vae.decode(latent);
+        const decoded = if (opts.transparent) try self.vae.decodeRgba(latent) else try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
         logMemory("vae decode");
@@ -3446,6 +3448,24 @@ test "QwenImage edit e2e CFG (env-gated)" {
     const d = try maxAbsDiff(plain, guided, engine.s);
     std.debug.print("[qwen-image] edit e2e CFG 2.5: max |cfg - plain| {d:.5}\n", .{d});
     try testing.expect(d > 0.0);
+}
+
+test "QwenImage edit e2e transparent keeps alpha (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prev_cap: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
+    const engine = try Engine.load(io, a, dir, true);
+    defer engine.deinit();
+
+    const refs = try editE2eRefs(a);
+    defer for (refs) |p| a.free(p);
+    const img = try engine.editImage(a, "remove the background", &refs, 256, 256, 42, 2, .{ .transparent = true }, null);
+    defer free(img);
+    try testing.expectEqualSlices(c_int, &.{ 1, 4, 256, 256 }, mlx.getShape(img));
+    try expectFiniteImage(img, engine.s);
 }
 
 test "QwenImage edit e2e towerless refuses (env-gated)" {

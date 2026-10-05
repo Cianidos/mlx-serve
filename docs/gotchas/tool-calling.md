@@ -453,6 +453,18 @@ emits diffs and holds back only the minimal ambiguous suffix, which is what
 vLLM's `extract_tool_calls_streaming` and llama.cpp's `common/chat.cpp` partial
 parse do — is in TODO.md.
 
+### `/v1/responses` never got it (2026-09-30)
+
+The fix above landed on chat and `/v1/messages`; the Responses stream still did
+`if (active_has_tools) continue;`, so after `response.in_progress` a tools
+request sent nothing and its whole thought arrived in the terminal burst beside
+the function call. Codex-style clients always send tools, so none of their turns
+could show thinking live or measure a first token. The Responses arm now runs
+the same order (tool hold, `streamThinkGateScan`, `streamableReasoning`,
+`unstreamedReasoning`) into `response.reasoning_summary_text.delta`, and the end
+sends only the unsent tail before the `.done` events. The answer and the calls
+still wait for the parse. Guard: `tests/test_responses_streaming.sh` [B2].
+
 ---
 
 ## A `</think>` inside a tool ARGUMENT destroyed the whole call (2026-08-05)
@@ -839,11 +851,15 @@ Qwen3.8 template renders `<think>` for ALL of them when `preserve_thinking` is
 undefined. Half the rendered prompt was prior reasoning, including the
 previous turn's loop.
 
-Fix: `serializeExtraContext` passes `preserve_thinking:false` to any template
-that reads it, so only turns after the last user query keep their reasoning.
-Qwen's default is deliberate (3.6+ is trained to reuse prior thinking), so the
-model's `chat_template_kwargs` in `model-settings.json`, or the request's own,
-can turn it back on. Precedence: request, model settings, generation_config, arch.
+Fix: `serializeExtraContext` forced `preserve_thinking:false`. Reversed on
+2026-10-04: on the imatrix Flash Next pack a real 162-turn pi session replayed
+at 60k-170k tokens looped 0 of 24 times either way, preserve-on scored +2.5 on
+tool-eval-bench (the multi-turn scenarios), and preserve-off re-prefilled up to
+44k tokens at every user follow-up because dropping prior reasoning moves the
+prefix. The template default stands; `chat_template_kwargs`
+`preserve_thinking:false` (request or `model-settings.json`) restores the old
+behaviour. A loop in history is the re-seed: non-streaming replies arrive with
+it cut (`loopTrimmedIds`), a streamed one cannot be retracted.
 Guard: the `preserve_thinking` test beside `serializeExtraContext`,
 `resolveChatThinking` in `server.zig`.
 
@@ -862,3 +878,35 @@ has tools and otherwise pass the text through.
 Fix: the non-stream split keeps markup when the request has no tools (chat,
 messages, responses), matching the stream and the other engines.
 Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+## Tool results were rewritten into user turns on a generic role header (MiMo, 2026-10-02)
+
+MiMo-V2.6's template renders every non-assistant turn as
+`<|im_start|>{{ message.role }}`, so it never spells `'tool'`. Our literal
+check read that as "no tool role" and rewrote each tool result into a user
+turn wrapped in `<tool_response>`, a format the model was not trained on.
+
+Cause: `templateReferencesToolRole` looked for the `'tool'` string only.
+
+Fix: a template that renders assistant `tool_calls` but names no tool role is
+probe-rendered with one tool message (`templateRendersToolTurn`); when its
+content survives, tool turns render natively. Templates without tool-call
+support keep the rewrite.
+Guard: `renderChatTemplate: a tool-aware template with a generic role header
+renders tool turns natively` in `chat.zig`.
+
+## jinja.cpp read `x.0` as a name, and GLM-5 tool history fell back
+
+GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()` reached via an integer property (`obj.0`). jinja.cpp parsed the `0` after the dot as an identifier, the lookup raised, and every conversation with a tool turn went to the generic fallback: the model saw Gemma-style turns, wrote `<end_of_turn>` into its reply and lost its own stop token.
+
+Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
+Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].
+
+## `tool_choice: "required"` was a request, not a constraint (2026-10-04)
+
+tool-eval-bench TC-45 sent `tool_choice: "required"` with "What is 7 times 8?" to Qwen3.8 Flash Next and got text. Its probe ("Reply with the single word OK. Do not call any tools.") then showed why a fix in the prompt is not enough: with the instruction line delivered, the model obeyed the user and the bench excluded the scenario as unenforced.
+
+Cause: all three surfaces turned `tool_choice` into an instruction line, which `renderChatTemplate` passed only to the paths that inline our own tool prompt; a template that renders the tools itself dropped it. Even delivered, a line is advice.
+
+Fix: the line reaches every template (`synthesizeToolFallbackMessages`), and the call is forced at decode: `armToolForce` arms a `ToolForce` whose opener (`chat.forcedToolOpener`, `<tool_call>\n<function=` plus the name for a named choice) `toolForceTick` commits once the think block closes. A thought still open with a quarter of `max_tokens` left is closed for the call (at `xhigh` the probe's 256 tokens were all thought). The request decodes plain so no draft round passes the closer. Dialects without a known opener keep the line only.
+Guard: `tests/test_tool_choice_required.sh` (red with the enforcement or the deadline stubbed), `ToolForce` + `forcedToolOpener` unit tests.

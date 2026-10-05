@@ -996,9 +996,8 @@ private struct ProvidersSectionContent: View {
                             serverPort: server.port,
                             status: status.first { $0.name == entry.name },
                             duplicate: ProvidersFile.duplicateNames(formState.providerEntries).contains(entry.name),
-                            onDelete: {
-                                formState.providerEntries.removeAll { $0.id == entry.id }
-                                formState.providerModelText[entry.id] = nil
+                            onDelete: { [id = entry.id] in
+                                formState.removeProvider(id: id)
                                 save()
                             },
                             onCommit: save)
@@ -1933,15 +1932,23 @@ private struct MemorySectionContent: View {
                     .toggleStyle(.switch).font(.app(.body))
             }
         }
-        if let m = meta["osMemoryReserve"] {
+        if let m = meta["osReserveGiB"] {
             SettingsRow(
                 title: m.title,
                 explainer: m.explainer,
-                isDirty: dirty.dirty(\.osMemoryReserve)
+                isDirty: dirty.dirty(\.osReserveGiB)
             ) {
-                Toggle("", isOn: opts.osMemoryReserve)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
+                let auto = ServerOptions.autoOsReserveGiB(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+                Picker("", selection: opts.osReserveGiB) {
+                    Text("Auto (\(auto.formatted(.number.precision(.fractionLength(0...1)))) GB)")
+                        .font(.app(.body)).tag(Int?.none)
+                    ForEach([0, 2, 3, 4, 6, 8], id: \.self) { gib in
+                        Text(gib == 0 ? "Off" : "\(gib) GB").font(.app(.body)).tag(Int?.some(gib))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 220).font(.app(.body))
             }
         }
         if showMLX {

@@ -300,6 +300,12 @@ return contig(o, s);   // `o` is never freed
 - **Rule**: a helper that materializes a view owns the view — free the intermediate, don't just wrap it. `mlx_clear_cache` is NOT the fix for this class (that's the cache-growth one above); if `active_bytes` itself climbs, you are holding handles. Prefer one shared slice-and-materialize helper per file over N hand-rolled copies: this shipped six times in one file because each site was written independently.
 - Guards: `tests/test_media_gen_memory.sh` (varies the size-driving shape across generations — a fixed-size replay cannot separate a leak from size-keyed caching — and asserts three load/gen/unload cycles return to the pre-load baseline; red-on-revert at +3.18 GB across four generations) and the hermetic `materializing helpers hand back every array they take` in mage_flow.zig, which calls each helper with a source built and freed INSIDE the loop and asserts `mlx_get_active_memory` returns to baseline. **The input must be rebuilt per iteration**: a caller-owned source that outlives the call keeps the parent alive anyway, and the first version of that test passed against the broken code for exactly that reason.
 
+### A scope freed AFTER the eval holds every activation of the step (Stable Audio 3, 45 GB at 120 s, 2026-10-03)
+`stable_audio.zig` collects a forward's intermediates in a `Scope` and frees them together. The sampler and the chunked decoder built each step inside a scope whose `deinit` ran after `mlx_array_eval`, so every handle was still live during the eval and MLX could not release a buffer once its consumer ran: a 120 s clip (162 decode windows, 8 DiT steps) peaked at 45 GB on a 2.6 GB model, and 30 s held 10 GB above the weights. Parity was perfect throughout; only `/props` `peak_bytes` showed it.
+- **Fix**: close the scope BEFORE the eval and keep only the output (`Scope.out` in a labelled block); 30 s now holds 657 MB, 120 s peaks at 4.2 GB, and it got faster (1.5 s → 0.6 s).
+- **Rule**: a handle you still hold pins its buffer through the eval. Release a step's intermediates before evaluating its result, not after.
+- Guard: `sa3: a 30 s sample + decode holds no more than one step's working set` (SA3_TEST_MODEL), red at 9969 MB before the fix.
+
 ## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
 
 `./mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige…` died mid-request with
@@ -4895,14 +4901,24 @@ reads the first attention layer's own offset. Gated: the 27B's batched
 +12%/+8% were measured with the cap dead, and un-batching those streams is
 unmeasured.
 
-## The PLE prefill prefetch is a kv gate, not a flag (PR #363)
+## PLE prefill must measure table reads, not infer residency from context length
 
-The pool served decode widths only. On the 374k ladder the serial gather went
-67.7 -> 267.9 ms per 1000 prompt tokens as the weights evicted the 32 GB
-mapping (31% of the prefill slowdown); on a resident table the pool LOSES
-2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
-of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
-and both arms announce which one ran.
+Short KV does not guarantee a resident n-gram mapping. A cold 29.8 GiB table
+reproduced 1.6–3.0 s TTFT after startup; parallel reads restored throughput.
+Resident tables can favor serial reads (the earlier sweep found a 2–7% pool penalty).
+
+`NgramTable.calibrateArm` samples 128 disjoint rows per arm with a 20% margin.
+Warming completion publishes an atomic refresh request; the next automatic wide
+gather measures fresh rows on the inference thread. The warmer never borrows
+the reader pool or mutates its policy. Completion alone does not force serial
+on a table that cannot stay resident. The KV gate still handles long contexts.
+With `MLX_SERVE_NGRAM_WARM=0`, only the load-time calibration runs: demand reads
+do not re-arm it. A cold-load pool choice therefore persists even if demand
+reads later warm the table. Reload to remeasure, or explicitly force the read arm.
+`QWEN4_PLE_PREFETCH_PREFILL=0|1` forces serial/pool and skips calibration.
+BF16 and GPU gathers retain their existing paths. The `ngram prefill` tests pin
+the margin, overrides, warm refresh, pool engagement and identical gathered rows.
+Adapted from Sushi's measured gather selection.
 
 ## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
 
@@ -5457,3 +5473,146 @@ raw BF16 rows do not depend on quantization group size`.
   slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
   branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
 - Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.
+
+### A per-round buffer sized by one drafter's cap overflows when another feeds the round
+
+MiMo's MTP history stash kept the round's committed ids in `[MAX_DEPTH + 1]u32` (9), but prompt-lookup rounds ride the same stash and commit up to `mtp_lookup.MAX_DRAFT_STRONG` (14) drafts. The first whole-file edit that engaged lookup wrote past the array; ReleaseFast has no bounds check, so the write landed in the generator's `ForwardCtx` and the next verify spliced a garbage `vision_embeddings` handle (`spliceVisionRows`, SIGSEGV at a two-u32 address). A ReleaseSafe build named the line at once (`index 9, len 9`).
+
+Fix: `MAX_ROUND_DRAFTS` = the max over every round producer, used by the stash and the merged history. Guard: `tests/test_mimo_v2.sh` [9] (a whole-file edit that engages lookup). Tell: a segfault on a field nothing writes, at an address made of small integers — rebuild ReleaseSafe and replay.
+
+## A full-buffer sliding layer caches every token it never reads
+
+MiMo-V2.6-Flash has 39 sliding-window (128) layers and 9 global ones. Our KV cache kept every token on the sliding layers too, so 87% of its 222 KB/token was rows attention never reads. The bill was honest about it, which is how it hurt: the app's `--ctx-size 1048576` billed 233 GB of context KV, the hot-cache clamp left 0 MB, and an 88k-token agent turn (a 20 GB entry anyway) re-prefilled its whole prompt every turn, ~38 s each; a 140k prompt failed admission.
+
+Fix: `ModelConfig.slidingRing` archs keep a ring of window + `SLIDING_RING_SLACK` rows per sliding layer (`KVCache.updateSliding`: a grow carries only the newest `keep` rows; `entry.base` maps buffer rows to absolute positions, so `offset`/`step` stay absolute), as mlx-lm's `RotatingKVCache`. Bills: global layers per token, rings once per slot (`slotFixedKvBytes`). A ring cannot rewind past its dropped rows: `truncate` and `trimmedCopy` refuse, the prefix cache restores only at matches above `ringFloor` (`ringRestores`), the SSD tier skips rings, and the hot-cache ask is one whole session (`ungatedHotCacheAsk`), since a ring entry is never trimmed.
+
+Guards: `KVCache sliding ring` (views bit-equal to a full buffer through chunks, decode, rollback, snapshot), `mimo_v2 sliding ring` (whole-forward logits bit-identical on the tiny pack), `prefix cache: a sliding ring restores only where…`, `DiskTier: a sliding ring is never persisted`.
+
+
+## A prefill-tiled kernel at decode width is one threadgroup's work (GLM-5)
+
+GLM's hyper-connection mixes kernel ran 8 rows per threadgroup with simdgroup matrices: right for prefill, but at one decode row it streamed the whole 1.5 MB `fn` through a single threadgroup, 90 times per token. Decode fell from 54 to 35 tok/s. The NAX indexer did the same thing in a different shape: one query padded to a 64-row tile, 63/64 of the MMA wasted per pool tile.
+
+Fix: the mixes kernel serves 512+ rows (`MIXES_KERNEL_MIN_ROWS`); one token runs `hcPre` (16 threadgroups, each a K-slice of all the mixes); one indexer query runs `decodeSelect` (fused pool + score, radix top-k).
+Guard: `glm5 mHC mixes and expand kernels match the op chain` (rows past the gate), `glm5 one-token hcPre chain…`, the two `glm5 one-query…` tests.
+
+## Partials that cross threadgroups inside one dispatch went stale
+
+`hcPre` reduces its 16 threadgroups' partial mixes in whichever threadgroup arrives last (a device counter nothing resets). With plain stores and loads the last threadgroup read wrong partials, and differently on each run, even with `atomic_thread_fence` on both sides: a core's L1 can hold stale lines of a reused buffer.
+
+Fix: partials go out by `atomic_store_explicit` and come back by `atomic_load_explicit` (both through L2); every storing thread fences before the arrival increment. The counter is 8 words, because an input shorter than 8 elements binds in the read-only constant address space.
+Guard: the hcPre test re-dispatches 32 times and requires bit-identical output.
+
+## An ablation that leaves an output unwritten measures NaN routing
+
+Profiling GLM decode by skipping parts: dropping the Sinkhorn gates (post/comb left unwritten), or feeding each branch the previous one's raw output, "saved" 0.5-1 ms. Both were artifacts. Garbage or unnormalized activations route every MoE layer to the same few experts, which then hit cache. Done right (real gates at 1 iteration; an `rms_norm` in place of the collapse) the gates cost 0.15 ms and the mHC 1.25 ms.
+
+Rule: an ablation keeps every live value sane (finite and normalized like the original). An f32 scalar in the stand-in op promotes bf16 and moves the whole branch to f32 kernels, so that skews the result too.
+
+## A cache row nothing reads in this forward stays a lazy chain (GLM-5 indexer)
+
+GLM's DSA layers append an indexer row (key | gate) every token, but below 2051 tokens selection never runs, so nothing in the token's graph read the indexer cache. The decode step evaluates only the token and the logits, so MLX never computed those rows: each `SliceUpdate` hung off the previous one, a chain growing by ~7 ops x 11 layers per token, evaluated all at once (a stall, and the retained intermediates' memory) when the context first passed 2051. Short-context decode looked faster than it was, because it skipped work.
+
+Fix: the attention output depends on the indexer cache (`glm5.withDependency` over `mlx_depends`), so every step materializes its row.
+Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tell: a decode graph dump with no `SliceUpdate` for a cache the layer writes.
+
+
+## GLM-5.3's long-prompt output moved with the prefill chunk width, and it was not a bug
+
+Defect suspected: on a cold 9.5k-token prompt, token 0's top-2 swapped and one token moved 4+ nats between prefill widths (single pass, 8192, 4096, 2048), and the prefix cache's 30-token tail split flipped the greedy answer against cache-off; Qwen3.6-35B-A3B moved at most 0.25 nats on the same sweep. Cause: rounding order, not carried state. Swapping the KDA recurrence for an equivalent kernel in ONE pass moved the token as far as chunking did (1.16 vs 1.35 nats with the indexer forced dense), a confident next token agreed at every width (-0.06), the per-core KDA kernel matches f64 from a nonzero state with a partial tail block, and the tiny fixture's chunked prefill matches the reference past its indexer budget. DSA's top-k pool choice is discontinuous, so small differences pick other pools. Bar for "chunking bug": a width swing larger than a same-math kernel swap at one pass, or a confident token that moves.
+
+## Flash Next serial decode is GPU-bound at 11 ms, and three dispatch-count fusions were nulls (2026-10-03)
+
+Setup: M5 Ultra, iQ-MLX-4.7bpw pack, `MLX_SERVE_DECODE_FWD_UBENCH=30`, same-boot arms interleaved. The forward reads 5.9 GB per token; the machine's qmv peak is ~1.1 TB/s (lm_head), so the bytes floor is 5.4 ms against 11.0 ms measured.
+
+What was measured first, so the rest is not guessed:
+- The eval is two host phases. With one command buffer per forward (`MLX_MAX_OPS_PER_BUFFER`/`MLX_MAX_MB_PER_BUFFER` huge) the host encode is 3.8 ms and the GPU wait 11.0 ms; the default mode's 9.6 ms "encode" is the encoder throttled on `MAX_ACTIVE_TASKS` (10 open buffers), i.e. GPU pacing. `fwd-ubench` now prints `[encode + wait]`.
+- `MLX_SERVE_DISPATCH_PROBE` 0/4/8: 11.07 / 11.61 / 12.13 ms GPU, ~2.8 us per CHAINED op on this forward. The decode graph dump has 2056 nodes, ~1180 of them kernels (579 custom, 315 qmm), 22 per GDN+MoE layer.
+- `MLX_SERVE_STEP_TRACE=1` on a serial step: build 1.25, PLE flush 0.3-0.5, submit 9.3 (throttled encode), resolve 0.001 ms. The flush is the only GPU idle per token.
+- hc read kernels by stand-in (`MLX_SERVE_HC_DIAG_SKIP=d|u`): U 0.9 ms, D 0.63 ms, all reads 1.95 ms against a 0.6 ms byte floor. The `n` stand-in drops the deferred write, MLX prunes every layer and the forward reads 1.6 ms: not a measurement.
+
+Three nulls, all reverted:
+1. The gated shared expert on the decode gather kernels (a one-expert bank through `gatherQmvGateUp` + a down+reduce variant with the sigmoid gate in-kernel): 8 chained dispatches became 2 and the forward got SLOWER, 11.00 -> 11.22 ms; each kernel alone was slower than the MLX qmv + elementwise it replaced (+0.15 / +0.09 ms). A single-expert GEMV on those kernels is 80 threadgroups each walking 20 serial load iterations: latency-bound. Dense GEMVs belong to MLX's qmv.
+2. Only the tail (sigmoid, multiply, add) folded into the down+reduce epilogue, bit-identical: 11.04 vs 11.02 ms, a wash. Those elementwise dispatches were already free, so the probe's per-op price does not transfer to ops MLX overlaps.
+3. The `uv` up/mix kernel at one row: 11.22/11.24/11.21 vs 11.26/10.98, inside between-boot noise.
+
+Rule: on this forward the MoE block is kernel-time bound; removing small dispatches buys nothing and a replacement kernel must beat MLX's qmv on its own. The levers left are the kernels themselves (hc U and D), the per-step host sync (next story) and bytes.
+
+## The one GPU idle per serial token was the n-gram history settle, and an async batch has ONE event (2026-10-03)
+
+`MLX_SERVE_STEP_TRACE=1` on the GPU PLE arm: build 1.3, flush 0.3, submit 9.3 ms per step; the flush is `flushDeferredPle` reading the step's own token so `pleAdvanceSerial` can move the history, and the GPU idles for that round trip plus the encode lead. The history is only read by the NEXT forward, a batch join, the spec drain and the cache commit at slot finish, so the GPU arm now leaves the record pending and those four sites settle it (`pleEmbedding`, `drainPipelineForBatch`, `drainPipelineForSpec`, `finishSlot`; `Generator.deinit` discards). `MLX_SERVE_PLE_LAZY_SETTLE=0` restores the eager settle.
+
+Two attempts lost 8% before it won: settling at the next build still cost 1.2 ms. MLX gives every array evaluated in one `async_eval` that batch's END event, so waiting on the sampled token (sampled inside the forward's batch) waited for the whole forward. `lazyForward` now `async_eval`s the reshaped token alone before building on it; the deferred settle then waits on the sampler. Reading the id straight off the evaluated array (no cast/contiguous ops, which would queue behind the running forward) is the other half.
+
+Measured (M5 Ultra, iQ-MLX-4.7bpw, `--ple-gpu`, 2+2 interleaved boots): short 90.3/91.8 vs 89.4/88.9 tok/s, 8k 83.3/83.9 vs 81.3/82.2, flush 0.000 ms, greedy text byte-identical to the eager and CPU arms. The CPU arm keeps its per-step gather (it needs the token).
+
+## Per-kernel profile of the Flash Next step: the big GEMVs are at the floor, the small ones are launch-bound (2026-10-04)
+
+Metal System Trace via `xcrun xctrace record --attach`, with the Shader Timeline enabled by a patched template (the CLI refuses the option; recipe and tables in the session scratchpad `prof/`). One serial step on the M5 Ultra, iQ-MLX-4.7bpw, `--ple-gpu`: 996 named kernels, 9.99 ms. MLX's `affine_qmv_fast` is 44% of it and the large projections run AT the machine's bandwidth (GDN in-proj 42 MB in 38.6 us, lm_head 636 MB in 594 us, out-proj 870 GB/s). The waste sits in ~150 SMALL dense GEMVs per step (router 512 rows, shared-expert gate/up 640 rows) at 6.8 us each and the shared-expert down on the generic `qmv` (K=640 misses the fast kernel's 256-wide block) at 13.5 us: 1.65 ms against a ~0.3 ms byte floor.
+
+Two kernels built against that, both nulls or losses, both reverted:
+- A register-resident top-k for the fused router (`moeRouterSource`: the lane's 16 keys stay in registers across the K max-then-mask rounds, no threadgroup traffic or barriers): 10.45/10.48 vs 10.67/10.54/10.72 ms GPU, about -0.18 ms. KEPT; parity tests bit-identical.
+- A split-K small-GEMV (`msv_qmv_small`: a threadgroup per 2-4 rows, 5-8 simdgroups splitting K on group boundaries, 320 threadgroups for a 640-row weight; then a second version with every load hoisted under a compile-time trip count): +0.1 to +0.2 ms GPU over stock in 3+3 interleaved boots, both versions, with the fp32-truth parity green. A custom `metal_kernel` dispatch costs more than MLX's built-in `qmv` at these shapes however the work is laid out; the small GEMVs are launch-latency bound, not parallelism bound.
+
+Rule: on this step the per-dispatch fixed cost (~1000 dispatches) is the structural overhead above the 5.4 ms byte floor; a kernel that replaces one dispatch with one dispatch cannot win there, only a kernel that replaces several and is no slower itself.
+
+Addendum, same night: bigger command buffers lose. `MLX_MAX_OPS_PER_BUFFER=200` with the MB cap lifted (about 17 buffers per step instead of ~100) read 10.82 vs 10.45 ms GPU in 3+3 boots: the encoder stops being throttled (3.8 ms) but the GPU starts later and the overlap at the step's head and tail goes. The ~5 us between kicks is not recoverable by packing.
+
+## The routed-expert kernels were kernel-time bound, and the fp4 shape fixes them (2026-10-04)
+
+The kernel microbench (`src/moe_gather_ubench.zig`, `MOE_UBENCH=1`) put the shipped per-slot gather kernels at 26 us for gate+up (~700 GB/s) and 26 us for down+reduce (~340 GB/s, latency-bound at K=640: 320 bytes of weights per row), within a few us of the in-situ profile, so the cost was real kernel work. `moe_affine4.zig` ports `moe_fp4`'s shape to 4-bit affine with biases: a simdgroup owns `ROWS` output rows (four here, one now: see the occupancy story below) and keeps its 16 values of x in registers across them, 8-byte loads, no threadgroup memory, the down kernel accumulates every expert of the token in registers with the score folded in, the bias rides a per-group sum of x, and a K that is not a whole 512 block (640) is predicated per lane. One token only (a row re-reads its own experts). Same-boot A/B, 3+3 boots: 10.17/10.19/10.29 vs 10.51/10.40/10.42 ms GPU, about -0.22 ms; bar `moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth`. `MLX_SERVE_MOE_AFFINE4=0` restores the per-slot kernels.
+
+## Long-context decode: the attention layer is a chain, and one-token QSA attention shortens it (2026-10-04)
+
+Past the indexer budget (2051 tokens) a serial Flash Next step costs ~1 ms more: per attention layer indexer prep, `msv_qsa_score` (20 us), `msv_qsa_select` (8), a ~35 us mask or gather op chain, two-pass SDPA (20 + 9) and the gate multiply, one dependent launch after another.
+
+What the profile taught, so it is not re-measured:
+- MLX gives a concurrent encoder a GLOBAL barrier before any kernel that reads an outstanding write, so two branches overlap for one stage only. The 34 us q projection ran before the indexer chain; ordering it behind the indexer with `mlx_depends` made the layer 8 us worse (the tape still put it before the score).
+- `msv_qsa_score` costs 13-16 us at 2k AND 10k blocks, so it is latency, not bytes (most likely its eight dependent matrix-op runs). No scalar order reproduces it: seven candidate accumulation orders (sequential FMA, 16-deep chunks, trees, an exactly rounded f64 sum) each differ from the matrix unit in ~30% of scores, and decode, verify and prefill must pick the same blocks, so the score stays on that kernel.
+- Kept: one kernel writes the row's key mask (+0.7% at 8k), then `qsa_decode.zig` (split pass + merge straight over the picks, no mask, gather or SDPA): 8k 99.3 -> 103.1, 21k 97.6 -> 102.5, 40k 96.8 -> 101.1 tok/s, `MLX_SERVE_QSA_DEC_KERNEL=0` restores. Dense KV, solo rows only (`solo` in `qsaMaskFromQk`; batched slots and verify widths keep their arms).
+- Four q heads per simdgroup cost 28 us (registers), one per simdgroup 21 us. An eight-key butterfly leaves key `lane >> 2` on four lanes; a reduction inside divergent code (`key ? reduce(...) : -inf`) returns garbage for the tail keys, so reduce first and select after.
+
+Guard: `qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth` (six contexts, 0 and 3 tail keys) and `qsa mask: the one-row kernel equals the op chain`.
+
+## Rows per simdgroup is an occupancy decision: the affine-4 MoE kernels at one row (2026-10-04)
+
+Both `moe_affine4` kernels shared four output rows a simdgroup (x registers amortized over four dots). The down kernel alone read 17.7 us for 9.2 MB (520 GB/s), so it looked latency-bound, and three plausible fixes lost or tied:
+- Ablating inside the kernel priced it: no activation loads -0.06 ms/token, no scale/bias loads -0.07, no WEIGHT loads at all -0.32 of the kernel's 0.85. The rest is issue and occupancy, not bytes.
+- Hoisting the expert ids and unrolling the expert loop: a tie. Double-buffering the next expert's weights in registers plus the mask-instead-of-shift nibble dot: 6% SLOWER (104.2 vs 110.7 tok/s) with identical text, most likely the register file again. Splitting a row's ten experts over 2, 5 or 10 simdgroups with a threadgroup sum: +0.5% at best.
+- What won was a constant: rows per simdgroup 4 -> 1 on both kernels, 110.5 -> 114.8 tok/s (8k: 103.1 -> 107.0; 2 rows ~113.8, 8 rows 101.8; threadgroup width 1-8 simdgroups did not matter; down alone +1.6, gate+up +2.5). The same lesson as `qsa_decode` (one head a simdgroup).
+
+Rule: before porting or deepening a multi-row decode kernel, sweep rows per simdgroup in situ (a short-context serial run per value, one boot each). A sweep script must word-split its configs explicitly: zsh does not split `$cfg`, and a bad knob made the kernels decline silently to the slow arm, so a first sweep measured nothing.
+
+What is left in the hyper-connection reads is not a single-kernel job: one read is 6.6 MB (down 3.3 + up 3.3), floor ~6 us, now 12.4 us in two launches; the up launch is itself a 3.3 MB GEMV, so folding it into the down launch needs a grid-wide handoff for little.
+
+## An embedded PLE table does not identify the norm convention
+
+- Defect: a Qwen4 pack with embedded PLE shards and already folded RMS weights would load and add 1 again, corrupting every affected norm while decoding without an error.
+- Cause: the loader used table storage to choose the norm transform, though the two are independent checkpoint choices.
+- Fix: load the weights unfolded; unmarked embedded packs infer from the loaded indexer q/k arrays on every expected full-attention layer: valid shapes, finite values, and unanimous means near 0 (`delta`) or 1 (`folded`). Fold eligible keys once in the shared trunk/MTP map, adding 1 before narrowing F16 to BF16. Missing, mixed, or ambiguous anchors fail by name; a checkpoint-local `qwen4_norm_convention` marker selects either convention explicitly, while unmarked external-table packs retain the folded default. A server-wide override for this field is refused. Embedded `weight_scale` must be identity when present.
+- Guard: model tests cover both inferred conventions, missing/mixed/malformed anchors, explicit markers across both layouts, all ten norm roles, and refusal of the global override; scale/header fixtures and the shared residency estimate guard the table path.
+
+## A fast path keyed on one pack's quant layout is silent on another's (Flash Next oQ4e, 2026-10-04)
+
+- Defect: oMLX's `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` loaded and answered correctly, but serial decode ran at half our pack's speed (21.7 vs 11 ms a forward). Nearly every tuned Flash Next path had declined without an error. They had been written against our pack's layout: 8-bit g64 non-expert weights, a dense inject and shared gate, and a merged `ngram_table.bin`.
+- Causes:
+  - Every fused hyper-connection kernel and the `softmax_gate` router fold read the inject and shared gate as dense rows. oQ4e quantizes both.
+  - The HC kernels and the MTP head's row kernel (`msvQmvRows`) unpacked 2/4/8-bit g64 only, and the verify graphs hardcoded 8-bit g64.
+  - The verify lanes were gated on 6-bit g64 at N ≥ 5120, and the `--ple-gpu` arm read one merged file.
+  - Launch-config caches had one slot or ignored the width, so alternating widths rebuilt a config per call. `op_count` in fwd-ubench counts FFI calls, config builds included; that is how 135 rebuilds per forward showed up, even on our own pack.
+- Found on the way: on the dual-die M5 (`applegpu_g17d`), MLX leaves per-row qmv at 18 rows while the joined batched projections allowed 24, so 3 slots × 6 rows stopped matching each slot alone (`qmvBatchLimit` mirrors MLX's table now). The test for it had always skipped on that machine.
+- Fix:
+  - Tiny dense-only tensors are dequantized at load (`dequantizeSmall`).
+  - The kernels unpack every affine width (`hc_pack8`, `msvQmvRows` at 3/5/6 bits and g128), and config caches key per width.
+  - Gates were re-measured per shape: 5/6-bit lanes from N 2560, NAX for those shapes only past 8 rows, while 8-bit N 2560 lost at M 7-8 and stays off.
+  - Embedded n-gram shards are repacked into one buffer for `--ple-gpu`.
+  - Serial decode went from 21.7 to 10.4 ms a forward, 9.6 ms with `--ple-gpu`.
+- Attribution trap: a prefill-width fwd-ubench chunk includes the synchronous host n-gram gather and ranked the GDN prefill fusion backwards on this pack. The server-timed `prefill_ab.sh` decides.
+- Guard: run `tests/qwen4_engagement.sh <pack>` on any new layout before measuring speed. Parity tests cover {4,5,6,8} × {g64,g128}, and the tiny `--oq4e-mix --embedded-ngram` pack runs through the `qwen4 fixture` forward oracle.
+
+## A short MoE prefill re-read every expert per row
+
+- Defect: a Nemotron-3 Nano prompt of a few dozen tokens took longer in the MoE than one twice its length.
+- Cause: the sorted expert gather (MLX's `gather_qmm_rhs` and our NAX `sortedGather`, which mirrors its gate) streams each expert once only at `B / E >= 4` sorted rows per expert; below it every row runs a `gather_qmv` that re-reads its expert's weights.
+- Fix: `nemotronMoeExperts` appends pad rows spread over the experts up to 4 per expert once there are 2+ (`moeStreamPadRows`); the pad rows sort past `total_inds`, so slicing `inv_order` drops them. Only on quantized banks with NAX (`moeStreamPadPays`): dense banks run `mlx_gather_mm` unsorted, and non-NAX machines are unmeasured.
+- Guard: `nemotronMoe matches a host reference of NemotronHMoE` (padded arm, forced by the `stream_pad` argument).

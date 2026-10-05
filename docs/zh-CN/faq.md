@@ -76,4 +76,4 @@
 
 ## 怎么更新？
 
-MLX Core 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-core` 或 `brew upgrade mlx-serve`。
+MLX Core 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-serve` 或 `brew upgrade mlx-serve`。
