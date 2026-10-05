@@ -10,6 +10,7 @@
 "Force: ignore client override" = "强制：忽略客户端覆盖";
 "Server default" = "服务器默认值";
 "Mixed" = "混合";
+"Force" = "强制";
 "Selective" = "严格筛选";
 "Lower values favor predictable replies; higher values add variety. 0 is greedy." = "较低值使回复更可预测；较高值增加多样性。0 使用贪心采样。";
 "Keep the smallest token pool covering this probability. 1 keeps all tokens." = "保留覆盖该概率的最小 token 集合。1 保留所有 token。";

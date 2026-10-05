@@ -15,9 +15,6 @@ struct GenerationDefaultsRows: View {
                     Text(L10n.format("Off: %@ · On: custom value", L10n.text(inheritance))
                          + (allowsForce ? L10n.text(" · Force: ignore client override") : ""))
                         .font(.app(.caption2)).foregroundStyle(.secondary)
-                    if profile.mode(fields: fields) == nil {
-                        Text("Mixed").font(.app(.caption2)).foregroundStyle(.secondary)
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 GenerationModeSwitch(value: profile.mode(fields: fields), allowsForce: allowsForce,
@@ -150,35 +147,70 @@ struct GenerationModeSwitch: View {
     let inheritance: String
     let title: String
     let onChange: (GenerationDefaults.Mode) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var stateLabel: String {
+        switch value {
+        case .inherited: "Off"
+        case .enabled: "On"
+        case .forced: "Force"
+        case nil: "Mixed"
+        }
+    }
+
+    private var ballColor: Color {
+        switch value {
+        case .inherited, nil: .gray
+        case .enabled: .accentColor
+        case .forced: .orange
+        }
+    }
 
     private var modes: [GenerationDefaults.Mode] {
         allowsForce ? [.inherited, .enabled, .forced] : [.inherited, .enabled]
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(modes, id: \.rawValue) { mode in
-                Button { onChange(mode) } label: {
-                    Circle()
-                        .fill(value == mode ? Color.accentColor : Color.secondary.opacity(0.35))
-                        .frame(width: value == mode ? 16 : 8, height: value == mode ? 16 : 8)
-                        .frame(width: 26, height: 28)
-                        .contentShape(Rectangle())
+        VStack(spacing: 3) {
+            HStack(spacing: 0) {
+                ForEach(modes, id: \.rawValue) { mode in
+                    Button { onChange(mode) } label: {
+                        Circle()
+                            .fill(Color.secondary.opacity(value == mode ? 0 : 0.35))
+                            .frame(width: 6, height: 6)
+                            .frame(width: 20, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(help(mode))
+                    .accessibilityLabel(L10n.text(title) + ": " + help(mode))
+                    .accessibilityValue(value == mode ? L10n.text("Selected") : "")
                 }
-                .buttonStyle(.plain)
-                .help(help(mode))
-                .accessibilityLabel(L10n.text(title) + ": " + help(mode))
-                .accessibilityValue(value == mode ? L10n.text("Selected") : "")
             }
+            .background {
+                Capsule().fill(Color.secondary.opacity(0.2)).frame(height: 2).padding(.horizontal, 10)
+            }
+            .overlay(alignment: .leading) {
+                Circle().fill(ballColor).frame(width: 14, height: 14)
+                    .offset(x: 3 + CGFloat(value?.rawValue ?? 0) * 20)
+                    .opacity(value == nil ? 0 : 1)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: value)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 3)
+            .background(Color.secondary.opacity(0.1), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2), lineWidth: 1))
+            Text(L10n.text(stateLabel)).font(.app(.caption2))
+                .foregroundStyle(value == .forced ? Color.orange : Color.secondary)
+                .frame(height: 14)
+                .frame(maxWidth: .infinity)
+                .accessibilityHidden(true)
         }
-        .background {
-            Capsule().fill(Color.secondary.opacity(0.2)).frame(height: 2).padding(.horizontal, 13)
-        }
-        .padding(.horizontal, 3)
-        .background(Color.secondary.opacity(0.1), in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2), lineWidth: 1))
+        .frame(width: CGFloat(modes.count * 20 + 6))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(L10n.text(title))
+        .accessibilityValue(L10n.text(stateLabel))
     }
 
     private func help(_ mode: GenerationDefaults.Mode) -> String {

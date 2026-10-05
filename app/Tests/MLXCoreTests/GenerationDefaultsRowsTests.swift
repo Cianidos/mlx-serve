@@ -26,6 +26,41 @@ final class GenerationDefaultsRowsTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testModeSwitchStaysCompactAndKeepsLabelSpaceForMixedState() {
+        let states: [GenerationDefaults.Mode?] = [nil, .inherited, .enabled, .forced]
+        for allowsForce in [false, true] {
+            var previous: CGSize?
+            for state in states where allowsForce || state != .forced {
+                let view = GenerationModeSwitch(value: state, allowsForce: allowsForce,
+                    inheritance: "Model default", title: "Temperature", onChange: { _ in })
+                let size = NSHostingView(rootView: view).fittingSize
+                XCTAssertLessThanOrEqual(size.width, allowsForce ? 68 : 48)
+                XCTAssertGreaterThanOrEqual(size.height, 44)
+                if let previous { XCTAssertEqual(size, previous) }
+                previous = size
+            }
+        }
+    }
+
+    @MainActor
+    func testBulkMixedStateDoesNotMoveRows() {
+        var mixed = GenerationDefaults()
+        mixed.setMode(.enabled, field: .thinking)
+        var enabled = mixed
+        enabled.setMode(.enabled, field: .effort)
+        let inherited = GenerationDefaults(rules: [
+            "enable_thinking": .init(value: .boolean(true)),
+            "reasoning_effort": .init(value: .text("low")),
+        ])
+        let sizes = [GenerationDefaults(), mixed, enabled].map { profile in
+            NSHostingView(rootView: GenerationDefaultsRows(profile: .constant(profile),
+                fields: [.thinking, .effort], inherited: inherited).frame(width: 620)).fittingSize
+        }
+        XCTAssertEqual(sizes[0], sizes[1])
+        XCTAssertEqual(sizes[1], sizes[2])
+    }
+
     func testSelectorStatesCreateRulesPreserveValuesAndClearInheritance() {
         var profile = GenerationDefaults()
         XCTAssertEqual(profile.mode(.temperature), .inherited)
