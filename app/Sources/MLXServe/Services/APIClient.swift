@@ -590,7 +590,6 @@ class APIClient {
             body["repeat_penalty"] = repeatPenalty
             body["presence_penalty"] = presencePenalty
             body["reasoning_budget_tokens"] = reasoningBudget
-            body["reasoning_budget"] = nil
         }
 
         static let none = RequestDefaults()

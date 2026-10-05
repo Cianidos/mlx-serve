@@ -96,18 +96,22 @@ final class GenerationDefaultsTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(GenerationDefaults.self, from: JSONEncoder().encode(profile)), profile)
     }
 
-    func testLegacyMigrationKeepsValuesButDoesNotOverwriteExistingProfile() throws {
+    func testLegacyMigrationKeepsOnlyServerWideValuesAndDoesNotOverwriteExistingProfile() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("generation-settings.json").path
         var options = ServerOptions()
         options.defaultReasoningBudget = 1024
+        options.defaultRepeatPenalty = 1.1
         options.defaultTemperature = 0.8
         try GenerationDefaultsFile.migrate(options, path: path)
         let profile = try GenerationDefaultsFile.load(path: path)
-        XCTAssertEqual(profile.rules["reasoning_budget"]?.value, .number(1024))
         XCTAssertEqual(profile.rules["temperature"]?.value, .number(0.8))
         XCTAssertNil(profile.rules["top_k"])
+        // App-chat-only defaults stay off the server: they would cap and penalize every client.
+        XCTAssertNil(profile.rules["reasoning_budget"])
+        XCTAssertNil(profile.rules["repeat_penalty"])
+        XCTAssertNil(profile.rules["max_tokens"])
         XCTAssertTrue(profile.rules.values.allSatisfy { !$0.ignoreClient })
         try GenerationDefaultsFile.save(.init(), path: path)
         try GenerationDefaultsFile.migrate(options, path: path)

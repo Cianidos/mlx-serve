@@ -126,18 +126,13 @@ struct GenerationDefaults: Codable, Equatable {
         return nil
     }
 
+    /// Only what the app already applied server-wide (its `--temp`/`--top-p`/`--top-k` launch
+    /// flags); the other saved defaults rode the app's own chats and must not reach every client.
     static func legacy(_ options: ServerOptions) -> Self {
         var p = Self()
         p.rules["temperature"] = .init(value: .number(options.defaultTemperature))
         p.rules["top_p"] = .init(value: .number(options.defaultTopP))
         if options.defaultTopK > 0 { p.rules["top_k"] = .init(value: .number(Double(options.defaultTopK))) }
-        p.rules["max_tokens"] = .init(value: .number(Double(max(0, options.defaultMaxTokens))))
-        p.rules["repeat_penalty"] = .init(value: .number(options.defaultRepeatPenalty))
-        p.rules["presence_penalty"] = .init(value: .number(options.defaultPresencePenalty))
-        if options.defaultReasoningBudget >= 0 {
-            p.rules["reasoning_budget"] = .init(value: .number(Double(options.defaultReasoningBudget)))
-        }
-        if options.defaultEnableThinking { p.rules["enable_thinking"] = .init(value: .boolean(true)) }
         return p
     }
 }
@@ -297,7 +292,7 @@ enum GenerationField: String, CaseIterable, Identifiable {
         case .repeatPenalty: description = "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding."
         case .frequencyPenalty: description = "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control."
         case .maxTokens: description = "0 uses remaining context. Context and memory limits still apply."
-        case .budget: description = "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement."
+        case .budget: description = "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget."
         case .thinking: description = "Explicit client thinking or effort wins unless locked."
         case .effort: description = "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control."
         case .temperature: description = "Lower values favor predictable replies; higher values add variety. 0 is greedy."

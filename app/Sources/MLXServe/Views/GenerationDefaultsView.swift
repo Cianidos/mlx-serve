@@ -74,7 +74,9 @@ struct GenerationParameterRow: View {
                     valueControl
                 }
                 if field.showsSlider {
-                    slider.accessibilityLabel(L10n.text(field.title))
+                    // A Form reserves a label column for an unlabeled Slider; hide it so the
+                    // track spans the column its end labels sit under.
+                    slider.labelsHidden().accessibilityLabel(L10n.text(field.title))
                     if let guidance = field.guidance {
                         HStack {
                             Text(L10n.text(guidance.low))
@@ -134,7 +136,8 @@ struct GenerationParameterRow: View {
                 set: { if let value = field.numberValue($0) { setValue(value) } }),
                 format: .number.grouping(.never).precision(.fractionLength(0...2)))
                 .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
-                .frame(width: max(58, min(104, CGFloat(number.formatted(.number.grouping(.never).precision(.fractionLength(0...2))).count) * 8 + 18)))
+                // Fixed: a width that follows the value reflows the row while the slider drags.
+                .frame(width: 76)
                 .font(.app(.body).monospacedDigit())
                 .accessibilityLabel(L10n.text(field.title))
         }

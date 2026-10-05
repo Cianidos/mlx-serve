@@ -749,7 +749,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var failed = false
         do {
             let thinking = config.thinkingForRequest(appState.serverOptions,
-                                                      inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil)
+                                                      inheritGeneration: server.chatIsLocal)
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
                 // Apple's on-device model needs no server and no load.
@@ -770,7 +770,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions,
-                                                  inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil),
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
@@ -1102,7 +1102,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
                 defaults: config.requestDefaults(from: appState.serverOptions,
-                                                  inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil),
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config)
             )
             }

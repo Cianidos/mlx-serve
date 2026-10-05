@@ -20,16 +20,13 @@ pub const Override = struct {
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
-    generation_defaults: generation.Profile = .{},
-    generation_error: ?anyerror = null,
     /// The speculation sidecar: "off", "auto" (the pack's own `drafter/`) or an
     /// absolute path. Owned.
     drafter: ?[]const u8 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null and
-            std.meta.eql(o.generation_defaults, generation.Profile{}) and o.generation_error == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -174,26 +171,23 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     if (obj.get("chat_template_kwargs")) |k| if (k == .object) {
         o.chat_template_kwargs = std.json.Stringify.valueAlloc(alloc, k, .{}) catch null;
     };
-    o.generation_defaults = generationProfile(obj) catch |err| blk: {
-        o.generation_error = err;
-        break :blk .{};
-    };
     return o;
 }
 
-fn generationProfile(obj: std.json.ObjectMap) !generation.Profile {
-    var profile = if (obj.get("generation_defaults")) |value| try generation.parseProfile(value) else generation.Profile{};
-    if (obj.get("chat_template_kwargs")) |kw| if (kw == .object) {
-        if (profile.rules[@backingInt(generation.Field.enable_thinking)] == null) {
-            if (kw.object.get("enable_thinking")) |v| if (v == .bool) profile.set(.enable_thinking, .{ .boolean = v.bool }, false);
-        }
-        if (profile.rules[@backingInt(generation.Field.reasoning_effort)] == null) {
-            if (kw.object.get("reasoning_effort")) |v| if (v == .string) {
-                if (std.meta.stringToEnum(generation.Effort, v.string)) |effort| profile.set(.reasoning_effort, .{ .effort = effort }, false);
-            };
-        }
-    };
-    return profile;
+/// A model entry's generation rules: its `generation_defaults`, plus the `enable_thinking` /
+/// `reasoning_effort` of its `chat_template_kwargs` where no rule names them.
+fn generationProfile(obj: std.json.ObjectMap) generation.Profile {
+    var p = if (obj.get("generation_defaults")) |v| generation.parseProfile(v) catch |err| blk: {
+        log.warn("[model-settings] generation_defaults ignored ({s})\n", .{@errorName(err)});
+        break :blk generation.Profile{};
+    } else generation.Profile{};
+    const kw = obj.get("chat_template_kwargs") orelse return p;
+    if (kw != .object) return p;
+    if (p.rules.get(.enable_thinking) == null) if (kw.object.get("enable_thinking")) |v| if (v == .bool)
+        p.set(.enable_thinking, .{ .boolean = v.bool }, false);
+    if (p.rules.get(.reasoning_effort) == null) if (kw.object.get("reasoning_effort")) |v| if (v == .string)
+        if (std.meta.stringToEnum(generation.Effort, v.string)) |e| p.set(.reasoning_effort, .{ .effort = e }, false);
+    return p;
 }
 
 pub fn parse(alloc: std.mem.Allocator, body: []const u8) !Settings {
@@ -214,8 +208,13 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
 }
 
 pub fn defaultPath(buf: []u8) []const u8 {
+    return homeFile(buf, "model-settings.json");
+}
+
+/// `~/.mlx-serve/<name>`; "" when it does not fit `buf`.
+pub fn homeFile(buf: []u8, name: []const u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
-    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/model-settings.json", .{home}) catch "";
+    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/{s}", .{ home, name }) catch "";
 }
 
 /// The parsed file kept for the request path: re-stats at most once per
@@ -230,7 +229,6 @@ pub const Cache = struct {
     settings: Settings = .{},
     stamp: ?Stamp = null,
     checked_ms: ?i64 = null,
-    failure: ?anyerror = null,
 
     const Stamp = struct { size: u64, mtime: i96, inode: u64 };
 
@@ -255,54 +253,32 @@ pub const Cache = struct {
         return copyInto(buf, self.settings.aliasForPath(model_path));
     }
 
+    /// The generation rules of `model_path`'s entry; null reads the whole file as one
+    /// profile (`generation-settings.json`). Read per request, so an edit applies to the next one.
+    pub fn generationDefaults(self: *Cache, io: std.Io, model_path: ?[]const u8) generation.Profile {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.refresh(io);
+        const parsed = self.settings.parsed orelse return .{};
+        const path = model_path orelse return generation.parseProfile(parsed.value) catch |err| {
+            log.warn("[generation-settings] {s} ignored ({s})\n", .{ self.path, @errorName(err) });
+            return .{};
+        };
+        if (parsed.value != .object) return .{};
+        var it = parsed.value.object.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), trimSlash(path))) continue;
+            return if (kv.value_ptr.* == .object) generationProfile(kv.value_ptr.object) else .{};
+        }
+        return .{};
+    }
+
     /// Re-read the file if it changed; lookups call it, and a caller that must
     /// not do I/O later (under another lock) can call it first.
     pub fn refreshNow(self: *Cache, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.refresh(io);
-    }
-
-    /// An owned request snapshot, including current template kwargs and generation rules.
-    pub fn requestOverride(self: *Cache, alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) !Override {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.refresh(io);
-        if (self.failure) |err| return err;
-        if (self.settings.parsed) |parsed| {
-            if (parsed.value != .object) return error.InvalidGenerationSettings;
-            var it = parsed.value.object.iterator();
-            while (it.next()) |item| {
-                if (std.mem.eql(u8, trimSlash(model_path), trimSlash(item.key_ptr.*)) and item.value_ptr.* != .object)
-                    return error.InvalidGenerationSettings;
-            }
-        }
-        var result = self.settings.lookup(alloc, model_path);
-        if (result.generation_error) |err| {
-            result.deinit(alloc);
-            return err;
-        }
-        return result;
-    }
-
-    /// Global and model generation profiles share the alias cache's parsed file.
-    pub fn generationDefaults(self: *Cache, io: std.Io, model_path: ?[]const u8) !generation.Profile {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.refresh(io);
-        if (self.failure) |err| return err;
-        const parsed = self.settings.parsed orelse return .{};
-        if (model_path) |path| {
-            if (parsed.value != .object) return error.InvalidGenerationSettings;
-            var it = parsed.value.object.iterator();
-            while (it.next()) |item| {
-                if (!std.mem.eql(u8, trimSlash(path), trimSlash(item.key_ptr.*))) continue;
-                if (item.value_ptr.* != .object) return error.InvalidGenerationSettings;
-                return generationProfile(item.value_ptr.object);
-            }
-            return .{};
-        }
-        return generation.parseProfile(parsed.value);
     }
 
     fn refresh(self: *Cache, io: std.Io) void {
@@ -313,36 +289,12 @@ pub const Cache = struct {
         self.checked_ms = now;
         const stamp: ?Stamp = if (std.Io.Dir.cwd().statFile(io, self.path, .{})) |st|
             .{ .size = st.size, .mtime = st.mtime.nanoseconds, .inode = @intCast(st.inode) }
-        else |err| switch (err) {
-            error.FileNotFound => null,
-            else => {
-                self.checked_ms = null;
-                self.failure = err;
-                self.settings.deinit();
-                self.stamp = null;
-                return;
-            },
-        };
-        if (stamp == null) {
-            self.stamp = null;
-            self.failure = null;
-            self.settings.deinit();
-            return;
-        }
+        else |_|
+            null;
         if (std.meta.eql(stamp, self.stamp)) return;
         self.stamp = stamp;
-        self.failure = null;
         self.settings.deinit();
-        const body = std.Io.Dir.cwd().readFileAlloc(io, self.path, alloc, .limited(1 << 20)) catch |err| {
-            self.failure = err;
-            return;
-        };
-        defer alloc.free(body);
-        self.settings = parse(alloc, body) catch |err| {
-            self.failure = err;
-            log.warn("[model-settings] {s}: malformed ({s}), aliases ignored\n", .{ self.path, @errorName(err) });
-            return;
-        };
+        self.settings = load(alloc, io, self.path);
         if (self.settings.duplicateAlias()) |d|
             log.warn("[model-settings] alias \"{s}\" claimed by {s} and {s}; the lower path wins\n", .{ d.alias, d.a, d.b });
     }
@@ -412,12 +364,36 @@ test "model_settings: chat_template_kwargs is an object carried verbatim, anythi
     var a = s.lookup(t, "/m/a");
     defer a.deinit(t);
     try std.testing.expectEqualStrings("{\"preserve_thinking\":true,\"x\":[1]}", a.chat_template_kwargs.?);
-    try std.testing.expect(a.generation_defaults.rules[@backingInt(generation.Field.enable_thinking)] == null);
-    var c = s.lookup(t, "/m/c");
-    defer c.deinit(t);
-    try std.testing.expect(c.generation_defaults.rules[@backingInt(generation.Field.enable_thinking)].?.value.boolean);
-    try std.testing.expectEqual(generation.Effort.high, c.generation_defaults.rules[@backingInt(generation.Field.reasoning_effort)].?.value.effort);
     try std.testing.expect(s.lookup(t, "/m/b").isEmpty());
+}
+
+test "model_settings: generation rules re-read per request; kwargs thinking keys fill rules the entry leaves unset" {
+    const t = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const path = try std.fs.path.join(t, &.{ dir, "model-settings.json" });
+    defer t.free(path);
+    var c: Cache = .{ .path = path, .alloc = t, .recheck_ms = 0 };
+    defer c.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
+        \\{"/m/a/": {"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "high"},
+        \\  "generation_defaults": {"reasoning_effort": {"value": "low", "ignore_client": true}}}}
+    });
+    var p = c.generationDefaults(io, "/m/a");
+    try std.testing.expectEqual(true, p.value(bool, .enable_thinking).?);
+    try std.testing.expectEqual(generation.Effort.low, p.value(generation.Effort, .reasoning_effort).?);
+    try std.testing.expect(p.forced(.reasoning_effort));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
+        \\{"/m/a": {"generation_defaults": {"temperature": {"value": 0.5}, "top_k": {"value": -1}}}}
+    });
+    p = c.generationDefaults(io, "/m/a"); // a bad rule drops the profile, never the request
+    try std.testing.expect(p.rules.get(.temperature) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{\"max_tokens\": {\"value\": 12, \"ignore_client\": true}}" });
+    p = c.generationDefaults(io, null);
+    try std.testing.expectEqual(@as(u32, 12), p.resolve(u32, .max_tokens, 64, 0));
 }
 
 test "model_settings: mtp_acceptance names a mode at its default threshold" {
@@ -531,70 +507,6 @@ test "model_settings: the alias cache rereads the file only after it changes, at
     try std.testing.expectEqualStrings("/m/bb", c.pathForAlias(io, "q", &buf).?);
     try std.testing.expectEqualStrings("q", c.aliasForPath(io, "/m/bb/", &buf).?);
     try std.testing.expect(c.aliasForPath(io, "/m/a", &buf) == null);
-}
-
-test "model_settings: generation snapshots refresh with aliases and preserve malformed-policy errors" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    const path = try std.fs.path.join(a, &.{ dir, "model-settings.json" });
-    defer a.free(path);
-    var cache = Cache{ .path = path, .alloc = a, .recheck_ms = 0 };
-    defer cache.deinit();
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
-        \\{"/m/":{"alias":"q","chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true},"generation_defaults":{"temperature":{"value":0.25},"reasoning_effort":{"value":"low","ignore_client":true}}}}
-    });
-    var first = try cache.requestOverride(a, io, "/m");
-    defer first.deinit(a);
-    try std.testing.expectEqual(@as(f64, 0.25), first.generation_defaults.rules[@backingInt(generation.Field.temperature)].?.value.number);
-    try std.testing.expect(first.generation_defaults.rules[@backingInt(generation.Field.enable_thinking)].?.value.boolean);
-    try std.testing.expectEqualStrings("/m", cache.pathForAlias(io, "q", &buf).?);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
-        \\{"/m":{"alias":"new","chat_template_kwargs":{"preserve_thinking":false},"generation_defaults":{"temperature":{"value":0.5}}}}
-    });
-    var second = try cache.requestOverride(a, io, "/m/");
-    defer second.deinit(a);
-    try std.testing.expectEqual(@as(f64, 0.5), second.generation_defaults.rules[@backingInt(generation.Field.temperature)].?.value.number);
-    try std.testing.expectEqualStrings("{\"preserve_thinking\":false}", second.chat_template_kwargs.?);
-    try std.testing.expectEqual(@as(f64, 0.25), first.generation_defaults.rules[@backingInt(generation.Field.temperature)].?.value.number);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{broken" });
-    try std.testing.expectError(error.SyntaxError, cache.requestOverride(a, io, "/m"));
-    try std.testing.expectError(error.SyntaxError, cache.requestOverride(a, io, "/m"));
-    try std.testing.expect(cache.pathForAlias(io, "new", &buf) == null);
-    try tmp.dir.deleteFile(io, "model-settings.json");
-    var removed = try cache.requestOverride(a, io, "/m");
-    defer removed.deinit(a);
-    try std.testing.expect(removed.isEmpty());
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{\"/m\":null}" });
-    try std.testing.expectError(error.InvalidGenerationSettings, cache.requestOverride(a, io, "/m"));
-}
-
-test "model_settings: global profiles share strict cached loading and lookup errors never fall open" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    const path = try std.fs.path.join(a, &.{ dir, "generation-settings.json" });
-    defer a.free(path);
-    var cache = Cache{ .path = path, .alloc = a, .recheck_ms = 0 };
-    defer cache.deinit();
-    try tmp.dir.writeFile(io, .{ .sub_path = "generation-settings.json", .data = "{\"max_tokens\":{\"value\":12,\"ignore_client\":true}}" });
-    const profile = try cache.generationDefaults(io, null);
-    try std.testing.expect(profile.rules[@backingInt(generation.Field.max_tokens)].?.ignore_client);
-    try tmp.dir.writeFile(io, .{ .sub_path = "generation-settings.json", .data = "{\"max_tokens\":{\"value\":12,\"ignore_clent\":true}}" });
-    try std.testing.expectError(error.InvalidGenerationSettings, cache.generationDefaults(io, null));
-    const bad_path = try a.alloc(u8, std.fs.max_path_bytes + 1);
-    defer a.free(bad_path);
-    @memset(bad_path, 'x');
-    var bad = Cache{ .path = bad_path, .alloc = a };
-    defer bad.deinit();
-    try std.testing.expectError(error.NameTooLong, bad.generationDefaults(io, null));
-    try std.testing.expectError(error.NameTooLong, bad.generationDefaults(io, null));
 }
 
 test "model_settings: an alias two models claim is named with both paths" {

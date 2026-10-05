@@ -154,7 +154,6 @@ pub const ChatConfig = struct {
     /// Template variables as a JSON object: the model's `chat_template_kwargs`
     /// (`model-settings.json`), with a request's own merged over them per request.
     chat_template_kwargs: ?[]const u8 = null,
-    generation_defaults: @import("generation_settings.zig").Profile = .{},
     /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
     /// per request is a second parse of a multi-KB template); null = unknown, probe.
     renders_tool_turn: ?bool = null,

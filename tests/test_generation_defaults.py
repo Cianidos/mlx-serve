@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 binary = pathlib.Path(os.environ.get('MLX_SERVE_BINARY', './zig-out/bin/mlx-serve')).resolve()
@@ -94,17 +93,8 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                 for stream in (False, True):
                     result = post(route, {**body, 'stream': stream})
                     check(result['usage'][output_key] <= 2, f'{route} stream={stream}: locked output cap wins')
-            try:
-                post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.', 'max_tokens': 64})
-            except urllib.error.HTTPError as error:
-                check(error.code == 400 and 'unsupported_generation_policy' in error.read().decode(),
-                      'raw completions refuses unsupported locked thinking policy')
-            else:
-                raise AssertionError('raw completions silently dropped thinking policy')
-            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
-                       if '[generation-settings] model=' in line]
-            check(records and all(record['max_tokens']['value'] == 2 and record['max_tokens']['source'] == 'global'
-                                  for record in records), 'resolved diagnostics report effective caps and sources')
+            result = post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.', 'max_tokens': 64})
+            check(result['usage']['completion_tokens'] <= 2, 'raw completions ignores the thinking lock and keeps the output lock')
             write(model_file, {str(model): {'generation_defaults': {'max_tokens': {'value': 3, 'ignore_client': False}}}})
             result = post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'max_tokens': 5})
             check(result['usage']['completion_tokens'] == 5, 'model unlocked rule replaces inherited global lock')
@@ -113,16 +103,6 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
             write(model_file, {})
             result = post('/api/chat', {'model': 'mlx-serve', 'messages': message, 'stream': False, 'options': {'num_predict': 64, 'temperature': 1}})
             check(result['eval_count'] <= 2, 'Ollama native option cannot bypass output lock')
-            with urllib.request.urlopen(base + '/props', timeout=5) as response:
-                props = json.load(response)
-            check(props['generation_defaults']['global']['max_tokens']['ignore_client'], '/props reports configured locks')
-            write(model_file, {str(model): {'generation_defaults': {'temperature': {'value': 0.25}}}})
-            post('/v1/unload-model', {'model': 'mlx-serve'})
-            with urllib.request.urlopen(base + '/props?model=' + urllib.parse.quote(str(model)), timeout=5) as response:
-                unloaded = json.load(response)
-            check(unloaded['generation_defaults']['model']['temperature']['value'] == 0.25,
-                  '/props reads model generation policy without loading model')
-            write(model_file, {})
             write(global_file, {
                 'temperature': {'value': 0.25},
                 'max_tokens': {'value': 2, 'ignore_client': True},
@@ -130,40 +110,13 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
             for route, body, _ in cases:
                 post(route, {**body, 'temperature': None})
             post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.', 'temperature': None})
-            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
-                       if '[generation-settings] model=' in line]
-            check(all(record['temperature']['value'] == 0.25 and record['temperature']['source'] == 'global'
-                      for record in records[-4:]), 'null client fields retain global defaults on every text API')
-            write(global_file, {
-                'temperature': {'value': 0},
-                'max_tokens': {'value': 2, 'ignore_client': True},
-                'min_p': {'value': 0.05, 'ignore_client': True},
-            })
-            for route, body, _ in cases:
-                for stream in (False, True):
-                    post(route, {**body, 'min_p': 0, 'stream': stream})
-            for stream in (False, True):
-                post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.',
-                                       'min_p': 0, 'stream': stream,
-                                       'stream_options': {'include_usage': True}})
-            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
-                       if '[generation-settings] model=' in line]
-            check(all(abs(record['min_p']['value'] - 0.05) < 1e-6 and record['min_p']['source'] == 'global'
-                      for record in records[-8:]), 'min_p lock applies across every text API and transport')
-            write(model_file, {str(model): {'generation_defaults': {'min_p': {'value': 0.1}}}})
-            post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'min_p': 0})
-            records = [json.loads(line[line.index('{'):]) for line in log_path.read_text().splitlines()
-                       if '[generation-settings] model=' in line]
-            check(records[-1]['min_p']['value'] == 0 and records[-1]['min_p']['source'] == 'client',
-                  'model unlocked min_p permits explicit client zero without reload')
+            lines = [line for line in log_path.read_text().splitlines() if 'POST /v1/' in line and 'temp=' in line]
+            check(len(lines) >= 4 and all('temp=0.25' in line for line in lines[-4:]),
+                  'null client fields take the global default on every text API')
             write(model_file, {str(model): {'generation_defaults': {'top_k': {'value': -1, 'ignore_client': True}}}})
-            try:
-                post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message})
-            except urllib.error.HTTPError as error:
-                check(error.code == 503 and 'generation_settings_error' in error.read().decode(),
-                      'malformed model policy refuses without reloading the model')
-            else:
-                raise AssertionError('malformed model policy accepted')
+            result = post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message})
+            check(result['usage']['completion_tokens'] == 2 and 'generation_defaults ignored' in log_path.read_text(),
+                  'malformed model policy is logged and ignored, the request is served')
             write(model_file, {})
             write(global_file, {
                 'temperature': {'value': 0},
@@ -174,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                 post('/v1/messages', {'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': 'Think carefully about 17 times 23, then answer.'}],
                                      'thinking': {'type': 'adaptive'}, 'output_config': {'effort': 'xhigh'},
                                      'tools': tools, 'max_tokens': 96, 'stream': stream})
-            check('[think-bound] reasoning budget 16 reached' in log_path.read_text(), 'adaptive xhigh request closes thought at locked budget')
+            check('[think-bound] reasoning budget 16 reached' in log_path.read_text(), 'adaptive xhigh request closes thought at forced budget')
             write(global_file, {'temperature': {'value': 0}, 'max_tokens': {'value': 2, 'ignore_client': True}})
             for stream in (False, True):
                 result = post('/v1/completions', {'model': 'mlx-serve', 'prompt': 'Count from 1 to 100.',
@@ -182,29 +135,11 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                                                  'stream_options': {'include_usage': True}})
                 check(result['usage']['completion_tokens'] <= 2,
                       f'raw completions stream={stream}: sampling/output policy applies')
-            write(global_file, {
-                'enable_thinking': {'value': True, 'ignore_client': True},
-                'reasoning_budget': {'value': 16, 'ignore_client': True},
-            })
-            try:
-                post('/v1/messages', {'model': 'mlx-serve', 'messages': message, 'max_tokens': 64,
-                                     'thinking': {'type': 'adaptive'},
-                                     'output_config': {'format': {'type': 'json_schema', 'schema': {'type': 'object'}}}})
-            except urllib.error.HTTPError as error:
-                failure = json.loads(error.read())
-                check(error.code == 400 and failure.get('type') == 'error'
-                      and failure['error']['type'] == 'unsupported_generation_policy',
-                      'unsupported locked thinking returns native Anthropic error envelope')
-            else:
-                raise AssertionError('structured output silently dropped locked thinking')
             global_file.write_text('{broken')
             time.sleep(1.1)
-            try:
-                post('/v1/messages', {'model': 'mlx-serve', 'messages': message, 'max_tokens': 8})
-            except urllib.error.HTTPError as error:
-                check(error.code == 503 and 'generation_settings_error' in error.read().decode(), 'malformed policy refuses rather than drops locks')
-            else:
-                raise AssertionError('malformed policy accepted')
+            result = post('/v1/messages', {'model': 'mlx-serve', 'messages': message, 'max_tokens': 8})
+            check(result['usage']['output_tokens'] > 2 and 'generation-settings.json: malformed' in log_path.read_text(),
+                  'malformed global file is logged and ignored, the request is served')
             print(f'{passed} checks passed', flush=True)
         finally:
             process.terminate()
