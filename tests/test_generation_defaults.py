@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
         'enable_thinking': {'value': False, 'ignore_client': True},
     })
     log_path = pathlib.Path(home, 'server.log')
-    with log_path.open('w') as log:
+    with log_path.open('a') as log:
         process = subprocess.Popen([
             str(binary), '--serve', '--host', '127.0.0.1', '--port', str(port),
             '--model', str(model), '--ctx-size', '8192', '--kv-quant', '8',
@@ -103,6 +103,33 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
             write(model_file, {})
             result = post('/api/chat', {'model': 'mlx-serve', 'messages': message, 'stream': False, 'options': {'num_predict': 64, 'temperature': 1}})
             check(result['eval_count'] <= 2, 'Ollama native option cannot bypass output lock')
+            write(global_file, {
+                'temperature': {'value': 0},
+                'max_tokens': {'value': 0, 'ignore_client': True},
+                'enable_thinking': {'value': False, 'ignore_client': True},
+            })
+            for stream in (False, True):
+                start = len(log_path.read_text())
+                post('/v1/messages', {'model': 'mlx-serve', 'messages': message,
+                                      'max_tokens': 8, 'stream': stream})
+                caps = [line for line in log_path.read_text()[start:].splitlines()
+                        if 'prompt=' in line and 'max_gen=' in line and 'ctx=' in line]
+                check(bool(caps) and all(int(line.split('max_gen=')[1].split(',')[0]) ==
+                      8192 - int(line.split('prompt=')[1].split()[0]) for line in caps),
+                      f'messages stream={stream}: forced Auto uses remaining context instead of client cap')
+            write(global_file, {
+                'temperature': {'value': 0},
+                'enable_thinking': {'value': True},
+                'reasoning_effort': {'value': 'none', 'ignore_client': True},
+            })
+            for route, body, _ in cases:
+                for stream in (False, True):
+                    start = len(log_path.read_text())
+                    post(route, {**body, 'stream': stream})
+                    lines = [line for line in log_path.read_text()[start:].splitlines()
+                             if f'POST {route} (' in line]
+                    check(bool(lines) and all('thinking=false' in line for line in lines),
+                          f'{route} stream={stream}: forced effort none beats unforced thinking on')
             write(global_file, {
                 'temperature': {'value': 0.25},
                 'max_tokens': {'value': 2, 'ignore_client': True},

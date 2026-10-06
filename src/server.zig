@@ -602,12 +602,11 @@ fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, c
     };
 }
 
-/// The request's `max_tokens` against the generation-defaults rule; `fallback` when neither
-/// names a positive cap (0 = auto, like an omitted field).
+/// A zero rule means remaining context; an omitted rule uses the surface's fallback.
 fn generationMaxTokens(gen: generation_settings.Profile, v: ?std.json.Value, fallback: u32) u32 {
     const req = resolveRequestMaxTokens(v, 0);
     const cap = gen.resolve(u32, .max_tokens, if (req > 0) req else null, fallback);
-    return if (cap > 0) cap else fallback;
+    return if (cap == 0 and gen.rules.get(.max_tokens) != null) AUTO_MAX_TOKENS_SENTINEL else cap;
 }
 
 var g_generation_settings: model_settings_mod.Cache = .{ .path = "" };
@@ -8332,8 +8331,10 @@ fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?Re
         null;
     const on = if (gen.forced(.enable_thinking))
         gen.value(bool, .enable_thinking).?
+    else if (gen.forced(.reasoning_effort))
+        model.?.enable
     else
-        thinkingFrom(if (ignore) null else enable, req_effort, thinkingFrom(gen.value(bool, .enable_thinking), model, arch_default));
+        thinkingFrom(enable, req_effort, thinkingFrom(gen.value(bool, .enable_thinking), model, arch_default));
     return .{ .enable = on, .effort = req_effort orelse modelEffortIfThinking(model, on) };
 }
 
@@ -21648,6 +21649,31 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
     }
 }
 
+test "resolveThinking: forced effort outranks unforced thinking defaults" {
+    inline for (.{ false, true }) |arch_default| {
+        inline for (.{ false, true }) |word_only| {
+            var gen = generation_settings.Profile{};
+            gen.set(.enable_thinking, .{ .boolean = true }, false);
+            gen.set(.reasoning_effort, .{ .effort = .none }, true);
+            const off = resolveThinking(gen, false, reasoningEffortFromWord("high", -1, word_only), arch_default, -1, word_only);
+            try std.testing.expect(!off.enable);
+            try std.testing.expect(off.effort == null);
+
+            gen.set(.enable_thinking, .{ .boolean = false }, false);
+            gen.set(.reasoning_effort, .{ .effort = .low }, true);
+            const on = resolveThinking(gen, false, reasoningEffortFromWord("none", -1, word_only), arch_default, -1, word_only);
+            try std.testing.expect(on.enable);
+            try std.testing.expectEqualStrings("low", on.effort.?.effort.?);
+
+            gen.set(.enable_thinking, .{ .boolean = false }, true);
+            try std.testing.expect(!resolveThinking(gen, true, null, arch_default, -1, word_only).enable);
+            gen.set(.enable_thinking, .{ .boolean = true }, true);
+            gen.set(.reasoning_effort, .{ .effort = .none }, true);
+            try std.testing.expect(resolveThinking(gen, false, null, arch_default, -1, word_only).enable);
+        }
+    }
+}
+
 test "schema thinking policy defers only a resolved reasoning protocol" {
     const decide = schemaMasksThinking;
     try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(false, false, true, false, true));
@@ -21723,7 +21749,15 @@ test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule
     try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(gen, null, 7));
     try std.testing.expectEqual(@as(u32, 64), generationMaxTokens(gen, .{ .integer = 64 }, 7));
     gen.set(.max_tokens, .{ .number = 0 }, false); // 0 = auto
-    try std.testing.expectEqual(@as(u32, 7), generationMaxTokens(gen, null, 7));
+    try std.testing.expectEqual(AUTO_MAX_TOKENS_SENTINEL, generationMaxTokens(gen, null, 7));
+    try std.testing.expectEqual(@as(u32, 64), generationMaxTokens(gen, .{ .integer = 64 }, 0));
+    gen.set(.max_tokens, .{ .number = 0 }, true);
+    for ([_]?std.json.Value{ null, .{ .integer = 0 }, .{ .integer = -1 }, .{ .integer = 64 } }) |value| {
+        const cap = generationMaxTokens(gen, value, 0);
+        try std.testing.expectEqual(AUTO_MAX_TOKENS_SENTINEL, cap);
+        try std.testing.expectEqual(@as(u32, 8092), clampMaxTokens(cap, 100, 8192));
+    }
+    try std.testing.expectEqual(@as(u32, 0), generationMaxTokens(.{}, null, 0));
     gen.set(.max_tokens, .{ .number = 12 }, true);
     try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(gen, .{ .integer = 64 }, 7));
 }
