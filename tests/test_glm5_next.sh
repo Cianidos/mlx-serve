@@ -8,6 +8,7 @@
 #   [2] thinking on by default, and  [6] prefix reuse: cached tokens, same answer
 #       low effort thinks less       [7] streaming carries no think/tool markup
 #   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
+#                                       [9] concurrent requests share one batched forward
 #
 # Hermetic counterparts: the config-parse tests in model.zig, the effort and tool-history
 # render tests in chat.zig, and the `glm5_next fixture` + `glm5_next MTP fixture` parity
@@ -109,6 +110,40 @@ check_absent "[7] no tool markup streamed" "$S" "<tool_call"
 
 check "[8] MTP head loaded" "$(cat "$LOG")" "GLM MTP head ready"
 check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
+
+# [9] Concurrent requests decode in ONE batched forward (rows of a window; each slot's KDA state and
+# DSA cache advance on their own). Three counting streams of different lengths (so the group shrinks
+# mid-flight) beside one carrying ~8k tokens (the sparse selection runs under batching).
+CONC=$(python3 - "$PORT" <<'PY'
+import json, sys, threading, urllib.request
+port = sys.argv[1]
+filler = " ".join(f"Section {i}: the weather report says clouds drift over hills and rivers flow to the sea." for i in range(400))
+needle = "The vault combination for the Aldergate safe is 74-19-52.\n\n" + filler + "\n\nWhat is the vault combination for the Aldergate safe? Answer with just the digits."
+reqs = [
+    ("count30", "Count from 1 to 30, separated by single spaces, and write nothing else.", 150),
+    ("count45", "Count from 1 to 45, separated by single spaces, and write nothing else.", 220),
+    ("count60", "Count from 1 to 60, separated by single spaces, and write nothing else.", 300),
+    ("741952", needle, 200),
+]
+out = {}
+def run(i):
+    key, msg, mt = reqs[i]
+    body = {"max_tokens": mt, "temperature": 0, "enable_thinking": False, "messages": [{"role": "user", "content": msg}]}
+    r = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    c = json.load(urllib.request.urlopen(r, timeout=900))["choices"][0]["message"]["content"]
+    out[i] = "".join(ch for ch in c if ch.isdigit()) if key.isdigit() else c.split()
+ts = [threading.Thread(target=run, args=(i,)) for i in range(len(reqs))]
+[t.start() for t in ts]; [t.join() for t in ts]
+def counted(toks, n):  # the stream counted 1..n in order
+    return toks[:n] == [str(k) for k in range(1, n + 1)]
+print("count30=%s count45=%s count60=%s needle=%s" % (counted(out[0], 30), counted(out[1], 45), counted(out[2], 60), out[3]))
+PY
+)
+check "[9] 30-count stream correct under batching" "$CONC" "count30=True"
+check "[9] 45-count stream correct under batching" "$CONC" "count45=True"
+check "[9] 60-count stream correct under batching" "$CONC" "count60=True"
+check "[9] needle recovered under batching" "$CONC" "needle=741952"
+check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] glm batched decode engaged"
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
 echo

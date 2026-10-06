@@ -34,6 +34,8 @@ const mage_flow = @import("mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
 const lora_mod = @import("lora.zig");
+const h3_glue = @import("h3_glue.zig");
+const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
 const gen_sse = @import("gen_sse.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
@@ -1071,9 +1073,7 @@ const LoraSlot = struct {
 fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
     if (slot.count == 0) return y;
     defer _ = mlx.mlx_array_free(y);
-    const d = try lora_mod.deltaSum(x, slot.active(), s);
-    defer _ = mlx.mlx_array_free(d);
-    return addA(y, d, s);
+    return lora_mod.addTo(y, x, slot.active(), s);
 }
 
 const AttnW = struct {
@@ -1597,20 +1597,17 @@ fn sliceAxis4(x: mlx.mlx_array, axis: usize, lo: c_int, hi: c_int, s: S) !mlx.ml
     return contig(o, s);
 }
 
-/// x [S, hidden] -> [S, hidden]. Full bidirectional attention (no mask): this
-/// is a diffusion transformer, every token sees every other.
-///
-/// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
-/// through in place of the attention output (same shape, projections intact).
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
-    const n: c_int = @intCast(mlx.getShape(x)[0]);
+/// qkv [S, 3*inner] -> q, k, v as [1, H, S, hd] for SDPA: per-head RMSNorm over head_dim, THEN rope
+/// (the reference's fused-kernel order; swapping it changes the result), then the head-major
+/// transpose. One fused dispatch when `h3_glue` serves the shape; this chain is its oracle.
+fn qkvHeadMajor(aw: *const AttnW, qkv: mlx.mlx_array, cfg: Config, rope: ?RopeTables, s: S) ![3]mlx.mlx_array {
+    const n: c_int = @intCast(mlx.getShape(qkv)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
     const half: c_int = @intCast(cfg.rotDim() / 2);
-
-    const qkv_base = try aw.qkv.forward(x, null, s);
-    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
-    defer _ = mlx.mlx_array_free(qkv);
+    if (rope) |rp| {
+        if (hd == 128) if (try h3_glue.qkvPrep(qkv, aw.q_norm, aw.k_norm, rp.cos, rp.sin, cfg.qk_norm_eps, h, half, s)) |f| return .{ f.q, f.k, f.v };
+    }
     var parts: [3]mlx.mlx_array = undefined;
     try splitEqual(qkv, 3, 1, &parts, s);
     defer for (&parts) |*p| {
@@ -1631,13 +1628,11 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
             continue;
         }
         defer _ = mlx.mlx_array_free(v4);
-        // Per-head RMSNorm over head_dim, THEN rope — that order is the
-        // reference's fused kernel, and swapping it changes the result.
         const nw = if (i == 0) aw.q_norm else aw.k_norm;
         const normed = try rmsNormLast(v4, nw, cfg.qk_norm_eps, s);
         if (rope) |rp| {
             defer _ = mlx.mlx_array_free(normed);
-    qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
+            qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
         } else {
             qkvn[i] = normed;
         }
@@ -1649,11 +1644,33 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
 
     // [1,S,H,hd] -> [1,H,S,hd] for SDPA
     var t: [3]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    errdefer for (t[0..made]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
     for (0..3) |i| {
         const tr = try transpose(qkvn[i], &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(tr);
         t[i] = try contig(tr, s);
+        made += 1;
     }
+    return t;
+}
+
+/// x [S, hidden] -> [S, hidden]. Full bidirectional attention (no mask): this
+/// is a diffusion transformer, every token sees every other.
+///
+/// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
+/// through in place of the attention output (same shape, projections intact).
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
+    const n: c_int = @intCast(mlx.getShape(x)[0]);
+    const h: c_int = @intCast(cfg.num_attention_heads);
+    const hd: c_int = @intCast(cfg.attention_head_dim);
+
+    const qkv_base = try aw.qkv.forward(x, null, s);
+    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    var t = try qkvHeadMajor(aw, qkv, cfg, rope, s);
     defer for (&t) |*p| {
         _ = mlx.mlx_array_free(p.*);
     };
@@ -1692,11 +1709,9 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     return loraAdd(out_base, flat, aw.out_lora, s);
 }
 
-/// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
-fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const y_base = try mw.fc1.forward(x, null, s);
-    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
-    defer _ = mlx.mlx_array_free(y);
+/// silu(gate) * up over the fused [S, 2*ffn] fc1 output.
+fn swigluAct(y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    if (try h3_glue.swiglu(y, s)) |a| return a;
     var halves: [2]mlx.mlx_array = undefined;
     try splitEqual(y, 2, 1, &halves, s);
     defer for (&halves) |*p| {
@@ -1704,7 +1719,15 @@ fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     };
     const g = try siluA(halves[0], s);
     defer _ = mlx.mlx_array_free(g);
-    const act = try mulA(g, halves[1], s);
+    return mulA(g, halves[1], s);
+}
+
+/// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
+fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const y_base = try mw.fc1.forward(x, null, s);
+    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
+    defer _ = mlx.mlx_array_free(y);
+    const act = try swigluAct(y, s);
     defer _ = mlx.mlx_array_free(act);
     const o_base = try mw.fc2.forward(act, null, s);
     return loraAdd(o_base, act, mw.fc2_lora, s);
@@ -1774,6 +1797,70 @@ fn modGate(x: mlx.mlx_array, gate: mlx.mlx_array, other: mlx.mlx_array, runs: []
         _ = mlx.mlx_array_free(p);
     };
     return concat(pieces, 0, s);
+}
+
+/// A branch output waiting for its gated residual add, `h += gate[row] * x`, carried to the next
+/// norm so `add_norm.gateNormMod` fuses the two. Owns both handles.
+const PendingGate = struct {
+    x: mlx.mlx_array,
+    gate: mlx.mlx_array,
+
+    fn init(x: mlx.mlx_array, gate: mlx.mlx_array) PendingGate {
+        var p: PendingGate = .{ .x = mlx.mlx_array_new(), .gate = mlx.mlx_array_new() };
+        _ = mlx.mlx_array_set(&p.x, x);
+        _ = mlx.mlx_array_set(&p.gate, gate);
+        return p;
+    }
+    fn deinit(self: *PendingGate) void {
+        _ = mlx.mlx_array_free(self.x);
+        _ = mlx.mlx_array_free(self.gate);
+    }
+};
+
+/// What the fused gate+norm+modulation kernel needs beyond the block's own arrays.
+const FusedMod = struct { row_mod: mlx.mlx_array, eps: mlx.mlx_array };
+
+/// Row r -> its modulation row, from the timestep plan's runs: the [S] i32 table `gateNormMod` indexes.
+fn buildRowMod(a: std.mem.Allocator, seq: u32, runs: []const ModRun) !mlx.mlx_array {
+    const rows = try a.alloc(i32, seq);
+    defer a.free(rows);
+    @memset(rows, 0);
+    for (runs) |r| @memset(rows[r.start..r.end], @intCast(r.mod_row));
+    const shape = [_]c_int{@intCast(seq)};
+    return mlx.mlx_array_new_data(rows.ptr, &shape, 1, .int32);
+}
+
+/// `h += pending` by the chain (`modGate`); the fallback for anything that is not the fused seam.
+fn applyPending(h: *mlx.mlx_array, pend: *?PendingGate, runs: []const ModRun, a: std.mem.Allocator, s: S) !void {
+    var p = pend.* orelse return;
+    const h1 = try modGate(h.*, p.gate, p.x, runs, a, s);
+    _ = mlx.mlx_array_free(h.*);
+    h.* = h1;
+    p.deinit();
+    pend.* = null;
+}
+
+/// The seam between two sublayers: `h += pending` (when there is one), then
+/// `rmsnorm(h) * w * (1 + scale) + shift`. `h` is replaced and `pend` cleared. One dispatch when
+/// `add_norm.gateNormMod` serves the shape, the op chain it is bit-equal to otherwise.
+fn gateNormMod(h: *mlx.mlx_array, pend: *?PendingGate, w: mlx.mlx_array, shift: mlx.mlx_array, scale: mlx.mlx_array, fused: ?FusedMod, runs: []const ModRun, a: std.mem.Allocator, norm_eps: f32, s: S) !mlx.mlx_array {
+    if (fused) |f| {
+        if (try add_norm.gateNormMod(h.*, if (pend.*) |g| .{ .x = g.x, .gate = g.gate } else null, w, scale, shift, f.row_mod, f.eps, s)) |o| {
+            if (pend.*) |*p| {
+                _ = mlx.mlx_array_free(h.*);
+                h.* = o.h;
+                p.deinit();
+                pend.* = null;
+            } else {
+                _ = mlx.mlx_array_free(o.h); // unwritten: no add ran
+            }
+            return o.normed;
+        }
+    }
+    try applyPending(h, pend, runs, a, s);
+    const n = try rmsNormLast(h.*, w, norm_eps, s);
+    defer _ = mlx.mlx_array_free(n);
+    return modScaleShift(n, shift, scale, runs, a, s);
 }
 
 // ── Timestep rows ───────────────────────────────────────────────────────────
@@ -2691,6 +2778,18 @@ pub const Model = struct {
             try mlx.check(mlx.mlx_zeros(&zero_mods, &[_]c_int{ zrows, @intCast(cfg.hidden_size) }, 2, self.dtype, s));
         }
 
+        // Each block ends in a gated add that the NEXT norm absorbs (`gateNormMod`), so a branch
+        // output rides in `pend` until then.
+        var pend: ?PendingGate = null;
+        defer if (pend) |*p| p.deinit();
+        const row_mod = if (h3_glue.enabled()) try buildRowMod(a, layout.seq_len, plan.runs) else mlx.mlx_array{ .ctx = null };
+        defer if (row_mod.ctx != null) {
+            _ = mlx.mlx_array_free(row_mod);
+        };
+        const eps_a = mlx.mlx_array_new_float(cfg.norm_eps);
+        defer _ = mlx.mlx_array_free(eps_a);
+        const fused: ?FusedMod = if (row_mod.ctx != null) .{ .row_mod = row_mod, .eps = eps_a } else null;
+
         for (self.blocks, 0..) |*b, bi| {
             var mods: [6]mlx.mlx_array = undefined;
             var mods_owned = true;
@@ -2716,12 +2815,11 @@ pub const Model = struct {
             var at_owned = true;
             const cacheable = attn_bcast != null and self.ablate == .none;
             if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
+                try applyPending(&h, &pend, plan.runs, a, s);
                 at = attn_bcast.?.blocks[bi];
                 at_owned = false;
             } else {
-                const n1 = try rmsNormLast(h, b.norm1, cfg.norm_eps, s);
-                defer _ = mlx.mlx_array_free(n1);
-                const m1 = try modScaleShift(n1, mods[0], mods[1], plan.runs, a, s);
+                const m1 = try gateNormMod(&h, &pend, b.norm1, mods[0], mods[1], fused, plan.runs, a, cfg.norm_eps, s);
                 defer _ = mlx.mlx_array_free(m1);
                 const smode = if (self.ablate == .none) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
                 const spec: ?SparseSpec = if (smode == .dense) null else .{
@@ -2740,20 +2838,14 @@ pub const Model = struct {
             defer if (at_owned) {
                 _ = mlx.mlx_array_free(at);
             };
-            const h1 = try modGate(h, mods[2], at, plan.runs, a, s);
-            _ = mlx.mlx_array_free(h);
-            h = h1;
-
-            const n2 = try rmsNormLast(h, b.norm2, cfg.norm_eps, s);
-            defer _ = mlx.mlx_array_free(n2);
-            const m2 = try modScaleShift(n2, mods[3], mods[4], plan.runs, a, s);
+            pend = PendingGate.init(at, mods[2]);
+            const m2 = try gateNormMod(&h, &pend, b.norm2, mods[3], mods[4], fused, plan.runs, a, cfg.norm_eps, s);
             defer _ = mlx.mlx_array_free(m2);
             const mo = if (self.ablate == .mlp) try contig(m2, s) else try self.mlpMaybeAne(&b.mlp, m2, bi, s);
             defer _ = mlx.mlx_array_free(mo);
-            const h2 = try modGate(h, mods[5], mo, plan.runs, a, s);
-            _ = mlx.mlx_array_free(h);
-            h = h2;
+            pend = PendingGate.init(mo, mods[5]);
         }
+        try applyPending(&h, &pend, plan.runs, a, s);
         defer _ = mlx.mlx_array_free(h);
 
         // Final layer: 1 modality, so the mod row is just the timestep row.
@@ -7146,4 +7238,126 @@ test "minimax h3: wantedLoras names what is missing or too many" {
     many_req.lora_paths = &many;
     try std.testing.expectError(error.TooManyLoras, wantedLoras(testPaths(null), many_req, &ps, &sc));
     try std.testing.expectEqual(@as(usize, 0), try wantedLoras(testPaths(null), base, &ps, &sc));
+}
+
+/// Random bf16 normal of `shape`.
+fn glueRand(shape: []const c_int, seed: u64, scale: f32, s: S) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, scale, key, s));
+    return astype(f, .bfloat16, s);
+}
+
+fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, what: []const u8, s: S) !void {
+    try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    var e = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(e);
+    try mlx.check(mlx.mlx_array_equal(&e, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(e));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, e));
+    if (!same) std.debug.print("{s} differs from its chain\n", .{what});
+    try testing.expect(same);
+}
+
+test "h3_glue: fused q/k norm + rope + head-major layout is bit-equal to the chain at the real row count" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg = Config{};
+    const rows: c_int = 15406;
+    const inner: c_int = @intCast(cfg.innerDim());
+    const half: c_int = @intCast(cfg.rotDim() / 2);
+    const qkv = try glueRand(&[_]c_int{ rows, 3 * inner }, 1, 3.0, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    var aw: AttnW = undefined;
+    aw.q_norm = try glueRand(&[_]c_int{@intCast(cfg.attention_head_dim)}, 2, 1.0, s);
+    defer _ = mlx.mlx_array_free(aw.q_norm);
+    aw.k_norm = try glueRand(&[_]c_int{@intCast(cfg.attention_head_dim)}, 3, 1.0, s);
+    defer _ = mlx.mlx_array_free(aw.k_norm);
+    const rope = RopeTables{
+        .cos = try glueRand(&[_]c_int{ 1, rows, 1, half }, 4, 1.0, s),
+        .sin = try glueRand(&[_]c_int{ 1, rows, 1, half }, 5, 1.0, s),
+    };
+    defer _ = mlx.mlx_array_free(rope.cos);
+    defer _ = mlx.mlx_array_free(rope.sin);
+
+    const fused = try qkvHeadMajor(&aw, qkv, cfg, rope, s);
+    defer for (fused) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    h3_glue.disabled_for_test = true;
+    defer h3_glue.disabled_for_test = false;
+    const chain = try qkvHeadMajor(&aw, qkv, cfg, rope, s);
+    defer for (chain) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (fused, chain, [_][]const u8{ "q", "k", "v" }) |f, c, name| try expectBitEqual(f, c, name, s);
+}
+
+test "h3_glue: fused swiglu is bit-equal to silu(gate) * up at the real row count" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg = Config{};
+    const rows: c_int = 15406;
+    const ffn: c_int = @intCast(cfg.ffn_hidden_size);
+    const y = try glueRand(&[_]c_int{ rows, 2 * ffn }, 6, 3.0, s);
+    defer _ = mlx.mlx_array_free(y);
+    const fused = try swigluAct(y, s);
+    defer _ = mlx.mlx_array_free(fused);
+    h3_glue.disabled_for_test = true;
+    defer h3_glue.disabled_for_test = false;
+    const chain = try swigluAct(y, s);
+    defer _ = mlx.mlx_array_free(chain);
+    try expectBitEqual(fused, chain, "swiglu", s);
+}
+
+test "add_norm: fused gate + rmsnorm + modulation is bit-equal to modGate -> rmsNormLast -> modScaleShift" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const cfg = Config{};
+    const rows: c_int = 15406;
+    const d: c_int = @intCast(cfg.hidden_size);
+    const h = try glueRand(&[_]c_int{ rows, d }, 7, 3.0, s);
+    defer _ = mlx.mlx_array_free(h);
+    const x = try glueRand(&[_]c_int{ rows, d }, 8, 3.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try glueRand(&[_]c_int{d}, 9, 1.0, s);
+    defer _ = mlx.mlx_array_free(w);
+    const gate = try glueRand(&[_]c_int{ 9, d }, 10, 0.5, s);
+    defer _ = mlx.mlx_array_free(gate);
+    const scale = try glueRand(&[_]c_int{ 9, d }, 11, 0.5, s);
+    defer _ = mlx.mlx_array_free(scale);
+    const shift = try glueRand(&[_]c_int{ 9, d }, 12, 0.5, s);
+    defer _ = mlx.mlx_array_free(shift);
+    const runs = [_]ModRun{
+        .{ .start = 0, .end = 77, .mod_row = 3 },
+        .{ .start = 77, .end = 4000, .mod_row = 0 },
+        .{ .start = 4000, .end = 9000, .mod_row = 1 },
+        .{ .start = 9000, .end = 9500, .mod_row = 8 },
+        .{ .start = 9500, .end = 15406, .mod_row = 7 },
+    };
+    const row_mod = try buildRowMod(a, 15406, &runs);
+    defer _ = mlx.mlx_array_free(row_mod);
+    const eps = mlx.mlx_array_new_float(cfg.norm_eps);
+    defer _ = mlx.mlx_array_free(eps);
+
+    const h1 = try modGate(h, gate, x, &runs, a, s);
+    defer _ = mlx.mlx_array_free(h1);
+    for ([_]bool{ true, false }) |with_add| {
+        const base = if (with_add) h1 else h;
+        const n = try rmsNormLast(base, w, cfg.norm_eps, s);
+        defer _ = mlx.mlx_array_free(n);
+        const want = try modScaleShift(n, shift, scale, &runs, a, s);
+        defer _ = mlx.mlx_array_free(want);
+        const got = (try add_norm.gateNormMod(h, if (with_add) .{ .x = x, .gate = gate } else null, w, scale, shift, row_mod, eps, s)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got.h);
+        defer _ = mlx.mlx_array_free(got.normed);
+        try expectBitEqual(got.normed, want, if (with_add) "gated norm+mod" else "norm+mod", s);
+        if (with_add) try expectBitEqual(got.h, h1, "gated residual", s);
+    }
 }

@@ -381,6 +381,7 @@ class DownloadManager: ObservableObject {
     /// `model_discovery.peekKevPack`.
     nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("joint_head_config.json")) { return "clef" }
         if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
             return "laya"
         }

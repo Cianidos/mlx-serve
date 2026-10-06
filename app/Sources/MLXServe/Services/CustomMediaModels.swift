@@ -87,6 +87,7 @@ enum CustomMediaModels {
     static func bundle(arch: String, repoId: String) -> MediaBundle? {
         if arch == "laya" { return .laya(repo: repoId, displayName: repoId, sizeGB: 0.35) }
         if arch == "kev" { return .kev(repo: repoId, displayName: repoId, sizeGB: 4.2) }
+        if arch == "clef" { return .clef(repo: repoId, displayName: repoId, sizeGB: 6.2) }
         if let p = imageFamily(arch: arch, id: repoId) { return p.asCustom(id: repoId).bundle }
         if let p = videoFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = audioFamily(arch: arch) { return p.asCustom(id: repoId).bundle }

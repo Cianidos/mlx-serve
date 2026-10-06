@@ -92,7 +92,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3",
+    "stable_audio3", "clef",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -103,7 +103,7 @@ func isMediaModelType(_ modelType: String) -> Bool {
 /// Typed-decision models (`POST /v1/decisions`): the Use button opens the
 /// Decisions window instead of a create pane.
 func isDecisionModelType(_ modelType: String) -> Bool {
-    modelType == "laya" || modelType == "kev"
+    modelType == "laya" || modelType == "kev" || modelType == "clef"
 }
 
 /// Media architectures a **Discover search row** may offer as a download.

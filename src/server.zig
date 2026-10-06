@@ -769,6 +769,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
+    "/v1/systemone",
     "/v1/embeddings",
     "/v1/images/edits",
     "/v1/images/generations",
@@ -806,7 +807,7 @@ pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
-    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -2014,7 +2015,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
+    log.info("  POST /v1/decisions, /v1/systemone (Laya, Kev, Clef)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2694,7 +2695,7 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/decisions")) {
+    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone"))) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .decisions);
@@ -14295,7 +14296,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 ///   data:image/jpeg|png|webp|...;base64,... (decoded + resized via stb_image / libwebp)
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
-fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -14382,7 +14383,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     }
 }
 
-fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
     const b64_data = url[sep + 8 ..];
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
@@ -14609,7 +14610,7 @@ fn appendLfm2Tiles(
     defer allocator.free(raw);
     std.base64.standard.Decoder.decode(raw, b64) catch return;
 
-    const src = decodeRgbOwned(allocator, raw) orelse return;
+    const src = decodeRgbOwned(allocator, raw, true) orelse return;
     defer src.deinit(allocator);
 
     const split = vp.max_tiles > 1 and
@@ -14763,7 +14764,7 @@ const DecodedRgb = struct {
     }
 };
 
-fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb {
+fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
@@ -14773,7 +14774,7 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
         const total_px: usize = @intCast(w * h);
         const rgb = allocator.alloc(u8, total_px * 3) catch return null;
         for (0..total_px) |i| {
-            const a = @as(u16, rgba[i * 4 + 3]);
+            const a: u16 = if (composite_alpha) rgba[i * 4 + 3] else 255;
             const inv_a = 255 - a;
             rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
             rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
@@ -14792,10 +14793,10 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
 }
 
-fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
-    const src = decodeRgbOwned(allocator, encoded) orelse return null;
+    const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
     defer src.deinit(allocator);
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
@@ -14882,6 +14883,18 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     return .{ .pixels = out_buf, .width = target, .height = target };
 }
 
+test "clef: transparent image RGB follows the checkpoint processor" {
+    const a = std.testing.allocator;
+    const bytes = try @import("clef_http_test.zig").readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(bytes);
+    const composited = decodeRgbOwned(a, bytes, true) orelse return error.BadImage;
+    defer composited.deinit(a);
+    const rgb = decodeRgbOwned(a, bytes, false) orelse return error.BadImage;
+    defer rgb.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, composited.rgb[0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
+}
+
 /// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
 /// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
 /// this codebase, so frame extraction is the client's job — into ONE
@@ -14909,7 +14922,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         const raw = allocator.alloc(u8, decoded_size) catch return null;
         defer allocator.free(raw);
         std.base64.standard.Decoder.decode(raw, b64) catch return null;
-        const rgb = decodeRgbOwned(allocator, raw) orelse return null;
+        const rgb = decodeRgbOwned(allocator, raw, true) orelse return null;
         decoded.append(allocator, rgb) catch {
             rgb.deinit(allocator);
             return null;

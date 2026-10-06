@@ -455,7 +455,7 @@ test "ple gpu: an embedded sharded table, weight scale included, embeds like the
         defer td.cleanup();
         var table = try openEmbeddedFixture(&td, variant);
         defer table.close();
-        const tbl = load(&table, true, 0) orelse return error.TestGpuArmDeclined;
+        const tbl = try wrapEmbedded(table.embedded.?);
         defer tbl.release();
         try testing.expectEqual(table.embedded.?.scale, tbl.scale);
         try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);

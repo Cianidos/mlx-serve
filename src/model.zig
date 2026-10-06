@@ -209,6 +209,9 @@ pub const ModelConfig = struct {
     // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
     // scores; optional renorm (/(sum+1e-20)) then × router_scaling_factor.
     moe_sigmoid_router: bool = false,
+    // kolibri1: top-k SELECTED on logits + expert_bias (no sigmoid before the
+    // bias), WEIGHTED by sigmoid(logits) of the picks; requires moe_sigmoid_router.
+    moe_logit_select: bool = false,
     moe_route_norm: bool = true,
     router_scaling_factor: f32 = 1.0,
     // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
@@ -1148,6 +1151,9 @@ pub const ModelConfig = struct {
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
         if (self.isMimo()) return true;
+        // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
+        // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
+        if (self.isGlm5()) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -3391,6 +3397,35 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         // eos [2, 24] (〈|EOS|〉, </assistant>) parsed generically from
         // eos_token_id above; no additive terminator merge needed.
+    } else if (std.mem.eql(u8, model_type, "kolibri1")) {
+        // Aleph Alpha Kolibri-1: the laguna attention arm minus the output gate, with NoPE
+        // full-attention layers, sandwich norms and an ungated shared expert on every layer.
+        // Reference: Aleph-Alpha/aleph-alpha-inference kolibri1.py.
+        config.model_type = "kolibri1";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.moe_sigmoid_router = true;
+        config.moe_logit_select = true;
+        config.moe_route_norm = false;
+        config.router_scaling_factor = 1.0;
+        config.rope_scaling_factor = 1.0;
+        config.query_pre_attn_scalar = config.head_dim;
+        // Sliding layers rotate at rope_theta (the config has no local base).
+        config.rope_local_base_freq = config.rope_theta;
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("kolibri1: norm_topk_prob=true not supported\n", .{});
+                return error.UnsupportedKolibriConfig;
+            }
+        }
+        // Full-attention layers carry no positional encoding.
+        if (config.has_explicit_layer_types) {
+            for (0..@min(config.num_hidden_layers, 128)) |i| config.layer_no_rope[i] = config.layer_is_global[i];
+        }
     } else if (std.mem.eql(u8, model_type, "inkling_mm_model")) {
         // Thinking Machines Inkling Small (276B-A12B MoE, natively multimodal;
         // REAP builds prune n_routed_experts). NO RoPE anywhere: position =
@@ -5558,6 +5593,47 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     // Unified flag drives the encoder-free vision/audio embedder path.
     try testing.expect(config.is_gemma4_unified);
+}
+
+test "ModelConfig parses kolibri1: logit-bias routing, NoPE on full layers, sandwich-norm MoE" {
+    // Trimmed copy of Kolibri-1's config.json: 4 layers keep the full/sliding mix.
+    const json =
+        \\{
+        \\  "model_type": "kolibri1",
+        \\  "hidden_size": 2560,
+        \\  "num_hidden_layers": 4,
+        \\  "num_attention_heads": 48,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 128,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "vocab_size": 128000,
+        \\  "max_position_embeddings": 262144,
+        \\  "rope_theta": 10000.0,
+        \\  "tie_word_embeddings": false,
+        \\  "use_sliding_window": true,
+        \\  "sliding_window": 513,
+        \\  "num_experts": 384,
+        \\  "num_experts_per_tok": 6,
+        \\  "moe_intermediate_size": 512,
+        \\  "shared_expert_intermediate_size": 512,
+        \\  "norm_topk_prob": false,
+        \\  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\  "quantization": {"group_size": 64, "bits": 3, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("kolibri1", config.model_type);
+    try testing.expect(config.moe_sigmoid_router and config.moe_logit_select);
+    try testing.expect(!config.moe_route_norm);
+    try testing.expectEqual(@as(u32, 384), config.num_experts);
+    try testing.expectEqual(@as(u32, 6), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 513), config.sliding_window);
+    // Only the full-attention layer is NoPE; sliding layers rotate at rope_theta.
+    try testing.expect(!config.layerSkipsRope(0));
+    try testing.expect(config.layerSkipsRope(3));
+    try testing.expect(config.isGlobalLayer(3) and !config.isGlobalLayer(0));
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
 }
 
 test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softplus gate, YaRN, sigmoid MoE" {

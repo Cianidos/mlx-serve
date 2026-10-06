@@ -218,6 +218,20 @@ extension MediaBundle {
         )
     }
 
+    static func clef(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "clef:\(repo)",
+            displayName: displayName,
+            components: [MediaComponent(
+                repo: repo,
+                selection: FileSelection(recursive: true),
+                readyMarkers: ["joint_head_config.json", "joint_head.safetensors", "config.json",
+                               "model.safetensors.index.json", "tokenizer.json"]
+            )],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// LTX-Video: pull ONLY the safetensors the engine reads (allowlist) plus
     /// the small json configs — the repo also carries ~50 GB of LoRAs /
     /// upscalers / alternate transformers we never touch. Depends on the

@@ -407,6 +407,27 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     return scaled;
 }
 
+/// `y + Σ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ` in y's dtype, `y` borrowed. The rank-r activation is tiny, so
+/// each adapter is one skinny GEMM and an `addmm` whose epilogue adds onto y: no delta tensor, no
+/// scalar pass. Caller must ensure `refs.len >= 1`.
+pub fn addTo(y: mlx.mlx_array, x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx_array {
+    var acc = y;
+    errdefer if (acc.ctx != y.ctx) {
+        _ = mlx.mlx_array_free(acc);
+    };
+    for (refs) |r| {
+        var xa = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xa);
+        try mlx.check(mlx.mlx_matmul(&xa, x, r.at, s));
+        var next = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(next);
+        try mlx.check(mlx.mlx_addmm(&next, acc, xa, r.bt, r.scale, 1.0, s));
+        if (acc.ctx != y.ctx) _ = mlx.mlx_array_free(acc);
+        acc = next;
+    }
+    return acc;
+}
+
 /// Sum of `scale_i · (x @ Aᵀᵢ) @ Bᵀᵢ` over every attached adapter — the
 /// runtime realization of stacking multiple LoRAs on one linear (mirrors
 /// mflux's `FusedLoRALinear`, which sums per-adapter deltas rather than
@@ -917,6 +938,71 @@ test "deltaSum adds every attached adapter's delta — the whole point of stacki
     _ = mlx.mlx_array_eval(one);
     const od = mlx.mlx_array_data_float32(one) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 110), od[0], 1e-4);
+}
+
+test "addTo equals y + deltaSum in y's dtype, for one adapter and a stack" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const M = 70;
+    const K = 96;
+    const R = 8;
+    const N = 80;
+    const mk = struct {
+        fn f(rows: c_int, cols: c_int, seed: f32, dt: mlx.mlx_dtype, sm: mlx.mlx_stream) !mlx.mlx_array {
+            var host: [M * 100]f32 = undefined;
+            const n: usize = @intCast(rows * cols);
+            for (host[0..n], 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37 + seed);
+            const shape = [_]c_int{ rows, cols };
+            const f32a = mlx.mlx_array_new_data(&host, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(f32a);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, f32a, dt, sm));
+            return out;
+        }
+    }.f;
+    const x = try mk(M, K, 0.1, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(x);
+    const y = try mk(M, N, 0.7, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(y);
+    const at0 = try mk(K, R, 1.3, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(at0);
+    const bt0 = try mk(R, N, 2.1, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(bt0);
+    const at1 = try mk(K, R, 3.3, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(at1);
+    const bt1 = try mk(R, N, 4.1, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(bt1);
+    const refs = [_]Ref{
+        .{ .at = at0, .bt = bt0, .scale = 0.5 },
+        .{ .at = at1, .bt = bt1, .scale = 1.25 },
+    };
+    for ([_]usize{ 1, 2 }) |n_refs| {
+        const got = try addTo(y, x, refs[0..n_refs], s);
+        defer _ = mlx.mlx_array_free(got);
+        const d = try deltaSum(x, refs[0..n_refs], s);
+        defer _ = mlx.mlx_array_free(d);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_add(&want, y, d, s));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+        var g32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g32);
+        var w32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w32);
+        try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
+        try mlx.check(mlx.mlx_astype(&w32, want, .float32, s));
+        _ = mlx.mlx_array_eval(g32);
+        _ = mlx.mlx_array_eval(w32);
+        const gp = mlx.mlx_array_data_float32(g32) orelse return error.NoData;
+        const wp = mlx.mlx_array_data_float32(w32) orelse return error.NoData;
+        var max_abs: f32 = 0;
+        for (0..M * N) |i| {
+            try testing.expect(std.math.isFinite(gp[i]));
+            max_abs = @max(max_abs, @abs(gp[i] - wp[i]));
+        }
+        // bf16 has 8 mantissa bits; both arms round, addTo once and deltaSum twice.
+        try testing.expect(max_abs < 0.35);
+    }
 }
 
 test "Stack.findAll collects one Ref per file and folds in that file's user scale" {

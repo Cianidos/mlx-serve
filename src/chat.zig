@@ -40,6 +40,8 @@ pub const ImageData = struct {
 /// config. Threaded into `parseImageUrlContent`/`decodeImageToPixels` so decode
 /// stays race-safe (no global state) under `--max-concurrent ≥ 2`.
 pub const VisionPreproc = struct {
+    /// Clef's Pillow RGB conversion discards alpha instead of compositing it.
+    composite_alpha: bool = true,
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
     mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
@@ -1281,7 +1283,13 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// Qwen3.8's effort vocabulary (xhigh|medium|low); `qwen38EffortFor` maps an
 /// absent effort to low on this family.
 pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
-    return std.mem.indexOf(u8, tpl, "'xhigh'") != null;
+    // Kolibri's effort list also spells 'xhigh' but has its own vocabulary.
+    return std.mem.indexOf(u8, tpl, "'xhigh'") != null and !isKolibriEffortTemplate(tpl);
+}
+
+/// Kolibri-1's template: the one place that names its private effort variable.
+pub fn isKolibriEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") != null;
 }
 
 pub fn templateConsumesEffort(tpl: []const u8) bool {
@@ -1374,6 +1382,17 @@ pub fn mergeTemplateKwargs(allocator: std.mem.Allocator, model_kwargs: ?[]const 
     return buf.toOwnedSlice(allocator);
 }
 
+/// Kolibri-1's template reads none|minimal|low|medium|high|xhigh|max and treats
+/// "none" as thinking-off; any other word it does not know falls through to high.
+fn kolibriEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "none";
+    const e = effort orelse return "high";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
+        if (std.mem.eql(u8, e, w)) return w;
+    }
+    return "high";
+}
+
 fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1450,6 +1469,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_effort in ['low', 'high']") != null) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, glm5EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -4022,10 +4045,11 @@ fn isScalarJsonType(want: []const u8) bool {
 
 /// The JSON type a property declares. `"type"` may be a union array
 /// (`["string","null"]`) — the first non-null entry wins. Absent/odd → null,
-/// which means "leave the value alone".
+/// which means "leave the value alone". Without a `"type"`, a `oneOf`/`anyOf`
+/// union declares one only when every non-null branch names the same.
 fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
     if (prop != .object) return null;
-    const t = prop.object.get("type") orelse return null;
+    const t = prop.object.get("type") orelse return unionJsonType(prop.object);
     switch (t) {
         .string => |s| return s,
         .array => |arr| {
@@ -4038,6 +4062,20 @@ fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
         },
         else => return null,
     }
+}
+
+fn unionJsonType(prop: std.json.ObjectMap) ?[]const u8 {
+    const branches = (prop.get("oneOf") orelse prop.get("anyOf") orelse return null);
+    if (branches != .array) return null;
+    var agreed: ?[]const u8 = null;
+    for (branches.array.items) |b| {
+        const bt = declaredJsonType(b) orelse return null;
+        if (std.mem.eql(u8, bt, "null")) continue;
+        if (agreed) |a| {
+            if (!std.mem.eql(u8, a, bt)) return null;
+        } else agreed = bt;
+    }
+    return agreed;
 }
 
 /// Tolerant boolean spelling — the union of what weak models actually emit:
@@ -10392,6 +10430,18 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
     }
 }
 
+test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
+    try testing.expectEqualStrings("none", kolibriEffortFor(null, false));
+    try testing.expectEqualStrings("none", kolibriEffortFor("high", false));
+    try testing.expectEqualStrings("high", kolibriEffortFor(null, true));
+    try testing.expectEqualStrings("low", kolibriEffortFor("low", true));
+    try testing.expectEqualStrings("medium", kolibriEffortFor("medium", true));
+    try testing.expectEqualStrings("high", kolibriEffortFor("banana", true));
+    // Its effort list spells 'xhigh' too, which must not read as Qwen3.8.
+    try testing.expect(!isQwen38EffortTemplate("{%- set _sv_reasoning_effort = reasoning_effort -%}['high', 'xhigh', 'max']"));
+    try testing.expect(isQwen38EffortTemplate("reasoning_effort|default('xhigh')"));
+}
+
 test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
     // medium deliberately maps LOW: DeepSeek's "high" text is a verbose
     // "absolute maximum, no shortcuts" preamble and the reference default is
@@ -12435,6 +12485,49 @@ test "coerceToolArgsToSchema: nullable union type [\"string\",\"null\"] coerces 
     try testing.expect(parsed.value.object.get("flag").? == .bool);
     try testing.expectEqual(false, parsed.value.object.get("flag").?.bool);
     try testing.expectEqualStrings("hi", parsed.value.object.get("note").?.string);
+}
+
+test "coerceToolArgsToSchema: an object param declared as a oneOf union coerces from its JSON text" {
+    // fx's shell tool: `request` is a discriminated union with no top-level "type".
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","required":["request"],"properties":{"request":{"oneOf":[{"type":"object","required":["action","command"],"properties":{"action":{"const":"run"},"command":{"type":"string"}}},{"type":"object","required":["action"],"properties":{"action":{"const":"cancel"}}}]}}}}}]
+    ;
+    const raw = "<tool_call>\n<function=shell>\n<parameter=request>\n{\"action\":\"run\",\"command\":\"ls\"}\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const req = parsed.value.object.get("request").?;
+    try testing.expect(req == .object);
+    try testing.expectEqualStrings("ls", req.object.get("command").?.string);
+}
+
+test "declaredJsonType: a oneOf/anyOf union declares a type only when its branches agree" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { schema: []const u8, want: ?[]const u8 }{
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"type\":\"object\"}]}", .want = "object" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}", .want = "string" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"object\"}]}", .want = null },
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"const\":1}]}", .want = null },
+    };
+    for (cases) |c| {
+        var doc = try std.json.parseFromSlice(std.json.Value, allocator, c.schema, .{});
+        defer doc.deinit();
+        const got = declaredJsonType(doc.value);
+        if (c.want) |w| {
+            try testing.expectEqualStrings(w, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
 }
 
 test "coerceToolArgsToSchema: an explicit JSON null satisfies any typed param (not coerced away)" {

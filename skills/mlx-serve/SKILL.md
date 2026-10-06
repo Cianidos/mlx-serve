@@ -1,6 +1,6 @@
 ---
 name: mlx-serve
-description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, sound effect, video and 3D generation, and Laya/Kev typed decisions. Use when code should call mlx-serve.
+description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, sound effect, video and 3D generation, and Laya/Kev/Clef typed decisions. Use when code should call mlx-serve.
 ---
 
 # mlx-serve
@@ -39,7 +39,7 @@ Each row has `id` (like `org/name`), `capabilities`, `state` (`ready`,
 | `sound` | `POST /v1/audio/sound-generations` (sound effects) | media.md |
 | `video` | `POST /v1/video/generations` | media.md |
 | `3d` | `POST /v1/3d/generations` | media.md |
-| `decisions` | `POST /v1/decisions` | decisions.md |
+| `decisions` | `POST /v1/decisions`, `POST /v1/systemone` | decisions.md |
 
 Read the linked file (next to this one) before writing client code for that
 endpoint. If no model has the capability the user needs, say so and tell them to

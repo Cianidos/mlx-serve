@@ -2018,3 +2018,10 @@ below then unwrapped that unopened map (`&tw.?`) before `loadVision`'s own early
 Fix: the tower is loaded only when the encoder has none (`needs_vision and te.vision == null`),
 the one condition under which the map was opened.
 Guard: `tests/test_h3_resident.sh` [4], two keyframe requests on one resident server.
+
+## A runtime LoRA bypass cost H3 Turbo half its step (2026-10-05)
+
+Defect: with `"turbo": true` an 864x480/124f step took 18.7 s against 10.1 s without the adapter; the bypass alone was ~8.7 s although its isolated cost at the same shapes was 1.25 s.
+Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY, which promotes it: a 1.3-1.8 GB f32 `[S, out]` tensor, a cast back and a separate add, five full passes per adapted linear, 200 big linears a step. Isolated it costs 1.25 s a step; the real graph paid ~8.7 s (why is unproven; allocator pressure from the f32 tensors is the suspect).
+Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
+Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).

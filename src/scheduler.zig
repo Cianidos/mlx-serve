@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const mlx = @import("mlx.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const transformer_mod = @import("transformer.zig");
@@ -130,7 +131,7 @@ pub const LoadParams = struct {
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
@@ -1186,7 +1187,7 @@ pub const LoadRequest = struct {
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
@@ -1371,7 +1372,7 @@ pub const Scheduler = struct {
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale
     /// as the prefix-cache fields above) so COLD-LOADED models — on-demand
-    /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-depth` /
+    /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-max-depth` /
     /// `--llama-cache-entries` / `--llama-kv-quant` like the `--model` primary.
     /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
     /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
@@ -2122,7 +2123,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP + embedded-llama.cpp
             // settings too (same reason as prefix-cache above) — pre-plumbing
-            // these were LoadRequest defaults, so --no-mtp / --mtp-depth /
+            // these were LoadRequest defaults, so --no-mtp / --mtp-max-depth /
             // --llama-cache-entries / --llama-kv-quant were silently dropped
             // on every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
@@ -2514,6 +2515,13 @@ fn groupCtxMax(caches: []const *const KVCache) u32 {
     var m: usize = 0;
     for (caches) |c| m = @max(m, c.kvLenForBatching());
     return @intCast(@min(m, std.math.maxInt(u32)));
+}
+
+/// Does the batched forward pad every slot's KV to the group's longest? GLM-5-Next attends per
+/// slot at any length, so it has no padding to cap.
+fn groupPadsKv(slot: *const Slot) bool {
+    const cfg = slot.model.config orelse return true;
+    return !cfg.isGlm5();
 }
 
 /// The per-slot attention arm serves every batched trunk but qwen4's QSA reads.
@@ -7522,7 +7530,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // its short neighbours build a tensor orders of magnitude bigger than
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
-        if (group.len >= 2) {
+        if (group.len >= 2 and groupPadsKv(group[0])) {
             var kv_lens: [32]u32 = undefined;
             var ctx_max: u32 = 0;
             {
@@ -8685,10 +8693,14 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         probe = true;
         recovering = true;
     }
-    if (Generator.mtpForcedDepth()) |depth| {
-        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
-        probe = false;
-        recovering = false;
+    // A width the range moves no longer matches what a probe was meant to price.
+    for (rows[0..active.len], 0..) |row, i| {
+        const width: u8 = @intCast(depth_bounds.plannerWidth(decision.widths[i], row.cap, depth_bounds.active));
+        if (width != decision.widths[i] or depth_bounds.active.pinned() != null) {
+            decision.widths[i] = width;
+            probe = false;
+            recovering = false;
+        }
     }
     var stale: [Planner.MAX_ROWS]bool = undefined;
     for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
@@ -8776,6 +8788,8 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
     if (!t.hasRecurrentLayers()) return true;
+    // GLM-5-Next likewise: its head drafts one slot at a time.
+    if (t.config.isGlm5()) return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
@@ -10040,6 +10054,14 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         q4.num_experts = 256;
         q4.num_experts_per_tok = 8;
         try testing.expect(q4.supportsBatchedGdnDecode());
+    }
+    {
+        // GLM-5-Next shares bailing's per-channel KDA gate, which is refused above; its own arm batches.
+        var glm = std.mem.zeroes(model_mod.ModelConfig);
+        glm.model_type = "glm5_next";
+        glm.kda_vector_gate = true;
+        try testing.expect(glm.supportsBatchedGdnDecode());
+        try testing.expect(configBatchesDecode(&glm));
     }
 }
 

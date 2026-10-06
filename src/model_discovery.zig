@@ -105,6 +105,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
+        std.mem.eql(u8, model_type, "clef") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -153,6 +154,7 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
+    if (peekClefPack(io, sub)) return .{ .supported = allocator.dupe(u8, "clef") catch return .missing_or_unparseable };
     // A Kev pack carries its base model's config.json (qwen3_5): the marker must win before it is read.
     if (peekKevPack(io, sub)) return .{ .supported = allocator.dupe(u8, "kev") catch return .missing_or_unparseable };
     var file = sub.openFile(io, "config.json", .{}) catch {
@@ -227,6 +229,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
 /// Twin of gen.isKevPack, which delegates here.
 pub fn peekKevPack(io: std.Io, sub: std.Io.Dir) bool {
     const st = sub.statFile(io, "kev_config.json", .{}) catch return false;
+    return st.kind == .file;
+}
+
+pub fn peekClefPack(io: std.Io, sub: std.Io.Dir) bool {
+    const st = sub.statFile(io, "joint_head_config.json", .{}) catch return false;
     return st.kind == .file;
 }
 
@@ -598,7 +605,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -2312,6 +2319,27 @@ test "config discovery tolerates invalid roots and oversized metadata" {
     for ([_][]const u8{ "[]", "null", "false", "17", "\"bad\"", "[{}]" }) |content| {
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
         try testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
+    }
+}
+
+test "clef: the joint head identifies a decision pack before its Qwen config" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "clef-4bit", "clef-8bit", "clef-flash-4bit", "clef-flash-8bit" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head_config.json", .data = "{\"hidden_size\":4096,\"width\":1024,\"routing_layers\":2,\"layers\":4,\"heads\":16,\"feedforward\":4096}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head.safetensors", .data = "head" });
+        const peek = peekConfig(io, a, tmp.dir, name);
+        defer if (peek == .supported) a.free(peek.supported);
+        try testing.expect(peek == .supported);
+        try testing.expectEqualStrings("clef", peek.supported);
+        try testing.expectEqual(ModelKind.decision, modelKindFromType(peek.supported));
+        try testing.expect(isMediaModelType(peek.supported));
     }
 }
 
