@@ -564,7 +564,7 @@ pub fn main(init: std.process.Init) !void {
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
-    var reasoning_budget: i32 = -1; // -1 = unlimited
+    var reasoning_budget: ?i32 = null;
     var no_vision = false;
     var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
     var pld_draft_len: u32 = 5;
@@ -828,7 +828,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
-            @import("generation_settings.zig").cli_reasoning_budget = reasoning_budget;
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
             if (log.Level.fromString(args[i])) |level| {
@@ -1855,7 +1854,7 @@ fn runGenServe(
     port: u16,
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
+    reasoning_budget: ?i32,
     max_resident_models: u32,
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
@@ -1965,7 +1964,7 @@ fn runHeadlessServe(
     port: u16,
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
+    reasoning_budget: ?i32,
     max_resident_models: u32,
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
@@ -2107,7 +2106,7 @@ fn runDs4Serve(
     port: u16,
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
+    reasoning_budget: ?i32,
     default_temperature: ?f32,
     default_top_p: ?f32,
     default_top_k: ?u32,
@@ -2396,7 +2395,7 @@ fn runLlamaServe(
     port: u16,
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
+    reasoning_budget: ?i32,
     default_temperature: ?f32,
     default_top_p: ?f32,
     default_top_k: ?u32,

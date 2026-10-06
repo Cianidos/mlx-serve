@@ -155,10 +155,6 @@ pub const ChatConfig = struct {
     /// (`model-settings.json`), with a request's own merged over them per request.
     chat_template_kwargs: ?[]const u8 = null,
     generation_defaults: @import("generation_settings.zig").Profile = .{},
-    /// The model's `enable_thinking` / `reasoning_effort` kwargs, typed: used
-    /// only when a request names neither (`server.resolveChatThinking`).
-    default_enable_thinking: ?bool = null,
-    default_reasoning_effort: ?[]const u8 = null,
     /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
     /// per request is a second parse of a multi-KB template); null = unknown, probe.
     renders_tool_turn: ?bool = null,

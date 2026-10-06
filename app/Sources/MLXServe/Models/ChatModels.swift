@@ -50,7 +50,6 @@ struct ChatSession: Identifiable, Codable {
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
     var disabledTools: [String]
-    var generationParams: GenerationDefaults
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -68,7 +67,6 @@ struct ChatSession: Identifiable, Codable {
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
-        self.generationParams = .init()
     }
 
     /// Resolve stored names to tools, silently dropping any this build no longer
@@ -79,7 +77,7 @@ struct ChatSession: Identifiable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
-        case disabledTools, generationParams
+        case disabledTools
         case reasoningEffort
     }
 
@@ -113,7 +111,6 @@ struct ChatSession: Identifiable, Codable {
         // Absent (every session saved before the Tools menu) → nothing disabled,
         // i.e. exactly the behaviour that build had.
         disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
-        generationParams = (try? c.decode(GenerationDefaults.self, forKey: .generationParams)) ?? .init()
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20

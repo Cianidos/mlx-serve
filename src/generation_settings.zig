@@ -1,12 +1,11 @@
 const std = @import("std");
 
 pub const Surface = enum { chat, completions, messages, responses };
-pub const Field = enum { temperature, top_p, top_k, repeat_penalty, presence_penalty, frequency_penalty, max_tokens, enable_thinking, reasoning_effort, reasoning_budget };
+pub const Field = enum { temperature, top_p, top_k, min_p, repeat_penalty, presence_penalty, frequency_penalty, max_tokens, enable_thinking, reasoning_effort, reasoning_budget };
 pub const Effort = enum { none, minimal, low, medium, high, xhigh, max };
 pub const Value = union(enum) { number: f64, integer: i64, boolean: bool, effort: Effort };
 pub const Source = enum { client, model, global, cli, checkpoint, fallback };
 pub const Rule = struct { value: Value, ignore_client: bool = false, source: Source = .global };
-pub var cli_reasoning_budget: ?i32 = null;
 
 pub const Profile = struct {
     rules: [std.enums.values(Field).len]?Rule = @splat(null),
@@ -157,7 +156,7 @@ pub fn parseProfile(value: std.json.Value) !Profile {
                     .float => |n| n,
                     else => return error.InvalidGenerationSettings,
                 };
-                const max: f64 = if (field == .repeat_penalty) 10 else if (field == .top_p) 1 else 2;
+                const max: f64 = if (field == .repeat_penalty) 10 else if (field == .top_p or field == .min_p) 1 else 2;
                 const min: f64 = if (field == .repeat_penalty) 0.01 else 0;
                 if (!std.math.isFinite(number) or number < min or number > max) return error.InvalidGenerationSettings;
                 break :blk .{ .number = number };

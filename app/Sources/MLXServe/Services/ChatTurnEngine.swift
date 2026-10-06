@@ -312,7 +312,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var repeatPenalty: Double? = nil
         var presencePenalty: Double? = nil
         var reasoningBudget: Int? = nil
-        var generationParams = GenerationDefaults()
         /// The surface's `reasoning_effort` pick, sent only while thinking is
         /// on (see `reasoningEffortParam`).
         var reasoningEffort: ReasoningEffort = .low
@@ -361,20 +360,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             thinking ? reasoningEffort.rawValue : nil
         }
 
-        func applyingGeneration(_ profile: GenerationDefaults) -> TurnConfig {
-            var copy = self
-            copy.generationParams = profile
-            if let value = profile.number(.temperature) { copy.temperature = value }
-            if let value = profile.number(.topP) { copy.topP = value }
-            if let value = profile.number(.topK) { copy.topK = Int(value) }
-            if let value = profile.number(.repeatPenalty) { copy.repeatPenalty = value }
-            else if profile.number(.frequencyPenalty) != nil { copy.repeatPenalty = nil }
-            if let value = profile.number(.presencePenalty) { copy.presencePenalty = value }
-            if let value = profile.number(.maxTokens) { copy.maxTokens = Int(value) }
-            if let value = profile.number(.budget) { copy.reasoningBudget = Int(value) }
-            return copy
-        }
-
         func thinkingForRequest(_ options: ServerOptions, inheritGeneration: Bool) -> Bool {
             enableThinking || (!inheritGeneration && options.defaultEnableThinking)
         }
@@ -401,7 +386,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
             }
             if let v = topP { d.topP = v }
-            d.generationParams = generationParams
             return d
         }
 
@@ -591,8 +575,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
               Self.canRunTurn(serverRunning: server.status == .running,
                               apple: appState.useAppleModel) else { return }
 
-        let config = config.applyingGeneration(session(sessionId)?.generationParams ?? .init())
-
         // A new submission to the SAME session supersedes its in-flight turn.
         // Other sessions' turns are untouched — the engine is multi-turn.
         stop(sessionId: sessionId)
@@ -668,7 +650,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // continuation as a new one.
         appState.markContinuing(sessionId)
         publishTurnState()
-        let config = config.applyingGeneration(session(sessionId)?.generationParams ?? .init())
         runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
                      config: config, token: token, continuing: true)
     }

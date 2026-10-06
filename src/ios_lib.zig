@@ -211,16 +211,19 @@ fn run(models_dir: []const u8, host: []const u8, port: u16, ctx_size: u32, max_r
         .tokenize_cache_entries = 4,
     };
 
-    try server_mod.serve(io, allocator, params, stub.config, host, port, .{
+    try server_mod.serve(io, allocator, params, stub.config, host, port, serverConfig(ctx_size));
+}
+
+pub fn serverConfig(ctx_size: u32) server_mod.ServerConfig {
+    return .{
         .max_context_size = ctx_size,
         .request_timeout_sec = 0,
-        .default_reasoning_budget = -1,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
         .default_enable_pld = true,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
-        .default_kv_attn_fused = false,
-    });
+        .kv_attn_mode = .dense,
+    };
 }
