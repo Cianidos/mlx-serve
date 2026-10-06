@@ -55,7 +55,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
         XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
-        XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
+        XCTAssertEqual(d.llamaCacheEntries, 4)        // scheduler.zig LlamaSettings.seqs
+        XCTAssertEqual(d.llamaMtpDrafts, 2)           // scheduler.zig LlamaSettings.mtp_drafts
+        XCTAssertEqual(d.llamaUbatch, 0)              // scheduler.zig LlamaSettings.ubatch (libllama default)
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
         // Deliberate divergence from main.zig's metrics_enabled=false: the tray
@@ -206,6 +208,17 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "1"))
         opts.llamaCacheEntries = 8
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "8"))
+    }
+
+    func testLlamaMtpDraftsAndUbatchEmitOnlyOffTheirDefaults() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--llama-mtp-drafts"))
+        XCTAssertFalse(args.contains("--llama-ubatch"))
+        var opts = ServerOptions()
+        opts.llamaMtpDrafts = 0   // off: the server must hear it, its default drafts
+        opts.llamaUbatch = 2048
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-mtp-drafts", value: "0"))
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-ubatch", value: "2048"))
     }
 
     func testTokenizeCacheEntriesOmittedAtDefault() {
@@ -512,6 +525,8 @@ extension ServerOptionsTests {
         o.ssdStreaming = true
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
+        o.llamaMtpDrafts = 4
+        o.llamaUbatch = 1024
         o.tokenizeCacheEntries = 16
         o.idleEvictSecs = 1800
         o.defaultMaxTokens = 8192

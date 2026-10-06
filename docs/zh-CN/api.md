@@ -69,4 +69,4 @@ curl http://localhost:11234/v1/responses \
 - `GET /metrics`、`GET /metrics.json` —— Prometheus + JSON（需要 `--metrics`）
 - `GET /v1/responses/{id}`、`DELETE /v1/responses/{id}` —— 获取 / 删除已存储的响应
 
-每个媒体端点都接受 `"stream": true`，以获得以 base64 `complete` 载荷收尾的 SSE 进度。视频流还接受 `"preview": true`，在每个去噪步骤给出一张廉价的 JPEG（默认关闭；cached-velocity 的 H3 步骤不带预览）。媒体 LoRA 在各处都只用一套文法：`lora_paths` + `lora_scales`，最多 8 个，依次叠加。
+每个媒体端点都接受 `"stream": true`，以获得以 base64 `complete` 载荷收尾的 SSE 进度。视频流还接受 `"preview": true`，在每个去噪步骤给出一张廉价的 JPEG（默认关闭；cached-velocity 的 H3 步骤不带预览）。媒体 LoRA 在各处都只用一套文法：`lora_paths` + `lora_scales`，最多 8 个，依次叠加。这些路径是服务器磁盘上的文件，所以只有服务器本机上的客户端可以发送；来自其他客户端（局域网共享、`--api-key`）的请求一旦带上它们就返回 403。

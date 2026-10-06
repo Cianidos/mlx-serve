@@ -11,6 +11,7 @@ const unavailable = "ds4 engine is unavailable on this build (macOS-only embedde
 
 pub const Error = error{
     EngineOpenFailed,
+    SplitGgufUnsupported,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,

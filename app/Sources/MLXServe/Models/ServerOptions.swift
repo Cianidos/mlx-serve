@@ -204,14 +204,17 @@ struct ServerOptions: Codable, Equatable {
     /// some quality cost. Auto-enables flash-attn server-side when
     /// non-default.
     var llamaKvQuant: LlamaKVQuant = .off
-    /// Multi-session LRU size for the embedded llama.cpp engine. 1 keeps the
-    /// legacy single-session behavior (every flip between long-doc prompts
-    /// evicts the other). N > 1 keeps the N most-recently-used prompts hot in
-    /// independent KV contexts. Default 4 MUST match `server.zig`
-    /// `llama_cache_entries` — `toCLIArgs` omits the flag at this value, so a
-    /// mismatch would silently run the server's default instead (see the
-    /// "ServerOptions defaults must mirror the Zig server" gotcha in CLAUDE.md).
+    /// Sequences per llama.cpp model: requests decoded together in one batch,
+    /// each keeping its own prompt KV warm (and holding a full context of KV
+    /// from load). Default 4 MUST match `scheduler.zig` `LlamaSettings.seqs` —
+    /// `toCLIArgs` omits the flag at this value, so a mismatch would silently
+    /// run the server's default instead.
     var llamaCacheEntries: Int = 4
+    /// Draft tokens per MTP round for a GGUF with an MTP head (its own, or an
+    /// `mtp-*.gguf` beside it); 0 = off. Default 2 mirrors `LlamaSettings.mtp_drafts`.
+    var llamaMtpDrafts: Int = 2
+    /// llama.cpp prefill batch in tokens; 0 = libllama's default (512).
+    var llamaUbatch: Int = 0
 
     // MARK: ds4-only (DeepSeek-V4-Flash engine)
     /// When true, launch with `--ssd-streaming` so the embedded ds4 engine
@@ -509,6 +512,8 @@ struct ServerOptions: Codable, Equatable {
         osReserveGiB == other.osReserveGiB &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
+        llamaMtpDrafts == other.llamaMtpDrafts &&
+        llamaUbatch == other.llamaUbatch &&
         ssdStreaming == other.ssdStreaming &&
         mlxGguf == other.mlxGguf &&
         tokenizeCacheEntries == other.tokenizeCacheEntries
@@ -720,8 +725,14 @@ struct ServerOptions: Codable, Equatable {
         if llamaKvQuant != .off {
             args += ["--llama-kv-quant", llamaKvQuant.cliValue]
         }
-        if llamaCacheEntries != 4 {  // 4 = server default (server.zig llama_cache_entries)
+        if llamaCacheEntries != 4 {  // 4 = server default (LlamaSettings.seqs)
             args += ["--llama-cache-entries", "\(llamaCacheEntries)"]
+        }
+        if llamaMtpDrafts != 2 {  // 2 = server default (LlamaSettings.mtp_drafts)
+            args += ["--llama-mtp-drafts", "\(llamaMtpDrafts)"]
+        }
+        if llamaUbatch != 0 {
+            args += ["--llama-ubatch", "\(llamaUbatch)"]
         }
         // All-engines knob — applies to MLX, llama, and ds4 alike.
         if tokenizeCacheEntries != 4 {
@@ -898,6 +909,8 @@ extension ServerOptions {
         }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaMtpDrafts) { llamaMtpDrafts = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaUbatch) { llamaUbatch = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .mlxGguf) { mlxGguf = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
@@ -1165,8 +1178,16 @@ extension ServerOptions {
             explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Same trade as the MLX version: less KV RAM, slower decode — leave off for maximum tokens/sec if you have plenty of RAM. Distinct kernels from the MLX KV-quant; auto-enables flash-attn on the server side when non-default.",
             needsRestart: true),
         "llamaCacheEntries": .init(
-            title: "Session cache entries",
-            explainer: "How many independent llama.cpp KV contexts to keep resident. 1 = legacy single-session (every flip between long prompts evicts the other). >1 keeps the N most-recently-used prompts hot — alternating multi-doc workloads stop cold-prefilling on every flip.",
+            title: "Parallel sequences",
+            explainer: "How many requests llama.cpp decodes at once, in one batch, each keeping its own prompt cache warm. Agent clients send several requests together; with 1 they wait in line. Each sequence holds a full context of KV memory from the moment the model loads, so lower it if a large context does not fit. Passes --llama-cache-entries.",
+            needsRestart: true),
+        "llamaMtpDrafts": .init(
+            title: "MTP draft tokens",
+            explainer: "For a GGUF with an MTP head (its own, or an mtp-*.gguf file beside it, as in unsloth's MTP folder), guess this many tokens ahead and check them in one pass: a faster reply with the same output. Drafts only while one request is decoding; with company the batch is faster. 0 turns it off and skips loading the head. Passes --llama-mtp-drafts.",
+            needsRestart: true),
+        "llamaUbatch": .init(
+            title: "Prefill batch size",
+            explainer: "How many prompt tokens llama.cpp processes per GPU pass. Larger batches read long prompts faster, mostly on MoE models, and take more scratch memory. Default is llama.cpp's 512. Passes --llama-ubatch.",
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",

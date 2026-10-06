@@ -113,6 +113,8 @@ enum SettingsReset {
                 f("mlxGguf") { $0.mlxGguf = $1.mlxGguf },
                 f("llamaKvQuant") { $0.llamaKvQuant = $1.llamaKvQuant },
                 f("llamaCacheEntries") { $0.llamaCacheEntries = $1.llamaCacheEntries },
+                f("llamaMtpDrafts") { $0.llamaMtpDrafts = $1.llamaMtpDrafts },
+                f("llamaUbatch") { $0.llamaUbatch = $1.llamaUbatch },
                 f("ssdStreaming") { $0.ssdStreaming = $1.ssdStreaming },
             ]
 

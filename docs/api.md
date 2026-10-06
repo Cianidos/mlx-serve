@@ -70,7 +70,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /metrics`, `GET /metrics.json` — Prometheus + JSON (needs `--metrics`)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
 
-Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked.
+Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked. The paths are files on the server's disk, so only a client on the server's own machine may send them; from anyone else (LAN sharing, `--api-key`) a request carrying them is a 403.
 
 ### Qwen-Image transparent PNG output
 

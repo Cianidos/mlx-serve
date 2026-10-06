@@ -14,6 +14,8 @@
 - **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
 - **fx and Grok join the launchers.** `mlx-serve launch fx` / `mlx-serve launch grok` and the app's Code menu start either agent against the local server, with every chat model and its real context window declared and no sign-in needed; your own fx default provider and `~/.grok` stay as they were.
 - **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
+- **GGUF models answer several requests at once.** The llama.cpp engine now decodes up to `--llama-cache-entries` requests (default 4) together in one batch instead of one after another, each keeping its own prompt cache warm; agent clients that send requests in parallel stop queueing (#547).
+- **MTP for GGUF models.** A GGUF that ships an MTP head, its own or an `mtp-*.gguf` beside it (unsloth's `MTP/` folder for Qwen3.8 Flash Next), drafts ahead while one request is decoding, with the same output; `--llama-mtp-drafts` sets the draft count (default 2, `0` off) and `--llama-ubatch` the prefill batch, both in Settings → Engines → llama.cpp (#548).
 
 ### Speed
 - **oMLX's Qwen3.8 Flash Next packs run at full speed.** The fast paths built for our own pack now also serve oMLX's per-layer mixed widths. On an M5 Ultra, `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` decodes at 172 tok/s with MTP (177 with `--ple-gpu`), against 133 for oMLX 0.7.0 on the same pack and 174 for our own pack.
@@ -22,6 +24,11 @@
 - Nemotron-3 Nano answers short prompts sooner on M5 Macs.
 
 ### Fixes
+- llama.cpp is updated to release v0.6.0, and an `mtp-*.gguf` draft head is no longer listed as a chat model.
+- A GGUF picked in the app answers its first message instead of a 404, switching to one no longer restarts the server, and the model picker names a split GGUF by its model rather than "1 of 00002".
+- A streamed tool call whose name the model malformed (a missing `>` after `<function=NAME`) no longer sends a chunk strict clients reject: the name ends at the line break, and every streamed tool-call field is JSON-escaped (#748).
+- `lora_paths` are accepted only from the server's own machine; a LAN or API-key client that sends them gets a 403, so it can no longer probe which files exist on the host (#540).
+- Split GGUFs (`*-00001-of-0000N.gguf`) now load through llama.cpp instead of silently killing the ds4 engine, and `--engine ds4` on one is refused with a message saying why (#586).
 - Homebrew: the app cask is now `mlx-serve` (was `mlx-core`; installs move over on `brew update`), and the install steps add `brew trust ddalcu/mlx-serve`, which Homebrew 7 requires before it installs from our tap.
 - Qwen3.8 agents keep their earlier turns' reasoning in the prompt again, as the model was trained to: multi-turn answers improve and a follow-up message no longer re-reads the whole conversation (up to 8 s saved per follow-up on a 120k-token session). `chat_template_kwargs` `preserve_thinking: false` restores the old behaviour.
 - `tool_choice: "required"`, a named function and Anthropic's `any` now always produce a tool call on Qwen 3.5 and later, even when the prompt says not to call one; the choice used to never reach the model. Naming a function the request does not declare is now a 400.

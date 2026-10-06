@@ -2025,3 +2025,10 @@ Defect: with `"turbo": true` an 864x480/124f step took 18.7 s against 10.1 s wit
 Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY, which promotes it: a 1.3-1.8 GB f32 `[S, out]` tensor, a cast back and a separate add, five full passes per adapted linear, 200 big linears a step. Isolated it costs 1.25 s a step; the real graph paid ~8.7 s (why is unproven; allocator pressure from the f32 tensors is the suspect).
 Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
 Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).
+
+## Stable Audio 3: a fractional length came out as clipped noise (2026-10-05)
+
+Defect: a sound effect at any non-whole length (0.5, 0.9, 1.5 s) came out as near-constant full-scale noise; whole seconds sounded right.
+Cause: training conditions on `seconds_total = math.ceil(n_samples / sample_rate)`, so the model only saw whole seconds >= 1, and the reference UI's slider steps by 1. Stability's own MLX pipeline peaks at 11-25x full scale at 0.5/0.9/1.5 s. Our parity fixtures ran at 5 s, a whole number. Separately, `generate()` samples 6 s past the request (`duration_padding_sec`) and trims, which the MLX port we followed omits.
+Fix: condition on `trainedSeconds` (`ceil(seconds)`, at least 1), sample that plus 6 s (`latentCount`: even, capped at `sample_size`), trim to the request.
+Guard: `sa3 trainedSeconds` and `sa3 latentCount` (stable_audio.zig).

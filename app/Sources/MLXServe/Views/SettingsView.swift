@@ -2131,67 +2131,98 @@ private struct EnginesSectionContent: View {
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
-    /// Group labels are not rows: a search narrows to rows, so they step aside.
-    private var showLabels: Bool { SettingsSearch.tokens(query).isEmpty }
+    /// A search narrows to rows, so the engine boxes step aside while one runs.
+    private var grouped: Bool { SettingsSearch.tokens(query).isEmpty }
 
     var body: some View {
         let opts = $appState.serverOptions
-        if showLabels {
-            EngineGroupLabel(name: "mlx-serve-gguf", blurb: "GGUF files on MLX itself. Experimental.")
-        }
-        if let m = meta["mlxGguf"] {
-            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.mlxGguf)) {
-                Toggle("", isOn: opts.mlxGguf)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
+        EngineGroup(name: "mlx-serve-gguf", blurb: "GGUF files on MLX itself. Experimental.", boxed: grouped) {
+            if let m = meta["mlxGguf"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.mlxGguf)) {
+                    Toggle("", isOn: opts.mlxGguf)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
             }
         }
-        if showLabels {
-            EngineGroupLabel(name: "llama.cpp", blurb: "Serves every other .gguf file. Its own kernels and KV layout, so the MLX rows do not apply.")
-        }
-        if let m = meta["llamaKvQuant"] {
-            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaKvQuant)) {
-                Picker("", selection: opts.llamaKvQuant) {
-                    ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).font(.app(.body)).tag(q)
+        EngineGroup(name: "llama.cpp", blurb: "Serves every other .gguf file. Its own kernels and KV layout, so the MLX rows do not apply.", boxed: grouped) {
+            if let m = meta["llamaKvQuant"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaKvQuant)) {
+                    Picker("", selection: opts.llamaKvQuant) {
+                        ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
+                            Text(L10n.text(q.label)).font(.app(.body)).tag(q)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 260).font(.app(.body))
+                }
+            }
+            if let m = meta["llamaCacheEntries"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaCacheEntries)) {
+                    Stepper(value: opts.llamaCacheEntries, in: 1...8) {
+                        Text("\(appState.serverOptions.llamaCacheEntries)")
+                            .font(.app(.body).monospacedDigit())
                     }
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(minWidth: 260).font(.app(.body))
             }
-        }
-        if let m = meta["llamaCacheEntries"] {
-            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaCacheEntries)) {
-                Stepper(value: opts.llamaCacheEntries, in: 1...8) {
-                    Text("\(appState.serverOptions.llamaCacheEntries)")
-                        .font(.app(.body).monospacedDigit())
+            if let m = meta["llamaMtpDrafts"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaMtpDrafts)) {
+                    Stepper(value: opts.llamaMtpDrafts, in: 0...8) {
+                        Text(appState.serverOptions.llamaMtpDrafts == 0 ? L10n.text("Off") : "\(appState.serverOptions.llamaMtpDrafts)")
+                            .font(.app(.body).monospacedDigit())
+                    }
+                }
+            }
+            if let m = meta["llamaUbatch"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaUbatch)) {
+                    Picker("", selection: opts.llamaUbatch) {
+                        Text(L10n.text("Default (512)")).font(.app(.body)).tag(0)
+                        ForEach([1024, 2048, 4096], id: \.self) { n in
+                            Text(verbatim: "\(n)").font(.app(.body)).tag(n)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 140).font(.app(.body))
                 }
             }
         }
-        if showLabels {
-            EngineGroupLabel(name: "ds4", blurb: "Serves DeepSeek-V4-Flash GGUF files.")
-        }
-        if let m = meta["ssdStreaming"] {
-            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.ssdStreaming)) {
-                Toggle("", isOn: opts.ssdStreaming)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
+        EngineGroup(name: "ds4", blurb: "Serves DeepSeek-V4-Flash GGUF files.", boxed: grouped) {
+            if let m = meta["ssdStreaming"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.ssdStreaming)) {
+                    Toggle("", isOn: opts.ssdStreaming)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
             }
         }
     }
 }
 
-private struct EngineGroupLabel: View {
+/// One engine's rows in a box under its name. Unboxed, the rows sit bare in the
+/// section, so a search that filters every row out leaves no empty box behind.
+private struct EngineGroup<Content: View>: View {
     let name: String
     let blurb: String
+    let boxed: Bool
+    @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(name).font(.app(.headline))
-            Text(L10n.text(blurb)).font(.app(.caption2)).foregroundStyle(.secondary)
+        if boxed {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name).font(.app(.headline))
+                    Text(L10n.text(blurb)).font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 18) { content }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+        } else {
+            content
         }
-        .padding(.top, 8)
     }
 }
 
