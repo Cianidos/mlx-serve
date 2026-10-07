@@ -10,6 +10,13 @@ final class GenerationDefaultsTests: XCTestCase {
         XCTAssertTrue(GenerationField.budget.help.contains("reasoning_budget_tokens"))
     }
 
+    func testTopKHelpExplainsCandidateCountInsteadOfInheritance() {
+        let help = GenerationField.topK.help
+        XCTAssertTrue(help.contains("most likely next tokens"))
+        XCTAssertTrue(help.contains("0 disables this filter"))
+        XCTAssertFalse(help.contains("Inherit"))
+    }
+
     func testRetiredSessionParametersAreIgnoredAndNotPersisted() throws {
         let existing = try JSONEncoder().encode(ChatSession())
         var stored = try XCTUnwrap(JSONSerialization.jsonObject(with: existing) as? [String: Any])

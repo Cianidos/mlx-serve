@@ -287,7 +287,7 @@ enum GenerationField: String, CaseIterable, Identifiable {
     var help: String {
         let description: String
         switch self {
-        case .topK: description = "0 disables top-k. Inherit uses the next configured default."
+        case .topK: description = "Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter."
         case .minP: description = "Minimum probability relative to the most likely token. 0 disables min-p."
         case .repeatPenalty: description = "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding."
         case .frequencyPenalty: description = "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control."

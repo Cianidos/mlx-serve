@@ -32,7 +32,7 @@
 "Applies to the next request without reloading. Model rules replace global values and their client-override policy." = "下一次请求生效，无需重新加载。模型规则替代全局值及其客户端覆盖策略。";
 "Generation defaults apply to the next request. Load settings apply when the model loads." = "生成默认值在下一次请求生效。加载设置在模型加载时生效。";
 "The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "已保存的生成策略包含无效或不受支持的字段。原内容会保留；请先修正 model-settings.json，再在此编辑。";
-"0 disables top-k. Inherit uses the next configured default." = "0 禁用 top-k。继承使用下一层配置的默认值。";
+"Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter." = "仅保留下一步最可能的 k 个 token。较低值缩小候选范围；0 禁用此筛选。";
 "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1 禁用重复惩罚。非中性惩罚可能禁用投机解码和批量解码。";
 "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "使用此引擎现有的频率惩罚映射。重复惩罚和频率惩罚共用一个采样器控制项。";
 "0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
